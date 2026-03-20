@@ -12,7 +12,19 @@ from flask import Flask, jsonify, render_template, request
 from telegram import Bot, Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters
 
-from bot import handle_message, start_command
+from bot import (
+    clear_command,
+    goal_command,
+    handle_message,
+    health_command,
+    help_command,
+    history_command,
+    injury_command,
+    race_command,
+    reset_command,
+    start_command,
+    today_command,
+)
 from companion import chat as companion_chat
 
 load_dotenv()
@@ -53,6 +65,15 @@ def get_telegram_app():
     if telegram_app is None:
         telegram_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
         telegram_app.add_handler(CommandHandler("start", start_command))
+        telegram_app.add_handler(CommandHandler("help", help_command))
+        telegram_app.add_handler(CommandHandler("goal", goal_command))
+        telegram_app.add_handler(CommandHandler("injury", injury_command))
+        telegram_app.add_handler(CommandHandler("race", race_command))
+        telegram_app.add_handler(CommandHandler("today", today_command))
+        telegram_app.add_handler(CommandHandler("history", history_command))
+        telegram_app.add_handler(CommandHandler("reset", reset_command))
+        telegram_app.add_handler(CommandHandler("clear", clear_command))
+        telegram_app.add_handler(CommandHandler("health", health_command))
         telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
         # Must initialize before process_update can be called
         _run_async(telegram_app.initialize())

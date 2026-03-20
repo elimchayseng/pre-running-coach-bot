@@ -24,10 +24,10 @@ def _truncate_memory(text: str, max_chars: int = MAX_MEMORY_CHARS) -> str:
     wait=wait_exponential(multiplier=1, min=1, max=10),
     retry=retry_if_exception_type((ConnectionError, TimeoutError)),
 )
-def _mem0_search(query: str, limit: int = 3) -> list:
+def _mem0_search(query: str, limit: int = 3, user_id: str = USER_ID) -> list:
     """Mem0 search with retry logic."""
     try:
-        result = mem0_client.search(query=query, user_id=USER_ID, limit=limit)
+        result = mem0_client.search(query=query, user_id=user_id, limit=limit)
         if result is None:
             return []
         return result.get("results", []) if isinstance(result, dict) else (result or [])
@@ -60,9 +60,9 @@ _cache_timestamps = {}
 CACHE_TTL_SECONDS = 60
 
 
-def _get_cached_search(query: str, limit: int = 3) -> list:
+def _get_cached_search(query: str, limit: int = 3, user_id: str = USER_ID) -> list:
     """Search with simple TTL cache."""
-    cache_key = f"{query}:{limit}"
+    cache_key = f"{user_id}:{query}:{limit}"
     now = datetime.now()
 
     if cache_key in _query_cache:
@@ -70,13 +70,13 @@ def _get_cached_search(query: str, limit: int = 3) -> list:
         if cached_time and (now - cached_time).seconds < CACHE_TTL_SECONDS:
             return _query_cache[cache_key]
 
-    result = _mem0_search(query, limit)
+    result = _mem0_search(query, limit, user_id=user_id)
     _query_cache[cache_key] = result
     _cache_timestamps[cache_key] = now
     return result
 
 
-def store_conversation(user_message: str, assistant_response: str) -> None:
+def store_conversation(user_message: str, assistant_response: str, user_id: str = USER_ID) -> None:
     """Store a conversation exchange with temporal metadata."""
     from temporal_context import get_temporal_context
 
@@ -88,7 +88,7 @@ def store_conversation(user_message: str, assistant_response: str) -> None:
     messages = [{"role": "user", "content": dated_user_msg}, {"role": "assistant", "content": dated_assistant_msg}]
     _mem0_add(
         messages,
-        user_id=USER_ID,
+        user_id=user_id,
         metadata={
             "stored_date": date.today().isoformat(),
             "training_phase": ctx["training_phase"],
@@ -97,11 +97,11 @@ def store_conversation(user_message: str, assistant_response: str) -> None:
     )
 
 
-def retrieve_context_and_constraints(query: str, limit: int = 3) -> tuple[str, str]:
+def retrieve_context_and_constraints(query: str, limit: int = 3, user_id: str = USER_ID) -> tuple[str, str]:
     """Combined retrieval for context and constraints (reduces API calls from 2 to 1+filtering)."""
     # Single broader search
     combined_query = f"{query} injury limitation constraint recovery"
-    memories = _get_cached_search(combined_query, limit=limit + 2)
+    memories = _get_cached_search(combined_query, limit=limit + 2, user_id=user_id)
 
     if not memories:
         return "", ""

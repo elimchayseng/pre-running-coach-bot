@@ -25,14 +25,14 @@ def _get_temporal_prompt() -> str:
     return _cached_temporal
 
 
-def get_system_prompt(user_query: str) -> str:
+def get_system_prompt(user_query: str, user_id: str = USER_ID) -> str:
     """Build system prompt with personality, temporal context, and relevant memories."""
     # Get temporal context (cached within day)
     temporal = _get_temporal_prompt()
     ctx = get_temporal_context()
 
     # Combined memory retrieval (1 API call instead of 2)
-    context, constraints = retrieve_context_and_constraints(user_query, limit=3)
+    context, constraints = retrieve_context_and_constraints(user_query, limit=3, user_id=user_id)
 
     prompt_parts = [
         f"You are PRE, a running coach. {PRE_PERSONALITY}",
@@ -73,7 +73,7 @@ def _call_llm(system_prompt: str, history: list) -> str:
 def chat(user_message: str, user_id: str = USER_ID) -> str:
     """Process user message and return coach response."""
     try:
-        system_prompt = get_system_prompt(user_message)
+        system_prompt = get_system_prompt(user_message, user_id=user_id)
 
         # Add user message to Redis history
         add_turn(user_id, "user", user_message)
@@ -90,7 +90,7 @@ def chat(user_message: str, user_id: str = USER_ID) -> str:
         # Store to Mem0 (skip trivial messages)
         skip_patterns = ["hi", "hey", "hello", "thanks", "thank you", "bye", "ok", "okay"]
         if user_message.lower().strip() not in skip_patterns:
-            store_conversation(user_message, assistant_response)
+            store_conversation(user_message, assistant_response, user_id=user_id)
 
         return assistant_response
 
