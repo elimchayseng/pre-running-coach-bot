@@ -1,10 +1,11 @@
-import logging
 from typing import Optional
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
-from config import llm_client, HEROKU_MODEL, PRE_PERSONALITY, logger
-from memory_manager import retrieve_context_and_constraints, store_conversation, USER_ID
+
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
+
+from config import HEROKU_MODEL, PRE_PERSONALITY, llm_client, logger
+from conversation_store import add_turn, clear_history, get_history
+from memory_manager import USER_ID, retrieve_context_and_constraints, store_conversation
 from temporal_context import build_temporal_prompt, get_temporal_context
-from conversation_store import get_history, add_turn, clear_history
 
 # Session-level cache for system prompt components
 _cached_temporal: Optional[str] = None
@@ -38,7 +39,7 @@ def get_system_prompt(user_query: str) -> str:
         "",
         temporal,
         "",
-        "Keep responses concise and actionable."
+        "Keep responses concise and actionable.",
     ]
 
     if context:
@@ -59,17 +60,12 @@ def get_system_prompt(user_query: str) -> str:
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=2, max=15),
-    retry=retry_if_exception_type((ConnectionError, TimeoutError))
+    retry=retry_if_exception_type((ConnectionError, TimeoutError)),
 )
 def _call_llm(system_prompt: str, history: list) -> str:
     """Call LLM with retry logic."""
     response = llm_client.chat.completions.create(
-        model=HEROKU_MODEL,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            *history
-        ],
-        max_tokens=500
+        model=HEROKU_MODEL, messages=[{"role": "system", "content": system_prompt}, *history], max_tokens=500
     )
     return response.choices[0].message.content
 

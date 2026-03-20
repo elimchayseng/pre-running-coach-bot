@@ -1,26 +1,16 @@
 """
 PRE: Running Coach Bot - Core bot logic with mem0 memory
 """
-import os
+
 import logging
-from mem0 import MemoryClient
-from openai import OpenAI
+
 from telegram import Update
 from telegram.ext import ContextTypes
 
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
-)
+from config import HEROKU_MODEL, llm_client, mem0_client
+
+logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-# Initialize clients
-mem0_client = MemoryClient(api_key=os.getenv("MEM0_API_KEY"))
-
-llm_client = OpenAI(
-    base_url=os.getenv("HEROKU_INFERENCE_URL"),
-    api_key=os.getenv("HEROKU_INFERENCE_KEY")
-)
 
 SYSTEM_PROMPT = """You are PRE, a friendly and knowledgeable running coach bot named after Steve Prefontaine.
 You help athletes with their training, race preparation, pacing strategies, and motivation.
@@ -76,25 +66,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         # Build messages for LLM
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT + memory_context},
-            {"role": "user", "content": user_message}
+            {"role": "user", "content": user_message},
         ]
 
         # Get response from LLM
-        response = llm_client.chat.completions.create(
-            model=os.getenv("HEROKU_MODEL", "claude-3-5-sonnet"),
-            messages=messages,
-            max_tokens=1024
-        )
+        response = llm_client.chat.completions.create(model=HEROKU_MODEL, messages=messages, max_tokens=1024)
 
         assistant_message = response.choices[0].message.content
 
         # Store the conversation in memory
         mem0_client.add(
-            [
-                {"role": "user", "content": user_message},
-                {"role": "assistant", "content": assistant_message}
-            ],
-            user_id=user_id
+            [{"role": "user", "content": user_message}, {"role": "assistant", "content": assistant_message}],
+            user_id=user_id,
         )
 
         # Send response
@@ -102,6 +85,4 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     except Exception as e:
         logger.error(f"Error processing message: {e}")
-        await update.message.reply_text(
-            "Sorry, I encountered an error. Please try again in a moment."
-        )
+        await update.message.reply_text("Sorry, I encountered an error. Please try again in a moment.")

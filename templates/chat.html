@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PRE Running Coach</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f5f5f5; display: flex; justify-content: center; padding: 20px; }
+    .container { max-width: 640px; width: 100%; }
+    h1 { text-align: center; margin-bottom: 4px; font-size: 1.4rem; }
+    .subtitle { text-align: center; color: #666; margin-bottom: 16px; font-size: 0.9rem; }
+    #messages { background: #fff; border: 1px solid #ddd; border-radius: 8px; height: 60vh; overflow-y: auto; padding: 16px; margin-bottom: 12px; }
+    .msg { margin-bottom: 12px; line-height: 1.5; }
+    .msg.user { text-align: right; }
+    .msg.user .bubble { background: #007bff; color: #fff; }
+    .msg.bot .bubble { background: #e9ecef; color: #333; }
+    .bubble { display: inline-block; padding: 8px 14px; border-radius: 16px; max-width: 80%; text-align: left; white-space: pre-wrap; }
+    .label { font-size: 0.75rem; color: #999; margin-bottom: 2px; }
+    form { display: flex; gap: 8px; }
+    input[type="text"] { flex: 1; padding: 10px 14px; border: 1px solid #ddd; border-radius: 20px; font-size: 1rem; outline: none; }
+    input[type="text"]:focus { border-color: #007bff; }
+    button { padding: 10px 20px; background: #007bff; color: #fff; border: none; border-radius: 20px; font-size: 1rem; cursor: pointer; }
+    button:disabled { background: #aaa; cursor: not-allowed; }
+    .user-id-bar { text-align: center; margin-bottom: 12px; font-size: 0.85rem; color: #666; }
+    .user-id-bar input { border: 1px solid #ddd; border-radius: 4px; padding: 2px 6px; width: 120px; font-size: 0.85rem; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>PRE Running Coach</h1>
+    <p class="subtitle">Web chat &mdash; test the bot without Telegram</p>
+    <div class="user-id-bar">
+      User ID: <input type="text" id="userId" value="web_test">
+    </div>
+    <div id="messages"></div>
+    <form id="chatForm">
+      <input type="text" id="input" placeholder="Ask PRE about your training..." autocomplete="off">
+      <button type="submit" id="sendBtn">Send</button>
+    </form>
+  </div>
+  <script>
+    const msgBox = document.getElementById("messages");
+    const form = document.getElementById("chatForm");
+    const input = document.getElementById("input");
+    const sendBtn = document.getElementById("sendBtn");
+    const userIdInput = document.getElementById("userId");
+
+    function addMsg(role, text) {
+      const div = document.createElement("div");
+      div.className = "msg " + role;
+      const label = document.createElement("div");
+      label.className = "label";
+      label.textContent = role === "user" ? "You" : "PRE";
+      const bubble = document.createElement("div");
+      bubble.className = "bubble";
+      bubble.textContent = text;
+      div.appendChild(label);
+      div.appendChild(bubble);
+      msgBox.appendChild(div);
+      msgBox.scrollTop = msgBox.scrollHeight;
+    }
+
+    form.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const msg = input.value.trim();
+      if (!msg) return;
+      addMsg("user", msg);
+      input.value = "";
+      sendBtn.disabled = true;
+
+      try {
+        const res = await fetch("/api/chat", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({message: msg, user_id: userIdInput.value.trim() || "web_test"})
+        });
+        const data = await res.json();
+        addMsg("bot", data.reply || data.error || "No response");
+      } catch (err) {
+        addMsg("bot", "Error: " + err.message);
+      } finally {
+        sendBtn.disabled = false;
+        input.focus();
+      }
+    });
+
+    input.focus();
+  </script>
+</body>
+</html>

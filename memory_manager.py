@@ -1,9 +1,9 @@
-import logging
-from datetime import datetime, timedelta, date
-from functools import lru_cache
+from datetime import date, datetime, timedelta
 from typing import Optional
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
-from config import mem0_client, logger
+
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
+
+from config import logger, mem0_client
 
 USER_ID = "runner"
 AGENT_ID = "pre_coach"
@@ -16,13 +16,13 @@ def _truncate_memory(text: str, max_chars: int = MAX_MEMORY_CHARS) -> str:
     """Truncate long memory text to save tokens."""
     if not text or len(text) <= max_chars:
         return text
-    return text[:max_chars - 3] + "..."
+    return text[: max_chars - 3] + "..."
 
 
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=1, max=10),
-    retry=retry_if_exception_type((ConnectionError, TimeoutError))
+    retry=retry_if_exception_type((ConnectionError, TimeoutError)),
 )
 def _mem0_search(query: str, limit: int = 3) -> list:
     """Mem0 search with retry logic."""
@@ -39,7 +39,7 @@ def _mem0_search(query: str, limit: int = 3) -> list:
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=1, max=10),
-    retry=retry_if_exception_type((ConnectionError, TimeoutError))
+    retry=retry_if_exception_type((ConnectionError, TimeoutError)),
 )
 def _mem0_add(messages: list, user_id: str = USER_ID, metadata: dict = None, agent_id: str = None) -> None:
     """Mem0 add with retry logic."""
@@ -79,23 +79,21 @@ def _get_cached_search(query: str, limit: int = 3) -> list:
 def store_conversation(user_message: str, assistant_response: str) -> None:
     """Store a conversation exchange with temporal metadata."""
     from temporal_context import get_temporal_context
+
     ctx = get_temporal_context()
 
     dated_user_msg = f"[{ctx['date']}] {user_message}"
     dated_assistant_msg = f"[{ctx['date']}] {assistant_response}"
 
-    messages = [
-        {"role": "user", "content": dated_user_msg},
-        {"role": "assistant", "content": dated_assistant_msg}
-    ]
+    messages = [{"role": "user", "content": dated_user_msg}, {"role": "assistant", "content": dated_assistant_msg}]
     _mem0_add(
         messages,
         user_id=USER_ID,
         metadata={
             "stored_date": date.today().isoformat(),
             "training_phase": ctx["training_phase"],
-            "days_to_race": ctx["days_to_race"]
-        }
+            "days_to_race": ctx["days_to_race"],
+        },
     )
 
 
@@ -123,8 +121,7 @@ def retrieve_context_and_constraints(query: str, limit: int = 3) -> tuple[str, s
 
         # Check if this is a constraint/injury
         is_constraint = metadata.get("type") == "injury" or any(
-            kw in memory_text.lower()
-            for kw in ["injury", "pain", "sore", "limit", "constraint", "recovery"]
+            kw in memory_text.lower() for kw in ["injury", "pain", "sore", "limit", "constraint", "recovery"]
         )
 
         if is_constraint:
@@ -159,11 +156,8 @@ def retrieve_context(query: str, limit: int = 3) -> str:
 def store_agent_personality() -> None:
     """Initialize coach personality in agent memory."""
     from config import PRE_PERSONALITY
-    _mem0_add(
-        [{"role": "system", "content": PRE_PERSONALITY}],
-        user_id=None,
-        agent_id=AGENT_ID
-    )
+
+    _mem0_add([{"role": "system", "content": PRE_PERSONALITY}], user_id=None, agent_id=AGENT_ID)
 
 
 def get_constraints() -> str:
@@ -199,10 +193,7 @@ def update_goal(goal_description: str) -> None:
             logger.info(f"Goal already exists, skipping: {goal_description}")
             return
 
-    _mem0_add(
-        [{"role": "user", "content": f"My marathon goal is: {goal_description}"}],
-        user_id=USER_ID
-    )
+    _mem0_add([{"role": "user", "content": f"My marathon goal is: {goal_description}"}], user_id=USER_ID)
 
 
 def store_injury(description: str, days_until_recovery: int = 14) -> None:
@@ -211,7 +202,7 @@ def store_injury(description: str, days_until_recovery: int = 14) -> None:
     _mem0_add(
         [{"role": "user", "content": f"Injury: {description}"}],
         user_id=USER_ID,
-        metadata={"type": "injury", "expiration_date": expiration}
+        metadata={"type": "injury", "expiration_date": expiration},
     )
 
 
@@ -240,7 +231,7 @@ def store_race_date(race_name: str, race_date: str) -> None:
     _mem0_add(
         [{"role": "user", "content": f"My target race: {race_name} on {race_date}"}],
         user_id=USER_ID,
-        metadata={"type": "race_date", "date": race_date}
+        metadata={"type": "race_date", "date": race_date},
     )
 
 

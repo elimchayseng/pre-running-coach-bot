@@ -1,22 +1,21 @@
+import logging
 import os
 import sys
-import logging
+
 from dotenv import load_dotenv
-from mem0 import MemoryClient
-from openai import OpenAI
 
 load_dotenv()
 
 # Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("pre_coach")
 
 # Quiet noisy loggers
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+# Testing mode: skip env validation and real client initialization
+TESTING = os.getenv("TESTING", "").lower() in ("1", "true")
 
 # Required environment variables
 REQUIRED_ENV_VARS = ["MEM0_API_KEY", "HEROKU_INFERENCE_URL", "HEROKU_INFERENCE_KEY"]
@@ -30,10 +29,6 @@ def validate_env() -> bool:
         return False
     return True
 
-
-# Validate on import
-if not validate_env():
-    sys.exit(1)
 
 # Mem0 client with custom instructions
 CUSTOM_INSTRUCTIONS = """
@@ -54,22 +49,37 @@ CUSTOM_CATEGORIES = [
     {"goals": "Race targets, time goals, Boston qualifying"},
     {"training": "Weekly plans, workouts, mileage"},
     {"constraints": "Injuries, recovery, limitations"},
-    {"preferences": "Schedule, terrain, gear preferences"}
+    {"preferences": "Schedule, terrain, gear preferences"},
 ]
-
-# Initialize Mem0 client
-mem0_client = MemoryClient(api_key=os.getenv("MEM0_API_KEY"))
-
-# Heroku LLM client (OpenAI-compatible)
-llm_client = OpenAI(
-    base_url=os.getenv("HEROKU_INFERENCE_URL"),
-    api_key=os.getenv("HEROKU_INFERENCE_KEY"),
-    timeout=30.0  # 30 second timeout
-)
 
 HEROKU_MODEL = os.getenv("HEROKU_MODEL", "claude-3-5-sonnet")
 
+if not TESTING:
+    # Validate on import
+    if not validate_env():
+        sys.exit(1)
+
+    from mem0 import MemoryClient
+    from openai import OpenAI
+
+    # Initialize Mem0 client
+    mem0_client = MemoryClient(api_key=os.getenv("MEM0_API_KEY"))
+
+    # Heroku LLM client (OpenAI-compatible)
+    llm_client = OpenAI(
+        base_url=os.getenv("HEROKU_INFERENCE_URL"),
+        api_key=os.getenv("HEROKU_INFERENCE_KEY"),
+        timeout=30.0,  # 30 second timeout
+    )
+else:
+    mem0_client = None
+    llm_client = None
+
 # Coach personality (condensed for token efficiency)
-PRE_PERSONALITY = """PRE is an elite marathon coach: clinical, demanding, uncompromising.
-He gives brutal truth over comfort, thinks in macro/microcycles, obsesses over biometrics (HRV, cardiac drift, GCT).
-He views Boston as a tactical challenge requiring precision pacing. He identifies mechanical leaks early and shuts down training if form breaks down."""
+PRE_PERSONALITY = (
+    "PRE is an elite marathon coach: clinical, demanding, uncompromising. "
+    "He gives brutal truth over comfort, thinks in macro/microcycles, "
+    "obsesses over biometrics (HRV, cardiac drift, GCT). "
+    "He views Boston as a tactical challenge requiring precision pacing. "
+    "He identifies mechanical leaks early and shuts down training if form breaks down."
+)

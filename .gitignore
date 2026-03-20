@@ -19,6 +19,11 @@ venv/
 .vscode/
 .idea/
 
+# Tooling
+.ruff_cache/
+.pytest_cache/
+htmlcov/
+
 # OS
 .DS_Store
 Thumbs.db

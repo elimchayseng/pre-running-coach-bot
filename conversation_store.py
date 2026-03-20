@@ -1,8 +1,9 @@
-import os
 import json
 import logging
+import os
+
 import redis
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 logger = logging.getLogger("pre_coach")
 
@@ -17,12 +18,7 @@ def _get_redis() -> redis.Redis:
     """Get Redis client with lazy initialization and reconnection support."""
     global _redis_client
     if _redis_client is None:
-        _redis_client = redis.from_url(
-            REDIS_URL,
-            decode_responses=True,
-            socket_connect_timeout=5,
-            socket_timeout=5
-        )
+        _redis_client = redis.from_url(REDIS_URL, decode_responses=True, socket_connect_timeout=5, socket_timeout=5)
     return _redis_client
 
 
@@ -39,7 +35,7 @@ def _key(user_id: str) -> str:
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=0.5, min=0.5, max=5),
-    retry=retry_if_exception_type((redis.ConnectionError, redis.TimeoutError))
+    retry=retry_if_exception_type((redis.ConnectionError, redis.TimeoutError)),
 )
 def get_history(user_id: str) -> list[dict]:
     """Get conversation history for user with retry."""
@@ -61,7 +57,7 @@ def get_history(user_id: str) -> list[dict]:
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=0.5, min=0.5, max=5),
-    retry=retry_if_exception_type((redis.ConnectionError, redis.TimeoutError))
+    retry=retry_if_exception_type((redis.ConnectionError, redis.TimeoutError)),
 )
 def add_turn(user_id: str, role: str, content: str) -> None:
     """Add a message to history with retry."""
@@ -72,7 +68,7 @@ def add_turn(user_id: str, role: str, content: str) -> None:
 
         # Sliding window: keep last N turns (N*2 messages)
         if len(history) > MAX_HISTORY_TURNS * 2:
-            history = history[-(MAX_HISTORY_TURNS * 2):]
+            history = history[-(MAX_HISTORY_TURNS * 2) :]
 
         r.setex(_key(user_id), SESSION_TTL_SECONDS, json.dumps(history))
     except (redis.ConnectionError, redis.TimeoutError) as e:
@@ -86,7 +82,7 @@ def add_turn(user_id: str, role: str, content: str) -> None:
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=0.5, min=0.5, max=5),
-    retry=retry_if_exception_type((redis.ConnectionError, redis.TimeoutError))
+    retry=retry_if_exception_type((redis.ConnectionError, redis.TimeoutError)),
 )
 def clear_history(user_id: str) -> None:
     """Clear conversation history for user with retry."""

@@ -1,4 +1,4 @@
-from datetime import datetime, date
+from datetime import date, datetime
 
 DEFAULT_RACE_DATE = date(2026, 4, 20)  # Boston Marathon
 
@@ -24,7 +24,7 @@ def get_temporal_context() -> dict:
         "time_of_day": time_of_day,
         "days_to_race": days_to_race,
         "weeks_to_race": days_to_race // 7,
-        "training_phase": get_training_phase(days_to_race)
+        "training_phase": get_training_phase(days_to_race),
     }
 
 
@@ -47,8 +47,8 @@ def build_temporal_prompt() -> str:
     """Build temporal context string for system prompt injection."""
     ctx = get_temporal_context()
     return f"""=== TEMPORAL CONTEXT ===
-Today: {ctx['date']} ({ctx['time_of_day']})
-Race: Boston Marathon - {ctx['days_to_race']} days away ({ctx['weeks_to_race']} weeks)
-Training phase: {ctx['training_phase']}
+Today: {ctx["date"]} ({ctx["time_of_day"]})
+Race: Boston Marathon - {ctx["days_to_race"]} days away ({ctx["weeks_to_race"]} weeks)
+Training phase: {ctx["training_phase"]}
 
 Adapt your coaching to this timing context."""

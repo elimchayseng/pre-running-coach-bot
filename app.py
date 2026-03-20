@@ -1,22 +1,23 @@
 """
 PRE: Running Coach Bot - Flask webhook server for Telegram
 """
-import os
-import logging
+
 import asyncio
-from flask import Flask, request, jsonify
+import logging
+import os
+import threading
+
 from dotenv import load_dotenv
-from telegram import Update, Bot
+from flask import Flask, jsonify, render_template, request
+from telegram import Bot, Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters
 
-from bot import start_command, handle_message
+from bot import handle_message, start_command
+from companion import chat as companion_chat
 
 load_dotenv()
 
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
-)
+logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
@@ -27,20 +28,34 @@ WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 
 telegram_app = None
 
+# --- Persistent event loop in a background thread ---
+_loop = asyncio.new_event_loop()
+
+
+def _start_loop(loop: asyncio.AbstractEventLoop) -> None:
+    asyncio.set_event_loop(loop)
+    loop.run_forever()
+
+
+_loop_thread = threading.Thread(target=_start_loop, args=(_loop,), daemon=True)
+_loop_thread.start()
+
+
+def _run_async(coro):
+    """Run a coroutine on the persistent event loop and return its result."""
+    future = asyncio.run_coroutine_threadsafe(coro, _loop)
+    return future.result(timeout=30)
+
 
 def get_telegram_app():
     """Get or create and initialize the Telegram application."""
     global telegram_app
     if telegram_app is None:
-        telegram_app = (
-            Application.builder()
-            .token(TELEGRAM_BOT_TOKEN)
-            .build()
-        )
+        telegram_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
         telegram_app.add_handler(CommandHandler("start", start_command))
         telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
         # Must initialize before process_update can be called
-        asyncio.run(telegram_app.initialize())
+        _run_async(telegram_app.initialize())
     return telegram_app
 
 
@@ -50,6 +65,30 @@ def health_check():
     return jsonify({"status": "healthy", "bot": "PRE Running Coach"})
 
 
+@app.route("/chat", methods=["GET"])
+def chat_page():
+    """Serve the web chat UI."""
+    return render_template("chat.html")
+
+
+@app.route("/api/chat", methods=["POST"])
+def api_chat():
+    """API endpoint for web chat — runs the same pipeline as Telegram."""
+    try:
+        data = request.get_json(force=True)
+        message = data.get("message", "").strip()
+        user_id = data.get("user_id", "web_test")
+
+        if not message:
+            return jsonify({"error": "Empty message"}), 400
+
+        reply = companion_chat(message, user_id=user_id)
+        return jsonify({"reply": reply})
+    except Exception as e:
+        logger.error(f"Web chat error: {e}")
+        return jsonify({"error": "Internal server error"}), 500
+
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
     """Handle incoming Telegram webhook updates."""
@@ -57,8 +96,8 @@ def webhook():
         telegram_application = get_telegram_app()
         update = Update.de_json(request.get_json(force=True), telegram_application.bot)
 
-        # Process update asynchronously
-        asyncio.run(telegram_application.process_update(update))
+        # Process update on the persistent event loop
+        _run_async(telegram_application.process_update(update))
 
         return jsonify({"status": "ok"})
     except Exception as e:
@@ -79,7 +118,7 @@ def setup_webhook():
         await bot.set_webhook(url=webhook_endpoint)
         logger.info(f"Webhook set to: {webhook_endpoint}")
 
-    asyncio.run(_set_webhook())
+    _run_async(_set_webhook())
 
 
 # Set up webhook on startup

@@ -1,24 +1,27 @@
-import sys
 import warnings
 
 # Suppress mem0's deprecation warning (it bypasses normal filters)
 _original_warn = warnings.warn
+
+
 def _filtered_warn(message, category=UserWarning, stacklevel=1):
     if "output_format" in str(message):
         return
     _original_warn(message, category, stacklevel + 1)
+
+
 warnings.warn = _filtered_warn
 
-from config import logger
-from companion import chat, reset_session
-from memory_manager import (
-    update_goal,
-    store_injury,
-    get_all_memories,
+from companion import chat, reset_session  # noqa: E402, I001
+from config import logger  # noqa: E402
+from conversation_store import check_redis_health  # noqa: E402
+from memory_manager import (  # noqa: E402
     clear_all_memories,
-    store_agent_personality
+    get_all_memories,
+    store_agent_personality,
+    store_injury,
+    update_goal,
 )
-from conversation_store import check_redis_health
 
 # ANSI color codes
 GREEN = "\033[92m"
@@ -71,6 +74,7 @@ def check_health() -> bool:
     # Check Mem0 (try a simple search)
     try:
         from memory_manager import _mem0_search
+
         _mem0_search("test", limit=1)
         print_system("  Mem0: OK")
         mem0_ok = True
@@ -80,11 +84,10 @@ def check_health() -> bool:
 
     # Check LLM
     try:
-        from config import llm_client, HEROKU_MODEL
+        from config import HEROKU_MODEL, llm_client
+
         llm_client.chat.completions.create(
-            model=HEROKU_MODEL,
-            messages=[{"role": "user", "content": "ping"}],
-            max_tokens=5
+            model=HEROKU_MODEL, messages=[{"role": "user", "content": "ping"}], max_tokens=5
         )
         print_system("  LLM: OK")
         llm_ok = True
@@ -123,7 +126,8 @@ def handle_command(cmd: str) -> bool:
             print_system(f"Injury logged (14-day tracking): {arg}")
 
     elif command == "/race":
-        from temporal_context import get_temporal_context, DEFAULT_RACE_DATE
+        from temporal_context import DEFAULT_RACE_DATE, get_temporal_context
+
         ctx = get_temporal_context()
         print_system(f"Race: Boston Marathon - {DEFAULT_RACE_DATE.strftime('%B %d, %Y')}")
         print_system(f"Countdown: {ctx['days_to_race']} days ({ctx['weeks_to_race']} weeks)")
@@ -131,6 +135,7 @@ def handle_command(cmd: str) -> bool:
 
     elif command == "/today":
         from temporal_context import get_temporal_context
+
         ctx = get_temporal_context()
         print_system(f"Date: {ctx['date']}")
         print_system(f"Time: {ctx['time_of_day']}")
@@ -145,8 +150,8 @@ def handle_command(cmd: str) -> bool:
             for mem in memories:
                 if mem is None:
                     continue
-                metadata = mem.get('metadata') or {}
-                memory_text = mem.get('memory', '')
+                metadata = mem.get("metadata") or {}
+                memory_text = mem.get("memory", "")
                 if metadata:
                     print(f"  - {memory_text} [metadata: {metadata}]")
                 else:
