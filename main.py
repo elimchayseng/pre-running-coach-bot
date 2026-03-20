@@ -15,6 +15,7 @@ warnings.warn = _filtered_warn
 from companion import chat, reset_session  # noqa: E402, I001
 from config import logger  # noqa: E402
 from conversation_store import check_redis_health  # noqa: E402
+from health import format_commands_text, run_health_checks  # noqa: E402
 from memory_manager import (  # noqa: E402
     clear_all_memories,
     get_all_memories,
@@ -47,55 +48,18 @@ def print_error(message: str) -> None:
 
 def show_help() -> None:
     """Display available commands."""
-    print_system("""
-Commands:
-  /goal <time>         - Update race goal (e.g., /goal 3:25)
-  /injury <desc>       - Log injury with 14-day tracking
-  /race                - Show race countdown and training phase
-  /today               - Show current date and time context
-  /history             - Show stored memories
-  /reset               - Clear session history (Mem0 memories preserved)
-  /clear               - Reset all memories
-  /health              - Check system health
-  /help                - Show this help
-  /quit                - Exit
-""")
+    print_system(f"\nCommands:\n{format_commands_text(include_quit=True)}\n")
 
 
 def check_health() -> bool:
     """Run system health checks."""
     print_system("Running health checks...")
-
-    # Check Redis
-    redis_ok = check_redis_health()
-    status = "OK" if redis_ok else "FAIL"
-    print_system(f"  Redis: {status}")
-
-    # Check Mem0 (try a simple search)
-    try:
-        from memory_manager import _mem0_search
-
-        _mem0_search("test", limit=1)
-        print_system("  Mem0: OK")
-        mem0_ok = True
-    except Exception as e:
-        print_error(f"  Mem0: FAIL ({e})")
-        mem0_ok = False
-
-    # Check LLM
-    try:
-        from config import HEROKU_MODEL, llm_client
-
-        llm_client.chat.completions.create(
-            model=HEROKU_MODEL, messages=[{"role": "user", "content": "ping"}], max_tokens=5
-        )
-        print_system("  LLM: OK")
-        llm_ok = True
-    except Exception as e:
-        print_error(f"  LLM: FAIL ({e})")
-        llm_ok = False
-
-    return redis_ok and mem0_ok and llm_ok
+    results = run_health_checks()
+    for component, ok in results.items():
+        status = "OK" if ok else "FAIL"
+        printer = print_system if ok else print_error
+        printer(f"  {component.capitalize()}: {status}")
+    return all(results.values())
 
 
 def handle_command(cmd: str) -> bool:
@@ -126,10 +90,11 @@ def handle_command(cmd: str) -> bool:
             print_system(f"Injury logged (14-day tracking): {arg}")
 
     elif command == "/race":
-        from temporal_context import DEFAULT_RACE_DATE, get_temporal_context
+        from temporal_context import get_race_date, get_temporal_context
 
         ctx = get_temporal_context()
-        print_system(f"Race: Boston Marathon - {DEFAULT_RACE_DATE.strftime('%B %d, %Y')}")
+        race_date = get_race_date()
+        print_system(f"Race: Boston Marathon - {race_date.strftime('%B %d, %Y')}")
         print_system(f"Countdown: {ctx['days_to_race']} days ({ctx['weeks_to_race']} weeks)")
         print_system(f"Phase: {ctx['training_phase']}")
 
@@ -161,11 +126,11 @@ def handle_command(cmd: str) -> bool:
         reset_session()
         print_system("Session history cleared. Mem0 memories preserved.")
 
-    elif command == "/clear":
-        confirm = input(f"{BLUE}Are you sure? This will delete all memories. (yes/no): {RESET}")
+    elif command == "/forgetall":
+        confirm = input(f"{BLUE}This will permanently delete ALL memories. Type 'yes' to confirm: {RESET}")
         if confirm.lower() == "yes":
             clear_all_memories()
-            print_system("All memories cleared.")
+            print_system("All memories deleted permanently.")
         else:
             print_system("Cancelled.")
 

@@ -23,43 +23,28 @@ def client():
 
 
 class TestHealthCheck:
-    def test_health_returns_200(self, client):
+    @patch("health.run_health_checks", return_value={"redis": True, "mem0": True, "llm": True})
+    def test_health_returns_200_when_all_ok(self, mock_checks, client):
         resp = client.get("/")
         assert resp.status_code == 200
         data = resp.get_json()
         assert data["status"] == "healthy"
+        assert data["redis"] == "ok"
+        assert data["mem0"] == "ok"
+        assert data["llm"] == "ok"
 
     def test_health_contains_bot_name(self, client):
         resp = client.get("/")
         data = resp.get_json()
         assert "PRE" in data["bot"]
 
-
-class TestChatPage:
-    def test_chat_page_returns_200(self, client):
-        resp = client.get("/chat")
-        assert resp.status_code == 200
-        assert b"PRE Running Coach" in resp.data
-
-
-class TestApiChat:
-    def test_empty_message_returns_400(self, client):
-        resp = client.post("/api/chat", json={"message": ""})
-        assert resp.status_code == 400
-
-    @patch("app.companion_chat", return_value="Keep running!")
-    def test_valid_message_returns_reply(self, mock_chat, client):
-        resp = client.post("/api/chat", json={"message": "How far today?"})
-        assert resp.status_code == 200
+    @patch("health.run_health_checks", return_value={"redis": False, "mem0": True, "llm": True})
+    def test_health_returns_503_when_redis_down(self, mock_checks, client):
+        resp = client.get("/")
+        assert resp.status_code == 503
         data = resp.get_json()
-        assert data["reply"] == "Keep running!"
-        mock_chat.assert_called_once_with("How far today?", user_id="web_test")
-
-    @patch("app.companion_chat", return_value="Noted!")
-    def test_custom_user_id(self, mock_chat, client):
-        resp = client.post("/api/chat", json={"message": "hi", "user_id": "custom_123"})
-        assert resp.status_code == 200
-        mock_chat.assert_called_once_with("hi", user_id="custom_123")
+        assert data["status"] == "degraded"
+        assert data["redis"] == "fail"
 
 
 class TestWebhook:

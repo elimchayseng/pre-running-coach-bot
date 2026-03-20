@@ -1,10 +1,16 @@
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from unittest.mock import MagicMock
 
 import pytest
 
 import memory_manager
-from memory_manager import MAX_MEMORY_CHARS, _truncate_memory, retrieve_context_and_constraints
+from memory_manager import (
+    CACHE_TTL_SECONDS,
+    MAX_MEMORY_CHARS,
+    _get_cached_search,
+    _truncate_memory,
+    retrieve_context_and_constraints,
+)
 
 
 class TestTruncateMemory:
@@ -83,3 +89,56 @@ class TestRetrieveContextAndConstraints:
         self.mock_client.search.return_value = [None, {"memory": "valid", "metadata": {}}]
         context, constraints = retrieve_context_and_constraints("test")
         assert "valid" in context
+
+
+class TestCachedSearch:
+    @pytest.fixture(autouse=True)
+    def mock_mem0(self, monkeypatch):
+        self.mock_client = MagicMock()
+        monkeypatch.setattr(memory_manager, "mem0_client", self.mock_client)
+        memory_manager._query_cache = {}
+        memory_manager._cache_timestamps = {}
+
+    def test_cache_returns_same_result(self):
+        self.mock_client.search.return_value = [{"memory": "cached result", "metadata": {}}]
+        result1 = _get_cached_search("test query", limit=3)
+        result2 = _get_cached_search("test query", limit=3)
+        assert result1 == result2
+        # Should only call Mem0 once — second call is cached
+        assert self.mock_client.search.call_count == 1
+
+    def test_cache_expires_after_ttl(self, monkeypatch):
+        self.mock_client.search.return_value = [{"memory": "old result", "metadata": {}}]
+        _get_cached_search("test query", limit=3)
+
+        # Simulate time passing beyond TTL
+        past_time = datetime.now() - timedelta(seconds=CACHE_TTL_SECONDS + 10)
+        memory_manager._cache_timestamps["runner:test query:3"] = past_time
+
+        self.mock_client.search.return_value = [{"memory": "new result", "metadata": {}}]
+        result = _get_cached_search("test query", limit=3)
+        assert result[0]["memory"] == "new result"
+        assert self.mock_client.search.call_count == 2
+
+    def test_cache_does_not_expire_with_total_seconds_fix(self, monkeypatch):
+        """Regression test: .seconds bug would cause cache to never expire after 24h."""
+        self.mock_client.search.return_value = [{"memory": "stale", "metadata": {}}]
+        _get_cached_search("test query", limit=3)
+
+        # Simulate 25 hours ago (the .seconds bug: timedelta(days=1, seconds=30).seconds == 30)
+        old_time = datetime.now() - timedelta(hours=25)
+        memory_manager._cache_timestamps["runner:test query:3"] = old_time
+
+        self.mock_client.search.return_value = [{"memory": "fresh", "metadata": {}}]
+        result = _get_cached_search("test query", limit=3)
+        assert result[0]["memory"] == "fresh"
+        assert self.mock_client.search.call_count == 2
+
+    def test_different_queries_cached_separately(self):
+        self.mock_client.search.return_value = [{"memory": "result A", "metadata": {}}]
+        _get_cached_search("query A", limit=3)
+
+        self.mock_client.search.return_value = [{"memory": "result B", "metadata": {}}]
+        _get_cached_search("query B", limit=3)
+
+        assert self.mock_client.search.call_count == 2

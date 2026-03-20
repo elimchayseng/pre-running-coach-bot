@@ -7,8 +7,9 @@ import logging
 from telegram import Update
 from telegram.ext import ContextTypes
 
-from companion import chat as companion_chat, reset_session
-from conversation_store import check_redis_health
+from companion import chat as companion_chat
+from companion import reset_session
+from health import format_commands_text, run_health_checks
 from memory_manager import (
     USER_ID,
     clear_all_memories,
@@ -16,7 +17,7 @@ from memory_manager import (
     store_injury,
     update_goal,
 )
-from temporal_context import DEFAULT_RACE_DATE, get_temporal_context
+from temporal_context import get_race_date, get_temporal_context
 
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -30,6 +31,7 @@ def get_user_id(update: Update) -> str:
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /start command."""
     user = update.effective_user
+    commands_text = format_commands_text()
     welcome_message = (
         f"Hey {user.first_name}! I'm PRE, your running coach bot.\n\n"
         "I can help you with:\n"
@@ -37,16 +39,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "- Race preparation and pacing strategies\n"
         "- Recovery and injury prevention\n"
         "- Motivation and goal setting\n\n"
-        "Commands:\n"
-        "/goal <time> - Update race goal\n"
-        "/injury <desc> - Log injury (14-day tracking)\n"
-        "/race - Show race countdown\n"
-        "/today - Show current date context\n"
-        "/history - Show stored memories\n"
-        "/reset - Clear session history\n"
-        "/clear - Delete all memories\n"
-        "/health - Check system health\n"
-        "/help - Show commands\n\n"
+        f"Commands:\n{commands_text}\n\n"
         "Just send me a message about your running goals or questions!"
     )
     await update.message.reply_text(welcome_message)
@@ -54,18 +47,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /help command."""
-    await update.message.reply_text(
-        "Commands:\n"
-        "/goal <time> - Update race goal (e.g., /goal 3:25)\n"
-        "/injury <desc> - Log injury with 14-day tracking\n"
-        "/race - Show race countdown and training phase\n"
-        "/today - Show current date and time context\n"
-        "/history - Show stored memories\n"
-        "/reset - Clear session history (memories preserved)\n"
-        "/clear - Delete all memories\n"
-        "/health - Check system health\n"
-        "/help - Show this help"
-    )
+    await update.message.reply_text(f"Commands:\n{format_commands_text()}")
 
 
 async def goal_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -91,8 +73,9 @@ async def injury_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def race_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /race command."""
     ctx = get_temporal_context()
+    race_date = get_race_date()
     await update.message.reply_text(
-        f"Race: Boston Marathon - {DEFAULT_RACE_DATE.strftime('%B %d, %Y')}\n"
+        f"Race: Boston Marathon - {race_date.strftime('%B %d, %Y')}\n"
         f"Countdown: {ctx['days_to_race']} days ({ctx['weeks_to_race']} weeks)\n"
         f"Phase: {ctx['training_phase']}"
     )
@@ -102,9 +85,7 @@ async def today_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     """Handle /today command."""
     ctx = get_temporal_context()
     await update.message.reply_text(
-        f"Date: {ctx['date']}\n"
-        f"Time: {ctx['time_of_day']}\n"
-        f"Days to race: {ctx['days_to_race']}"
+        f"Date: {ctx['date']}\nTime: {ctx['time_of_day']}\nDays to race: {ctx['days_to_race']}"
     )
 
 
@@ -140,38 +121,23 @@ async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await update.message.reply_text("Session history cleared. Mem0 memories preserved.")
 
 
-async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /clear command."""
-    clear_all_memories()
-    await update.message.reply_text("All memories cleared.")
+async def forget_all_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /forgetall command with confirmation."""
+    args = context.args
+    if args and args[0].lower() == "confirm":
+        clear_all_memories()
+        await update.message.reply_text("All memories deleted permanently.")
+    else:
+        await update.message.reply_text(
+            "This will permanently delete ALL stored memories.\nSend /forgetall confirm to proceed."
+        )
 
 
 async def health_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /health command."""
-    results = []
-
-    redis_ok = check_redis_health()
-    results.append(f"Redis: {'OK' if redis_ok else 'FAIL'}")
-
-    try:
-        from memory_manager import _mem0_search
-
-        _mem0_search("test", limit=1)
-        results.append("Mem0: OK")
-    except Exception as e:
-        results.append(f"Mem0: FAIL ({e})")
-
-    try:
-        from config import HEROKU_MODEL, llm_client
-
-        llm_client.chat.completions.create(
-            model=HEROKU_MODEL, messages=[{"role": "user", "content": "ping"}], max_tokens=5
-        )
-        results.append("LLM: OK")
-    except Exception as e:
-        results.append(f"LLM: FAIL ({e})")
-
-    await update.message.reply_text("Health Check:\n" + "\n".join(results))
+    results = run_health_checks()
+    lines = [f"{component.capitalize()}: {'OK' if ok else 'FAIL'}" for component, ok in results.items()]
+    await update.message.reply_text("Health Check:\n" + "\n".join(lines))
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -182,7 +148,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     logger.info(f"Message from {user_id}: {user_message[:50]}...")
 
     try:
-        # Use the same pipeline as web and CLI
+        # Use the same pipeline as CLI
         response = companion_chat(user_message, user_id=user_id)
         await update.message.reply_text(response)
 

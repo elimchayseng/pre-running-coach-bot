@@ -1,4 +1,14 @@
-from temporal_context import build_temporal_prompt, get_temporal_context, get_training_phase
+import pytest
+
+from temporal_context import build_temporal_prompt, get_temporal_context, get_training_phase, reset_race_date_cache
+
+
+@pytest.fixture(autouse=True)
+def _reset_cache():
+    """Reset the race date cache between tests."""
+    reset_race_date_cache()
+    yield
+    reset_race_date_cache()
 
 
 class TestGetTrainingPhase:

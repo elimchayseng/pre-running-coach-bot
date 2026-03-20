@@ -24,6 +24,9 @@ venv/
 .pytest_cache/
 htmlcov/
 
+# Project
+TODOS.md
+
 # OS
 .DS_Store
 Thumbs.db

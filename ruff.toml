@@ -5,4 +5,4 @@ target-version = "py313"
 select = ["E", "F", "W", "I"]
 
 [lint.isort]
-known-first-party = ["config", "bot", "companion", "memory_manager", "conversation_store", "temporal_context"]
+known-first-party = ["config", "bot", "companion", "health", "memory_manager", "conversation_store", "temporal_context"]

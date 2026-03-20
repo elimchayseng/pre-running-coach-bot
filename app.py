@@ -8,12 +8,12 @@ import os
 import threading
 
 from dotenv import load_dotenv
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, jsonify, request
 from telegram import Bot, Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters
 
 from bot import (
-    clear_command,
+    forget_all_command,
     goal_command,
     handle_message,
     health_command,
@@ -25,7 +25,6 @@ from bot import (
     start_command,
     today_command,
 )
-from companion import chat as companion_chat
 
 load_dotenv()
 
@@ -72,7 +71,7 @@ def get_telegram_app():
         telegram_app.add_handler(CommandHandler("today", today_command))
         telegram_app.add_handler(CommandHandler("history", history_command))
         telegram_app.add_handler(CommandHandler("reset", reset_command))
-        telegram_app.add_handler(CommandHandler("clear", clear_command))
+        telegram_app.add_handler(CommandHandler("forgetall", forget_all_command))
         telegram_app.add_handler(CommandHandler("health", health_command))
         telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
         # Must initialize before process_update can be called
@@ -82,37 +81,32 @@ def get_telegram_app():
 
 @app.route("/", methods=["GET"])
 def health_check():
-    """Health check endpoint for Railway."""
-    return jsonify({"status": "healthy", "bot": "PRE Running Coach"})
+    """Health check endpoint for Railway — checks Redis and Mem0."""
+    from health import run_health_checks
 
-
-@app.route("/chat", methods=["GET"])
-def chat_page():
-    """Serve the web chat UI."""
-    return render_template("chat.html")
-
-
-@app.route("/api/chat", methods=["POST"])
-def api_chat():
-    """API endpoint for web chat — runs the same pipeline as Telegram."""
-    try:
-        data = request.get_json(force=True)
-        message = data.get("message", "").strip()
-        user_id = data.get("user_id", "web_test")
-
-        if not message:
-            return jsonify({"error": "Empty message"}), 400
-
-        reply = companion_chat(message, user_id=user_id)
-        return jsonify({"reply": reply})
-    except Exception as e:
-        logger.error(f"Web chat error: {e}")
-        return jsonify({"error": "Internal server error"}), 500
+    results = run_health_checks()
+    all_ok = all(results.values())
+    status_code = 200 if all_ok else 503
+    return jsonify(
+        {
+            "status": "healthy" if all_ok else "degraded",
+            "bot": "PRE Running Coach",
+            **{k: ("ok" if v else "fail") for k, v in results.items()},
+        }
+    ), status_code
 
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
     """Handle incoming Telegram webhook updates."""
+    # T8: Verify the request comes from Telegram via secret_token
+    webhook_secret = os.getenv("TELEGRAM_WEBHOOK_SECRET")
+    if webhook_secret:
+        token_header = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+        if token_header != webhook_secret:
+            logger.warning("Webhook request rejected: invalid secret token")
+            return jsonify({"status": "forbidden"}), 403
+
     try:
         telegram_application = get_telegram_app()
         update = Update.de_json(request.get_json(force=True), telegram_application.bot)
@@ -123,7 +117,8 @@ def webhook():
         return jsonify({"status": "ok"})
     except Exception as e:
         logger.error(f"Webhook error: {e}")
-        return jsonify({"status": "error", "message": str(e)}), 500
+        # T9: Don't leak internal error details in response
+        return jsonify({"status": "error", "message": "Internal processing error"}), 500
 
 
 def setup_webhook():
@@ -133,10 +128,14 @@ def setup_webhook():
         return
 
     webhook_endpoint = f"{WEBHOOK_URL}/webhook"
+    webhook_secret = os.getenv("TELEGRAM_WEBHOOK_SECRET")
     bot = Bot(token=TELEGRAM_BOT_TOKEN)
 
     async def _set_webhook():
-        await bot.set_webhook(url=webhook_endpoint)
+        kwargs = {"url": webhook_endpoint}
+        if webhook_secret:
+            kwargs["secret_token"] = webhook_secret
+        await bot.set_webhook(**kwargs)
         logger.info(f"Webhook set to: {webhook_endpoint}")
 
     _run_async(_set_webhook())

@@ -1,5 +1,6 @@
 from typing import Optional
 
+from openai import APIStatusError, RateLimitError
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from config import HEROKU_MODEL, PRE_PERSONALITY, llm_client, logger
@@ -60,13 +61,16 @@ def get_system_prompt(user_query: str, user_id: str = USER_ID) -> str:
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=2, max=15),
-    retry=retry_if_exception_type((ConnectionError, TimeoutError)),
+    retry=retry_if_exception_type((ConnectionError, TimeoutError, RateLimitError, APIStatusError)),
 )
 def _call_llm(system_prompt: str, history: list) -> str:
     """Call LLM with retry logic."""
     response = llm_client.chat.completions.create(
         model=HEROKU_MODEL, messages=[{"role": "system", "content": system_prompt}, *history], max_tokens=500
     )
+    if not response.choices:
+        logger.error("LLM returned empty choices array")
+        raise ValueError("LLM returned no response choices")
     return response.choices[0].message.content
 
 

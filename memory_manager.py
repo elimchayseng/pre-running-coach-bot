@@ -44,9 +44,11 @@ def _mem0_search(query: str, limit: int = 3, user_id: str = USER_ID) -> list:
 def _mem0_add(messages: list, user_id: str = USER_ID, metadata: dict = None, agent_id: str = None) -> None:
     """Mem0 add with retry logic."""
     try:
-        kwargs = {"user_id": user_id} if user_id else {}
+        kwargs = {}
+        if user_id:
+            kwargs["user_id"] = user_id
         if agent_id:
-            kwargs = {"agent_id": agent_id}
+            kwargs["agent_id"] = agent_id
         if metadata:
             kwargs["metadata"] = metadata
         mem0_client.add(messages, output_format="v1.1", **kwargs)
@@ -67,7 +69,7 @@ def _get_cached_search(query: str, limit: int = 3, user_id: str = USER_ID) -> li
 
     if cache_key in _query_cache:
         cached_time = _cache_timestamps.get(cache_key)
-        if cached_time and (now - cached_time).seconds < CACHE_TTL_SECONDS:
+        if cached_time and (now - cached_time).total_seconds() < CACHE_TTL_SECONDS:
             return _query_cache[cache_key]
 
     result = _mem0_search(query, limit, user_id=user_id)
