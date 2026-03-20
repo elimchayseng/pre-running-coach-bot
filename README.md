@@ -1,6 +1,6 @@
 # PRE - AI Running Coach Bot
 
-An AI-powered running coach named after [Steve Prefontaine](https://en.wikipedia.org/wiki/Steve_Prefontaine). PRE provides personalized marathon training guidance with long-term memory, temporal awareness, and injury tracking.
+An AI-powered running coach that provides personalized marathon training guidance with long-term memory, temporal awareness, and injury tracking.
 
 ## Features
 
@@ -16,7 +16,7 @@ An AI-powered running coach named after [Steve Prefontaine](https://en.wikipedia
 - **Memory**: [Mem0](https://mem0.ai) for long-term athlete context
 - **Session Store**: Redis for conversation history
 - **Telegram**: python-telegram-bot with Flask webhook
-- **Deployment**: Heroku (gunicorn)
+- **Deployment**: Railway (gunicorn)
 
 ## Prerequisites
 
@@ -82,13 +82,12 @@ gunicorn app:app
 
 ## Deployment
 
-Deploy to Heroku with the included `Procfile`:
+Deploy to Railway with the included `Procfile`:
 
-```bash
-heroku create your-app-name
-heroku config:set MEM0_API_KEY=... HEROKU_INFERENCE_URL=... HEROKU_INFERENCE_KEY=... HEROKU_MODEL=... REDIS_URL=... TELEGRAM_BOT_TOKEN=... WEBHOOK_URL=...
-git push heroku main
-```
+1. Create a new project on [Railway](https://railway.app)
+2. Connect your GitHub repo
+3. Add environment variables from `.env.example`
+4. Railway will auto-detect the `Procfile` and deploy
 
 ## Project Structure
 
@@ -103,6 +102,6 @@ git push heroku main
 ├── temporal_context.py     # Date/time and training phase logic
 ├── test_heroku_llm.py      # LLM connectivity test
 ├── requirements.txt        # Python dependencies
-├── Procfile                # Heroku process definition
+├── Procfile                # Railway process definition
 └── .env.example            # Environment variable template
 ```
