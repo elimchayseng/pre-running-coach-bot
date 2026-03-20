@@ -49,7 +49,7 @@ def _mem0_add(messages: list, user_id: str = USER_ID, metadata: dict = None, age
             kwargs = {"agent_id": agent_id}
         if metadata:
             kwargs["metadata"] = metadata
-        mem0_client.add(messages, **kwargs)
+        mem0_client.add(messages, output_format="v1.1", **kwargs)
     except Exception as e:
         logger.error(f"Mem0 add failed: {e}")
 
