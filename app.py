@@ -29,7 +29,7 @@ telegram_app = None
 
 
 def get_telegram_app():
-    """Get or create the Telegram application."""
+    """Get or create and initialize the Telegram application."""
     global telegram_app
     if telegram_app is None:
         telegram_app = (
@@ -39,6 +39,8 @@ def get_telegram_app():
         )
         telegram_app.add_handler(CommandHandler("start", start_command))
         telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+        # Must initialize before process_update can be called
+        asyncio.run(telegram_app.initialize())
     return telegram_app
 
 
