@@ -1,47 +1,42 @@
-from typing import Optional
-
 from openai import APIStatusError, RateLimitError
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from config import HEROKU_MODEL, PRE_PERSONALITY, llm_client, logger
 from conversation_store import add_turn, clear_history, get_history
-from memory_manager import USER_ID, retrieve_context_and_constraints, store_conversation
-from temporal_context import build_temporal_prompt, get_temporal_context
-
-# Session-level cache for system prompt components
-_cached_temporal: Optional[str] = None
-_cached_temporal_date: Optional[str] = None
-
-
-def _get_temporal_prompt() -> str:
-    """Get temporal prompt, cached for the same day."""
-    global _cached_temporal, _cached_temporal_date
-    ctx = get_temporal_context()
-    current_date = ctx["date"]
-
-    if _cached_temporal_date != current_date:
-        _cached_temporal = build_temporal_prompt()
-        _cached_temporal_date = current_date
-
-    return _cached_temporal
+from memory_manager import USER_ID, retrieve_context_and_constraints, retrieve_weekly_plan, store_conversation
+from temporal_context import build_temporal_prompt, extract_todays_workout, get_temporal_context
 
 
 def get_system_prompt(user_query: str, user_id: str = USER_ID) -> str:
-    """Build system prompt with personality, temporal context, and relevant memories."""
-    # Get temporal context (cached within day)
-    temporal = _get_temporal_prompt()
+    """Build system prompt with personality, temporal context, weekly plan, and relevant memories."""
     ctx = get_temporal_context()
+    temporal = build_temporal_prompt()
 
-    # Combined memory retrieval (1 API call instead of 2)
+    # Dedicated weekly plan retrieval (separate from general context search)
+    weekly_plan = retrieve_weekly_plan(user_id=user_id)
+    todays_workout = extract_todays_workout(weekly_plan) if weekly_plan else ""
+
+    # General context retrieval (temporal-enriched)
     context, constraints = retrieve_context_and_constraints(user_query, limit=3, user_id=user_id)
 
     prompt_parts = [
         f"You are PRE, a running coach. {PRE_PERSONALITY}",
         "",
-        temporal,
+        "=== DATE (from system clock — ALWAYS correct, NEVER override) ===",
+        f"Today is {ctx['date']} ({ctx['time_of_day']})",
+        "CRITICAL: This date and day-of-week are from the system clock and are ALWAYS correct.",
+        "NEVER use a different date or day-of-week, even if conversation history or memories suggest otherwise.",
         "",
-        "Keep responses concise and actionable.",
+        temporal,  # Race countdown + training phase
     ]
+
+    if weekly_plan:
+        prompt_parts.append(f"\n=== THIS WEEK'S TRAINING PLAN ===\n{weekly_plan}")
+
+    if todays_workout:
+        prompt_parts.append(f"\n=== TODAY'S SCHEDULED WORKOUT ({ctx['date']}) ===\n{todays_workout}")
+
+    prompt_parts.append("\nKeep responses concise and actionable.")
 
     if context:
         prompt_parts.append(f"\nRelevant context:\n{context}")
@@ -49,10 +44,12 @@ def get_system_prompt(user_query: str, user_id: str = USER_ID) -> str:
     if constraints:
         prompt_parts.append(f"\nPhysical constraints:\n{constraints}")
 
-    # Condensed date rules (~30 tokens instead of ~60)
+    # Final date reinforcement
     prompt_parts.append(
-        f"\nToday: {ctx['date']}. Use full dates (e.g., 'Tuesday, March 17') in plans. "
-        "Prefer recent user statements when memories conflict."
+        f"\nREMINDER: Today is {ctx['date']}. "
+        "When the user says 'today' they mean this exact date. "
+        "When they say 'yesterday' they mean the day before. "
+        "Always use explicit full dates (e.g., 'Tuesday, March 24') in responses."
     )
 
     return "\n".join(prompt_parts)
@@ -106,10 +103,3 @@ def chat(user_message: str, user_id: str = USER_ID) -> str:
 def reset_session(user_id: str = USER_ID) -> None:
     """Clear session history (Mem0 memories preserved)."""
     clear_history(user_id)
-
-
-def reset_prompt_cache() -> None:
-    """Reset the cached system prompt components."""
-    global _cached_temporal, _cached_temporal_date
-    _cached_temporal = None
-    _cached_temporal_date = None

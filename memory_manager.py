@@ -1,3 +1,4 @@
+import re
 from datetime import date, datetime, timedelta
 from typing import Optional
 
@@ -10,6 +11,13 @@ AGENT_ID = "pre_coach"
 
 # Memory truncation limit (tokens ~ chars/4)
 MAX_MEMORY_CHARS = 400  # ~100 tokens per memory
+
+# Day abbreviation to full name mapping
+_DAY_ABBREVS = {"mon": "Monday", "tue": "Tuesday", "wed": "Wednesday", "thu": "Thursday",
+                "fri": "Friday", "sat": "Saturday", "sun": "Sunday"}
+
+# Weekly plan: higher truncation limit since plans are structured data
+MAX_PLAN_CHARS = 800
 
 
 def _truncate_memory(text: str, max_chars: int = MAX_MEMORY_CHARS) -> str:
@@ -78,31 +86,134 @@ def _get_cached_search(query: str, limit: int = 3, user_id: str = USER_ID) -> li
     return result
 
 
-def store_conversation(user_message: str, assistant_response: str, user_id: str = USER_ID) -> None:
-    """Store a conversation exchange with temporal metadata."""
-    from temporal_context import get_temporal_context
+def resolve_temporal_references(query: str) -> str:
+    """Resolve temporal words (today, yesterday, this week, day names) to explicit dates for better mem0 search."""
+    from temporal_context import get_temporal_context, now_local, resolve_day_name_to_date, today_local
+
+    lower = query.lower()
+
+    # Check for explicit day names (Monday, Tuesday, etc.)
+    _day_names = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+    has_day_name = any(d in lower for d in _day_names)
+
+    has_temporal = has_day_name or any(kw in lower for kw in [
+        "today", "this morning", "this evening", "this afternoon",
+        "yesterday", "this week", "last week", "tomorrow",
+    ])
+    if not has_temporal:
+        return query
 
     ctx = get_temporal_context()
+    today = today_local()
+
+    additions = []
+    if any(kw in lower for kw in ["today", "this morning", "this evening", "this afternoon"]):
+        additions.append(f"[Date: {ctx['date']}]")
+    if "yesterday" in lower:
+        yesterday = today - timedelta(days=1)
+        additions.append(f"[Date: {yesterday.strftime('%A, %B %d, %Y')}]")
+    if "tomorrow" in lower:
+        tomorrow = today + timedelta(days=1)
+        additions.append(f"[Date: {tomorrow.strftime('%A, %B %d, %Y')}]")
+    if "this week" in lower:
+        week_start = today - timedelta(days=today.weekday())  # Monday
+        week_end = week_start + timedelta(days=6)  # Sunday
+        additions.append(f"[Week: {week_start.strftime('%B %d')} - {week_end.strftime('%B %d, %Y')}]")
+    if "last week" in lower:
+        last_week_start = today - timedelta(days=today.weekday() + 7)
+        last_week_end = last_week_start + timedelta(days=6)
+        additions.append(f"[Week: {last_week_start.strftime('%B %d')} - {last_week_end.strftime('%B %d, %Y')}]")
+
+    # Resolve explicit day names: "how was my Monday?" → closest past Monday
+    # Use past for report-like queries, future for planning-like queries
+    if has_day_name:
+        planning_keywords = ["plan", "schedule", "what's", "whats", "what is", "upcoming", "next"]
+        intent = "future" if any(kw in lower for kw in planning_keywords) else "past"
+        for day in _day_names:
+            if day in lower:
+                resolved = resolve_day_name_to_date(day, intent=intent)
+                additions.append(f"[{day.capitalize()}: {resolved.strftime('%A, %B %d, %Y')}]")
+
+    if additions:
+        return f"{query} {' '.join(additions)}"
+    return query
+
+
+def _resolve_workout_date(message: str) -> str:
+    """Resolve temporal references in a workout report to an ISO date string."""
+    from temporal_context import resolve_day_name_to_date, today_local
+
+    lower = message.lower()
+    today = today_local()
+    if "yesterday" in lower:
+        return (today - timedelta(days=1)).isoformat()
+
+    # Check for explicit day names: "my Monday run", "Saturday's long run"
+    _day_names = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+    for day in _day_names:
+        if day in lower:
+            resolved = resolve_day_name_to_date(day, intent="past")
+            return resolved.isoformat()
+
+    # Default: today (covers "this morning", "today", or no temporal reference)
+    return today.isoformat()
+
+
+def _detect_workout_report(message: str) -> bool:
+    """Detect if a message is reporting a completed workout."""
+    lower = message.lower()
+    workout_keywords = ["ran", "run ", "miles", "mi ", "workout", "tempo", "intervals",
+                        "long run", "easy run", "recovery run", "splits", "pace"]
+    return sum(1 for kw in workout_keywords if kw in lower) >= 2
+
+
+def _detect_weekly_plan(text: str) -> bool:
+    """Detect if text contains a weekly training plan (markdown table format)."""
+    lower = text.lower()
+    # Must have multiple day references in table-like format
+    day_pattern = re.compile(r'\b(mon|tue|wed|thu|fri|sat|sun)\b', re.IGNORECASE)
+    day_matches = day_pattern.findall(lower)
+    has_table = "|" in text
+    has_plan_keywords = any(kw in lower for kw in ["week", "plan", "schedule", "target"])
+    return len(day_matches) >= 4 and has_table and has_plan_keywords
+
+
+def store_conversation(user_message: str, assistant_response: str, user_id: str = USER_ID) -> None:
+    """Store a conversation exchange with temporal metadata."""
+    from temporal_context import get_temporal_context, today_local
+
+    ctx = get_temporal_context()
+    today = today_local()
 
     dated_user_msg = f"[{ctx['date']}] {user_message}"
     dated_assistant_msg = f"[{ctx['date']}] {assistant_response}"
 
+    metadata = {
+        "stored_date": today.isoformat(),
+        "training_phase": ctx["training_phase"],
+        "days_to_race": ctx["days_to_race"],
+    }
+
+    # Detect and tag workout reports
+    if _detect_workout_report(user_message):
+        workout_date = _resolve_workout_date(user_message)
+        metadata["type"] = "workout_log"
+        metadata["workout_date"] = workout_date
+        metadata["day_of_week"] = date.fromisoformat(workout_date).strftime("%A")
+
     messages = [{"role": "user", "content": dated_user_msg}, {"role": "assistant", "content": dated_assistant_msg}]
-    _mem0_add(
-        messages,
-        user_id=user_id,
-        metadata={
-            "stored_date": date.today().isoformat(),
-            "training_phase": ctx["training_phase"],
-            "days_to_race": ctx["days_to_race"],
-        },
-    )
+    _mem0_add(messages, user_id=user_id, metadata=metadata)
+
+    # Auto-detect and store weekly plans from assistant responses
+    if _detect_weekly_plan(assistant_response) and len(assistant_response) > 200:
+        store_weekly_plan(assistant_response, user_id=user_id)
 
 
 def retrieve_context_and_constraints(query: str, limit: int = 3, user_id: str = USER_ID) -> tuple[str, str]:
     """Combined retrieval for context and constraints (reduces API calls from 2 to 1+filtering)."""
-    # Single broader search
-    combined_query = f"{query} injury limitation constraint recovery"
+    # Enrich temporal references before searching
+    enriched_query = resolve_temporal_references(query)
+    combined_query = f"{enriched_query} injury limitation constraint recovery"
     memories = _get_cached_search(combined_query, limit=limit + 2, user_id=user_id)
 
     if not memories:
@@ -243,6 +354,97 @@ def get_race_date() -> Optional[str]:
     if not memories or memories[0] is None:
         return None
     return memories[0].get("memory")
+
+
+def store_weekly_plan(plan_text: str, week_start: date = None, user_id: str = USER_ID) -> None:
+    """Store a weekly training plan with structured metadata for reliable retrieval.
+
+    Includes a created_at timestamp so retrieve_weekly_plan can pick the latest
+    version if the plan is updated mid-week.
+    """
+    from temporal_context import now_local, today_local
+
+    today = today_local()
+    if week_start is None:
+        week_start = today - timedelta(days=today.weekday())  # Monday
+    week_end = week_start + timedelta(days=6)  # Sunday
+
+    # Build a structured header so the stored text has explicit date context
+    header = (
+        f"WEEKLY TRAINING PLAN: {week_start.strftime('%A %B %d')} - "
+        f"{week_end.strftime('%A %B %d, %Y')}"
+    )
+    structured_plan = f"{header}\n{plan_text}"
+
+    _mem0_add(
+        [{"role": "assistant", "content": structured_plan}],
+        user_id=user_id,
+        metadata={
+            "type": "weekly_plan",
+            "week_start": week_start.isoformat(),
+            "week_end": week_end.isoformat(),
+            "stored_date": today.isoformat(),
+            "created_at": now_local().isoformat(),
+        },
+    )
+    logger.info(f"Stored weekly plan for {week_start.isoformat()} - {week_end.isoformat()}")
+
+
+def retrieve_weekly_plan(user_id: str = USER_ID) -> str:
+    """Retrieve the current week's training plan from mem0.
+
+    If multiple versions exist (mid-week update), returns the most recently created one
+    based on the created_at metadata timestamp.
+    """
+    from temporal_context import today_local
+
+    today = today_local()
+    week_start = today - timedelta(days=today.weekday())  # Monday
+    search_query = f"weekly training plan schedule week of {week_start.strftime('%B %d')}"
+
+    # Try filtered search first (metadata-based)
+    try:
+        result = mem0_client.search(
+            query=search_query,
+            user_id=user_id,
+            limit=5,
+            filters={"type": "weekly_plan"},
+        )
+        if result is None:
+            memories = []
+        elif isinstance(result, dict):
+            memories = result.get("results", [])
+        else:
+            memories = result or []
+    except Exception as e:
+        logger.warning(f"Filtered weekly plan search failed (falling back): {e}")
+        memories = []
+
+    # Fallback: unfiltered semantic search
+    if not memories:
+        memories = _get_cached_search(search_query, limit=3, user_id=user_id)
+
+    if not memories:
+        return ""
+
+    # Pick the most recently created plan (handles mid-week updates)
+    best_text = ""
+    best_created_at = None
+    for mem in memories:
+        if mem is None:
+            continue
+        text = mem.get("memory", "")
+        if not text:
+            continue
+        metadata = mem.get("metadata") or {}
+        created_at = metadata.get("created_at", metadata.get("stored_date", ""))
+        if best_created_at is None or created_at > best_created_at:
+            best_created_at = created_at
+            best_text = text
+
+    if best_text:
+        return best_text[:MAX_PLAN_CHARS] if len(best_text) > MAX_PLAN_CHARS else best_text
+    return ""
 
 
 def clear_cache() -> None:

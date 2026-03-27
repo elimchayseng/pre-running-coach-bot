@@ -4,6 +4,57 @@ import pytest
 
 import companion
 import memory_manager
+from companion import get_system_prompt
+
+
+class TestSystemPrompt:
+    @pytest.fixture(autouse=True)
+    def setup_mocks(self, monkeypatch):
+        self.mock_mem0 = MagicMock()
+        self.mock_mem0.search.return_value = []
+        monkeypatch.setattr(memory_manager, "mem0_client", self.mock_mem0)
+        memory_manager._query_cache = {}
+        memory_manager._cache_timestamps = {}
+
+    def test_contains_date_authority_section(self):
+        prompt = get_system_prompt("test query")
+        assert "ALWAYS correct" in prompt
+        assert "NEVER override" in prompt
+
+    def test_contains_date_three_times(self):
+        from temporal_context import get_temporal_context
+        ctx = get_temporal_context()
+        prompt = get_system_prompt("test query")
+        # Date should appear at top, in temporal section implicitly, and at bottom reminder
+        assert prompt.count(ctx["date"]) >= 2
+
+    def test_contains_race_countdown(self):
+        prompt = get_system_prompt("test query")
+        assert "RACE COUNTDOWN" in prompt
+
+    def test_contains_weekly_plan_when_available(self):
+        self.mock_mem0.search.return_value = [
+            {"memory": "Week 12: Mon easy, Tue tempo", "metadata": {"type": "weekly_plan"}}
+        ]
+        prompt = get_system_prompt("what's my workout?")
+        assert "WEEK'S TRAINING PLAN" in prompt
+
+    def test_contains_today_workout_when_available(self):
+        from datetime import datetime
+        now = datetime.now()
+        day_abbrev = now.strftime("%a")[:3]
+        month_day = f"{now.month}/{now.day}"
+        plan_text = f"| {day_abbrev} {month_day} | 6mi easy |"
+        self.mock_mem0.search.return_value = [
+            {"memory": plan_text, "metadata": {"type": "weekly_plan"}}
+        ]
+        prompt = get_system_prompt("what's my workout?")
+        assert "TODAY'S SCHEDULED WORKOUT" in prompt
+
+    def test_contains_reminder_at_end(self):
+        prompt = get_system_prompt("test")
+        assert "REMINDER:" in prompt
+        assert "explicit full dates" in prompt
 
 
 class TestChat:
