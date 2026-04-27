@@ -35,6 +35,7 @@ from tools import ALL_TOOLS, execute_tool  # noqa: E402
 
 STATE_DIR = ROOT / "state"
 MAX_TOOL_LOOPS = 8
+HARNESS_BUILD = "v3-content-debug"  # bump on every harness change so we can see what's running
 
 
 def build_system_prompt(state: StateManager) -> str:
@@ -133,17 +134,40 @@ def chat_loop() -> None:
 
 def run_agent_turn(messages: list[dict], state: StateManager, show_raw: bool) -> str:
     """Run the tool-use loop for a single user turn. Returns final assistant text."""
+    print(f"  [harness build: {HARNESS_BUILD}]")
     msg = None
     for i in range(MAX_TOOL_LOOPS):
-        response = llm_client.chat.completions.create(
-            model=HEROKU_MODEL,
-            messages=messages,
-            tools=ALL_TOOLS,
-            tool_choice="auto",
-            max_tokens=2000,
-        )
+        try:
+            response = llm_client.chat.completions.create(
+                model=HEROKU_MODEL,
+                messages=messages,
+                tools=ALL_TOOLS,
+                tool_choice="auto",
+                max_tokens=2000,
+            )
+        except Exception:
+            # Dump the full message list so we can see exactly what Heroku rejected.
+            print("\n  [LLM call failed — dumping messages payload]")
+            for idx, m in enumerate(messages):
+                role = m.get("role")
+                keys = list(m.keys())
+                content_repr = repr(m.get("content"))[:120]
+                tc = m.get("tool_calls")
+                tc_summary = f"tool_calls={len(tc)}" if tc else "tool_calls=0"
+                print(f"    [{idx}] role={role} keys={keys} content={content_repr} {tc_summary}")
+            raise
+
         msg = response.choices[0].message
-        messages.append(msg.model_dump(exclude_none=True))
+        # Heroku Inference rejects null OR empty `content` on assistant messages
+        # that carry tool_calls. Force a non-empty placeholder.
+        msg_dict = msg.model_dump(exclude_none=True)
+        if not msg_dict.get("content"):
+            msg_dict["content"] = "(calling tools)"
+        messages.append(msg_dict)
+        if show_raw:
+            print(f"    [appended assistant msg keys: {list(msg_dict.keys())}, "
+                  f"content={msg_dict.get('content')!r}, "
+                  f"tool_calls={len(msg_dict.get('tool_calls') or [])}]")
 
         if not msg.tool_calls:
             return msg.content or ""
