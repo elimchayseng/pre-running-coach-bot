@@ -116,9 +116,8 @@ async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /reset command."""
-    user_id = get_user_id(update)
-    reset_session(user_id)
-    await update.message.reply_text("Session history cleared. Mem0 memories preserved.")
+    reset_session()
+    await update.message.reply_text("Session history cleared.")
 
 
 async def forget_all_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -149,7 +148,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     try:
         # Use the same pipeline as CLI
-        response = companion_chat(user_message, user_id=user_id)
+        response = companion_chat(user_message)
         await update.message.reply_text(response)
 
     except Exception as e:
