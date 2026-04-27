@@ -18,7 +18,7 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 TESTING = os.getenv("TESTING", "").lower() in ("1", "true")
 
 # Required environment variables
-REQUIRED_ENV_VARS = ["MEM0_API_KEY", "HEROKU_INFERENCE_URL", "HEROKU_INFERENCE_KEY"]
+REQUIRED_ENV_VARS = ["HEROKU_INFERENCE_URL", "HEROKU_INFERENCE_KEY"]
 
 
 def validate_env() -> bool:
@@ -59,11 +59,7 @@ if not TESTING:
     if not validate_env():
         sys.exit(1)
 
-    from mem0 import MemoryClient
     from openai import OpenAI
-
-    # Initialize Mem0 client
-    mem0_client = MemoryClient(api_key=os.getenv("MEM0_API_KEY"))
 
     # Heroku LLM client (OpenAI-compatible)
     llm_client = OpenAI(
@@ -71,6 +67,15 @@ if not TESTING:
         api_key=os.getenv("HEROKU_INFERENCE_KEY"),
         timeout=30.0,  # 30 second timeout
     )
+
+    # Mem0 client — kept around until memory_manager.py is deleted (step 6).
+    # Optional: returns None if MEM0_API_KEY is unset, so the harness boots
+    # without Mem0 credentials.
+    if os.getenv("MEM0_API_KEY"):
+        from mem0 import MemoryClient
+        mem0_client = MemoryClient(api_key=os.getenv("MEM0_API_KEY"))
+    else:
+        mem0_client = None
 else:
     mem0_client = None
     llm_client = None
