@@ -102,9 +102,12 @@ SCHEMAS = [
         "function": {
             "name": "append_journal",
             "description": (
-                "Add a freeform timestamped note to journal.md. Use for life "
-                "context, mood, decision rationale, or anything that doesn't "
-                "fit structured fields."
+                "Add a freeform note to journal.md. Use for life context "
+                "(sleep, stress, travel, illness, mood) and decision "
+                "rationale that should persist beyond this conversation. "
+                "Pass body text only — a timestamp header is added "
+                "automatically. Do NOT include a date or section header in "
+                "the entry text."
             ),
             "parameters": {
                 "type": "object",
