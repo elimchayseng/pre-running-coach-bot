@@ -4,7 +4,8 @@ import pytest
 
 from temporal_context import (
     build_temporal_prompt,
-    extract_todays_workout,
+    get_next_race,
+    get_race_date,
     get_temporal_context,
     get_training_phase,
     get_week_date_range,
@@ -17,7 +18,7 @@ from temporal_context import (
 
 @pytest.fixture(autouse=True)
 def _reset_cache():
-    """Reset the race date cache between tests."""
+    """Reset the cached race info between tests."""
     reset_race_date_cache()
     yield
     reset_race_date_cache()
@@ -58,165 +59,148 @@ class TestGetTrainingPhase:
         assert get_training_phase(42) == "high-volume build"
 
 
+class TestRaceDateResolution:
+    def test_env_var_overrides_state(self, monkeypatch):
+        monkeypatch.setenv("RACE_DATE", "2099-12-31")
+        assert get_race_date() == date(2099, 12, 31)
+
+    def test_env_var_invalid_falls_through(self, monkeypatch):
+        monkeypatch.setenv("RACE_DATE", "not-a-date")
+        # Should fall through to state lookup; either returns a date or None
+        result = get_race_date()
+        assert result is None or isinstance(result, date)
+
+    def test_no_state_no_env_returns_none(self, monkeypatch, tmp_path):
+        monkeypatch.delenv("RACE_DATE", raising=False)
+        # Repoint state dir to an empty tmp_path so no athlete.yaml exists
+        import temporal_context
+        monkeypatch.setattr(temporal_context, "_state_dir", lambda: tmp_path)
+        assert get_race_date() is None
+
+    def test_state_provides_next_race(self, monkeypatch, tmp_path):
+        monkeypatch.delenv("RACE_DATE", raising=False)
+        (tmp_path / "athlete.yaml").write_text(
+            "target_races:\n"
+            "  - name: Past Race\n"
+            "    date: 2020-01-01\n"
+            "  - name: Future Race\n"
+            "    date: 2099-06-15\n"
+        )
+        import temporal_context
+        monkeypatch.setattr(temporal_context, "_state_dir", lambda: tmp_path)
+        info = get_next_race()
+        assert info["name"] == "Future Race"
+        assert info["date"] == date(2099, 6, 15)
+
+
 class TestGetTemporalContext:
     def test_returns_required_keys(self):
         ctx = get_temporal_context()
-        assert "date" in ctx
-        assert "time_of_day" in ctx
-        assert "days_to_race" in ctx
-        assert "weeks_to_race" in ctx
-        assert "training_phase" in ctx
+        for key in ("date", "time_of_day", "days_to_race", "weeks_to_race", "training_phase"):
+            assert key in ctx
 
     def test_time_of_day_valid(self):
         ctx = get_temporal_context()
         assert ctx["time_of_day"] in ("morning", "afternoon", "evening", "night")
 
-    def test_weeks_is_days_div_7(self):
+    def test_no_race_yields_none_fields(self, monkeypatch, tmp_path):
+        monkeypatch.delenv("RACE_DATE", raising=False)
+        import temporal_context
+        monkeypatch.setattr(temporal_context, "_state_dir", lambda: tmp_path)
         ctx = get_temporal_context()
-        assert ctx["weeks_to_race"] == ctx["days_to_race"] // 7
+        assert ctx["days_to_race"] is None
+        assert ctx["weeks_to_race"] is None
+        assert ctx["training_phase"] is None
 
 
 class TestBuildTemporalPrompt:
-    def test_contains_race_countdown_header(self):
+    def test_no_race_message(self, monkeypatch, tmp_path):
+        monkeypatch.delenv("RACE_DATE", raising=False)
+        import temporal_context
+        monkeypatch.setattr(temporal_context, "_state_dir", lambda: tmp_path)
         prompt = build_temporal_prompt()
         assert "RACE COUNTDOWN" in prompt
+        assert "No target race" in prompt
 
-    def test_contains_boston_marathon(self):
+    def test_includes_race_name_from_state(self, monkeypatch, tmp_path):
+        monkeypatch.delenv("RACE_DATE", raising=False)
+        (tmp_path / "athlete.yaml").write_text(
+            "target_races:\n"
+            "  - name: Tahoe 50K\n"
+            "    date: 2099-06-15\n"
+        )
+        import temporal_context
+        monkeypatch.setattr(temporal_context, "_state_dir", lambda: tmp_path)
         prompt = build_temporal_prompt()
-        assert "Boston Marathon" in prompt
-
-    def test_contains_training_phase(self):
-        prompt = build_temporal_prompt()
+        assert "Tahoe 50K" in prompt
         assert "Training phase:" in prompt
-
-
-class TestExtractTodaysWorkout:
-    SAMPLE_PLAN = """# Week 12 (Mar 23-29)
-**Target: 40-44 miles**
-| Day | Workout |
-|-----|---------|
-| Mon 3/23 | 5mi easy |
-| Tue 3/24 | 8mi with 3mi @ MP |
-| Wed 3/25 | Rest or cross-train |
-| Thu 3/26 | 6mi easy |
-| Fri 3/27 | Rest |
-| Sat 3/28 | 18mi long (last 2-3mi @ MP if feeling good) |
-| Sun 3/29 | Rest |"""
-
-    def test_extracts_by_date(self):
-        now = datetime.now()
-        month_day = f"{now.month}/{now.day}"
-        # Build a plan with today's date in it
-        plan = f"| {now.strftime('%a')} {month_day} | 6mi easy test |"
-        result = extract_todays_workout(plan)
-        assert "6mi easy test" in result
-
-    def test_returns_empty_for_no_match(self):
-        # Plan for a different week entirely
-        result = extract_todays_workout("| Mon 1/1 | 5mi easy |\n| Tue 1/2 | tempo |")
-        now = datetime.now()
-        # Only empty if today is NOT Jan 1 or Jan 2
-        if now.month != 1 or now.day not in (1, 2):
-            # Should fall back to day-name matching
-            # which may or may not match depending on today's day
-            pass  # Non-deterministic, skip assertion
-
-    def test_empty_plan_returns_empty(self):
-        assert extract_todays_workout("") == ""
-
-    def test_none_plan_returns_empty(self):
-        assert extract_todays_workout(None) == ""
-
-    def test_extracts_by_day_abbreviation(self):
-        now = datetime.now()
-        day_abbrev = now.strftime("%a")[:3]
-        plan = f"| {day_abbrev} 12/99 | special workout |"
-        # Won't match by date (12/99 is invalid), but should match by day abbreviation
-        result = extract_todays_workout(plan)
-        assert "special workout" in result
 
 
 class TestGetWeekDateRange:
     def test_returns_monday_to_sunday(self):
         monday, sunday = get_week_date_range()
-        assert monday.weekday() == 0  # Monday
-        assert sunday.weekday() == 6  # Sunday
+        assert monday.weekday() == 0
+        assert sunday.weekday() == 6
         assert (sunday - monday).days == 6
 
 
 class TestResolveDayNameToDate:
     def test_past_intent_earlier_this_week(self):
         today = today_local()
-        # Pick a day earlier in the week (if today is not Monday)
         if today.weekday() > 0:
             target_weekday = today.weekday() - 1
-            day_names = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
-            resolved = resolve_day_name_to_date(day_names[target_weekday], intent="past")
+            names = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+            resolved = resolve_day_name_to_date(names[target_weekday], intent="past")
             assert resolved == today - timedelta(days=1)
-            assert resolved < today
 
     def test_past_intent_same_day_returns_today(self):
         today = today_local()
-        day_name = today.strftime("%A")
-        resolved = resolve_day_name_to_date(day_name, intent="past")
+        resolved = resolve_day_name_to_date(today.strftime("%A"), intent="past")
         assert resolved == today
 
     def test_past_intent_later_day_goes_to_last_week(self):
         today = today_local()
-        # Pick a day later in the week (if today is not Sunday)
         if today.weekday() < 6:
             target_weekday = today.weekday() + 1
-            day_names = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
-            resolved = resolve_day_name_to_date(day_names[target_weekday], intent="past")
-            assert resolved < today
-            # Should be last week's occurrence
+            names = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+            resolved = resolve_day_name_to_date(names[target_weekday], intent="past")
             assert (today - resolved).days == 6
 
     def test_future_intent_later_this_week(self):
         today = today_local()
         if today.weekday() < 6:
             target_weekday = today.weekday() + 1
-            day_names = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
-            resolved = resolve_day_name_to_date(day_names[target_weekday], intent="future")
+            names = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+            resolved = resolve_day_name_to_date(names[target_weekday], intent="future")
             assert resolved == today + timedelta(days=1)
-            assert resolved > today
 
     def test_future_intent_same_day_returns_today(self):
         today = today_local()
-        day_name = today.strftime("%A")
-        resolved = resolve_day_name_to_date(day_name, intent="future")
+        resolved = resolve_day_name_to_date(today.strftime("%A"), intent="future")
         assert resolved == today
 
     def test_abbreviation_works(self):
         today = today_local()
-        day_abbrev = today.strftime("%a")[:3]  # e.g., "Thu"
-        resolved = resolve_day_name_to_date(day_abbrev, intent="past")
+        resolved = resolve_day_name_to_date(today.strftime("%a")[:3], intent="past")
         assert resolved == today
 
     def test_invalid_day_returns_today(self):
-        today = today_local()
-        resolved = resolve_day_name_to_date("notaday", intent="past")
-        assert resolved == today
+        assert resolve_day_name_to_date("notaday", intent="past") == today_local()
 
 
 class TestTimezoneAwareness:
     def test_now_local_returns_datetime(self):
-        result = now_local()
-        assert isinstance(result, datetime)
+        assert isinstance(now_local(), datetime)
 
     def test_today_local_returns_date(self):
-        result = today_local()
-        assert isinstance(result, date)
+        assert isinstance(today_local(), date)
 
     def test_timezone_env_override(self, monkeypatch):
         monkeypatch.setenv("USER_TIMEZONE", "America/New_York")
-        # Force re-evaluation by calling directly
         from temporal_context import _get_user_tz
-        tz = _get_user_tz()
-        assert tz is not None
+        assert _get_user_tz() is not None
 
     def test_invalid_timezone_falls_back(self, monkeypatch):
         monkeypatch.setenv("USER_TIMEZONE", "Not/A/Timezone")
         from temporal_context import _get_user_tz
-        tz = _get_user_tz()
-        assert tz is None  # Falls back to system local
+        assert _get_user_tz() is None
