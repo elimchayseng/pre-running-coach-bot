@@ -1,30 +1,59 @@
-# PRE - AI Running Coach Bot
+# PRE — AI Running Coach Bot
 
-An AI-powered running coach that provides personalized marathon training guidance with long-term memory, temporal awareness, and injury tracking.
+A coaching agent for endurance athletes. Reads and writes a structured local
+state (athlete profile, training plan, session log, journal) and adapts week
+to week using Claude's tool-use API.
 
-## Features
+## How it works
 
-- **Persistent Memory** — Remembers your goals, training history, and preferences across sessions using Mem0
-- **Temporal Awareness** — Knows the current date, days until race day, and your training phase
-- **Injury Tracking** — Log injuries with automatic 14-day follow-up tracking
-- **Dual Interface** — CLI for local use, Telegram bot for mobile access
-- **Session History** — Redis-backed conversation context within sessions
+Every turn the agent loads the full state into the system prompt and decides
+which tools to call:
 
-## Tech Stack
+- `get_today` / `get_todays_workout` / `get_week_plan` — read the prescribed plan
+- `log_session` — append a session to `log.jsonl`
+- `update_plan` — replace `plan.md` (preserving the locked weekly table format)
+- `update_athlete` — patch `athlete.yaml` (PRs, zones, resolved injuries)
+- `append_journal` — add a timestamped life-context note
+- `get_sessions` — date-range query on `log.jsonl`
+- `get_fitness_summary` — soft-touch trailing snapshot: weekly volume, pace-vs-zone
+  decoration on quality sessions, HR context, English signals (no prescriptions)
 
-- **LLM**: Claude via Heroku Inference (OpenAI-compatible API)
-- **Memory**: [Mem0](https://mem0.ai) for long-term athlete context
-- **Session Store**: Redis for conversation history
-- **Telegram**: python-telegram-bot with Flask webhook
-- **Deployment**: Railway (gunicorn)
+Long-term context lives in `state/` files. Short-term in-conversation history
+lives in Redis (~10 turns, 2-hour TTL).
+
+## Tech stack
+
+- **LLM**: Claude Sonnet 4.6 (default) via Heroku Inference, OpenAI-compatible client
+- **State**: local files — `athlete.yaml` (round-trip via `ruamel.yaml`),
+  `plan.md`, `log.jsonl`, `journal.md`
+- **Session store**: Redis (single-user, single key)
+- **Interfaces**: Telegram webhook (`app.py` + `bot.py`), CLI (`main.py`),
+  test harness (`scripts/test_agent.py`)
+- **Deployment**: Railway via gunicorn (`Procfile`)
+
+## State files
+
+```
+state/
+├── athlete.yaml        identity, target_races, prs, zones, preferences,
+│                       hr_zones, injury_history, race_history
+├── plan.md             current training block; locked
+│                       "| Day | Date | Workout | Pace target | Notes |"
+│                       table for the current week (parsed by /today)
+├── log.jsonl           one session per line: date, type, miles, pace_avg,
+│                       hr_avg, rpe, notes, details{}
+├── journal.md          freeform timestamped notes
+└── plan_changelog.md   append-only log of plan edits + reasons
+```
+
+`state/` is gitignored — keep it local or in a separate private repo.
 
 ## Prerequisites
 
 - Python 3.9+
-- Redis server (local or hosted)
-- Mem0 API key
-- Heroku Inference API key
-- Telegram Bot token (for Telegram mode)
+- Redis (local or hosted)
+- Heroku Inference API key (with access to `claude-sonnet-4-6` or `claude-opus-4-7`)
+- Telegram Bot token (for the Telegram interface)
 
 ## Installation
 
@@ -34,51 +63,51 @@ cd pre-running-coach-bot
 python -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
+cp .env.example .env       # fill in your keys
 ```
 
-## Configuration
-
-Copy the example environment file and fill in your keys:
-
-```bash
-cp .env.example .env
-```
-
-See `.env.example` for all required variables.
+Then create your `state/athlete.yaml` and `state/plan.md`. See the example
+shapes inline at the top of `state_manager.py` and the schema descriptions in
+`tools/state.py`.
 
 ## Usage
 
-### CLI Mode
+### Test harness (recommended for iteration)
 
 ```bash
-python main.py
+./venv/bin/python scripts/test_agent.py
 ```
 
-### Telegram Bot (webhook)
+REPL with no Telegram or Redis dependency. Slash commands: `/quit /reset /state
+/tools /system /raw`.
+
+### CLI
 
 ```bash
-python app.py
+./venv/bin/python main.py
 ```
 
-Or with gunicorn:
+### Telegram (webhook)
 
 ```bash
-gunicorn app:app
+./venv/bin/python app.py        # local
+gunicorn app:app                 # production
 ```
 
-### CLI Commands
+### Slash commands (CLI + Telegram)
 
 | Command | Description |
 |---------|-------------|
-| `/goal <time>` | Set race goal (e.g., `/goal 3:25`) |
-| `/injury <desc>` | Log an injury with 14-day tracking |
-| `/race` | Show race countdown and training phase |
-| `/today` | Show current date/time context |
-| `/history` | Show stored memories |
-| `/reset` | Clear session history (memories preserved) |
-| `/clear` | Reset all memories |
-| `/health` | Check system health (Redis, Mem0, LLM) |
-| `/quit` | Exit |
+| `/today` | Today's prescribed workout (no LLM round-trip) |
+| `/plan` | Print the current training plan |
+| `/log [days]` | Recent sessions, default last 7 days |
+| `/race` | Race countdown and training phase |
+| `/reset` | Clear short-term Redis history (state files unchanged) |
+| `/health` | Check Redis + LLM connectivity |
+| `/help` | Show commands |
+| `/quit` (CLI only) | Exit |
+
+Free-text messages route through the agent and may invoke any of the tools above.
 
 ## Deployment
 
@@ -89,19 +118,33 @@ Deploy to Railway with the included `Procfile`:
 3. Add environment variables from `.env.example`
 4. Railway will auto-detect the `Procfile` and deploy
 
-## Project Structure
+State files are not included in the deploy by default (gitignored). Either:
+- Keep state in a private companion repo and clone on deploy, or
+- Use a Railway volume mounted at `state/`.
+
+## Tests
+
+```bash
+./venv/bin/python -m pytest -q
+```
+
+## Project structure
 
 ```
-├── app.py                  # Flask webhook server (Telegram)
-├── bot.py                  # Telegram bot handlers
-├── main.py                 # CLI chat interface
-├── companion.py            # Core chat logic and system prompt
-├── config.py               # Configuration and client initialization
-├── memory_manager.py       # Mem0 memory operations
-├── conversation_store.py   # Redis session storage
-├── temporal_context.py     # Date/time and training phase logic
-├── test_heroku_llm.py      # LLM connectivity test
-├── requirements.txt        # Python dependencies
-├── Procfile                # Railway process definition
-└── .env.example            # Environment variable template
+├── app.py                  Flask webhook for Telegram
+├── bot.py                  Telegram handlers
+├── main.py                 CLI chat
+├── companion.py            Agent loop: build_system_prompt, agent_turn, chat
+├── state_manager.py        State file I/O (read/write/atomic/round-trip YAML)
+├── temporal_context.py     Timezone-aware now/today + race resolution
+├── conversation_store.py   Redis short-term history
+├── config.py               LLM client, env, personality
+├── health.py               Health checks + slash command list
+├── tools/                  Tool schemas + handlers
+│   ├── state.py            log_session, update_plan, append_journal,
+│   │                       update_athlete, get_sessions
+│   ├── plan.py             get_today, get_todays_workout, get_week_plan
+│   └── fitness.py          get_fitness_summary (soft-touch signals)
+├── scripts/test_agent.py   CLI harness, no Redis required
+└── tests/                  pytest
 ```
