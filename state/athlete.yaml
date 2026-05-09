@@ -28,7 +28,7 @@ target_races:
     priority: A  # goal race
     terrain: technical mountain / sky
     elevation_gain_ft: ~10000
-    goal_time: null
+    goal_time:
     goal_context: "Just finish — survive the day, manage effort, no racing"
     location: Palisades Tahoe, CA
 
@@ -58,22 +58,23 @@ hr_zones:
 weekly_volume_ceiling_miles: 55
 
 preferences:
-  - "Direct communication, no fluff"
-  - "Data-driven — appreciates detailed analysis"
-  - "Structured workouts with explicit pace targets"
-  - "2-week taper protocol"
-  - "Tends to run faster than prescribed on easy days — flag when easy paces drift"
-  - "Will push through pain if motivated — apply external load checks during niggles"
-
+  communication_style: Direct, no fluff, no positive reinforcement padding. 
+    Maintains original tone in any rewrites.
+  data_sharing: Shares Strava activity tables and lap-level workout data via 
+    screenshots.
 training_characteristics:
-  - "Negative-split responder — fastest reps/miles typically at the end"
-  - "Strong on trails with elevation (SF terrain) — relevant for Broken Arrow"
-  - "Late-race fader at marathon distance — addressed via volume + more MP long runs"
-
+  pacing_discipline: 'Tends to run faster than prescribed on workouts and easy days.
+    Thu 5/7 HM test: prescribed 6:10-6:15, ran 5:57/6:00/6:06 with HR spiking to 190
+    on second mile. Confirms handoff note about needing external load checks.'
+  unprescribed_volume_pattern: 'Adds sessions outside the plan when feeling good.
+    Week of 5/4: added Mon 3mi run (was rest), turned Wed recovery spin into 18.18mi/1,266ft
+    climbing ride.'
 cross_training:
-  cycling: "20-30mi rides with significant elevation"
-  swimming: "recovery / injury substitute"
+  cycling: "20-30mi rides typical, gravitates toward elevation. Needs explicit no-climbing
+    rules on recovery rides."
+  swimming: "Used for recovery."
 
+  yoga: Has regular practice. Willing to slot in when prescribed.
 strength_training:
   frequency: "3-4x/week"
   focus_lifts:
@@ -88,6 +89,10 @@ strength_training:
 
 # Standing PT protocol — used during recent Achilles rehab; reference for any
 # calf/Achilles flare-up.
+  equipment_access: Full gym (barbell, rack, machines).
+  race_week_protocol: 'Last lift no later than 4 days pre-race. Primer format: trap
+    bar DL 3x3 @60%, box jumps 3x3, single-leg calf raises 2x10. No grinding, no failure
+    sets, no accessory work.'
 pt_protocol_achilles:
   - "Eccentric heel drops: straight leg + bent knee"
   - "Glute bridges"
