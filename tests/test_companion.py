@@ -1,110 +1,209 @@
+"""Unit tests for companion.py.
+
+Mocks llm_client (no real LLM calls) and uses fake_redis + a tmp state dir.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
 
 import companion
-import memory_manager
-from companion import get_system_prompt
+from state_manager import StateManager
+
+ATHLETE_YAML = """\
+name: Test
+target_races:
+  - name: Future Race
+    date: 2099-01-01
+    priority: A
+    goal_pace: "6:10"
+zones:
+  marathon_pace: "6:40"
+"""
+
+PLAN_MD = """\
+# Plan
+
+## This Week
+
+| Day | Date | Workout | Pace target | Notes |
+|-----|------|---------|-------------|-------|
+| Sun | 2099-01-01 | Easy 4mi | 8:30-9:00 | |
+"""
 
 
-class TestSystemPrompt:
-    @pytest.fixture(autouse=True)
-    def setup_mocks(self, monkeypatch):
-        self.mock_mem0 = MagicMock()
-        self.mock_mem0.search.return_value = []
-        monkeypatch.setattr(memory_manager, "mem0_client", self.mock_mem0)
-        memory_manager._query_cache = {}
-        memory_manager._cache_timestamps = {}
+@pytest.fixture
+def state_dir(tmp_path: Path) -> Path:
+    d = tmp_path / "state"
+    d.mkdir()
+    (d / "athlete.yaml").write_text(ATHLETE_YAML)
+    (d / "plan.md").write_text(PLAN_MD)
+    return d
 
-    def test_contains_date_authority_section(self):
-        prompt = get_system_prompt("test query")
-        assert "ALWAYS correct" in prompt
-        assert "NEVER override" in prompt
 
-    def test_contains_date_three_times(self):
-        from temporal_context import get_temporal_context
-        ctx = get_temporal_context()
-        prompt = get_system_prompt("test query")
-        # Date should appear at top, in temporal section implicitly, and at bottom reminder
-        assert prompt.count(ctx["date"]) >= 2
+@pytest.fixture
+def state(state_dir: Path, monkeypatch) -> StateManager:
+    """Inject a tmp StateManager into companion's module-global cache."""
+    s = StateManager(state_dir)
+    monkeypatch.setattr(companion, "_state", s)
+    return s
 
-    def test_contains_race_countdown(self):
-        prompt = get_system_prompt("test query")
-        assert "RACE COUNTDOWN" in prompt
 
-    def test_contains_weekly_plan_when_available(self):
-        self.mock_mem0.search.return_value = [
-            {"memory": "Week 12: Mon easy, Tue tempo", "metadata": {"type": "weekly_plan"}}
-        ]
-        prompt = get_system_prompt("what's my workout?")
-        assert "WEEK'S TRAINING PLAN" in prompt
+def _llm_message(content: str | None = None, tool_calls=None) -> MagicMock:
+    msg = MagicMock()
+    msg.content = content
+    msg.tool_calls = tool_calls or []
 
-    def test_contains_today_workout_when_available(self):
-        from datetime import datetime
-        now = datetime.now()
-        day_abbrev = now.strftime("%a")[:3]
-        month_day = f"{now.month}/{now.day}"
-        plan_text = f"| {day_abbrev} {month_day} | 6mi easy |"
-        self.mock_mem0.search.return_value = [
-            {"memory": plan_text, "metadata": {"type": "weekly_plan"}}
-        ]
-        prompt = get_system_prompt("what's my workout?")
-        assert "TODAY'S SCHEDULED WORKOUT" in prompt
+    def model_dump(exclude_none=False):
+        d = {"role": "assistant"}
+        if content is not None:
+            d["content"] = content
+        if tool_calls:
+            d["tool_calls"] = [
+                {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {
+                        "name": tc.function.name,
+                        "arguments": tc.function.arguments,
+                    },
+                }
+                for tc in tool_calls
+            ]
+        return d
 
-    def test_contains_reminder_at_end(self):
-        prompt = get_system_prompt("test")
-        assert "REMINDER:" in prompt
-        assert "explicit full dates" in prompt
+    msg.model_dump = model_dump
+    return msg
+
+
+def _mock_llm(monkeypatch, *responses) -> MagicMock:
+    """Patch companion.llm_client.chat.completions.create to return canned responses."""
+    fake_client = MagicMock()
+    completions = []
+    for msg in responses:
+        completion = MagicMock()
+        completion.choices = [MagicMock(message=msg)]
+        completions.append(completion)
+    fake_client.chat.completions.create.side_effect = completions
+    monkeypatch.setattr(companion, "llm_client", fake_client)
+    return fake_client
+
+
+# ---------------- build_system_prompt ----------------
+
+
+class TestBuildSystemPrompt:
+    def test_contains_required_sections(self, state):
+        p = companion.build_system_prompt(state)
+        for marker in [
+            "VOICE & FORMAT",
+            "TODAY",
+            "ATHLETE PROFILE",
+            "TRAINING PLAN",
+            "HOW TO USE TOOLS",
+            "ADAPTATION NORMS",
+        ]:
+            assert marker in p, f"missing section: {marker}"
+
+    def test_includes_state_blob(self, state):
+        p = companion.build_system_prompt(state)
+        assert "Future Race" in p  # athlete.yaml content
+        assert "Easy 4mi" in p  # plan.md content
+
+    def test_voice_norms_present(self, state):
+        p = companion.build_system_prompt(state)
+        assert "Declaratives" in p
+        assert "Tables ONLY" in p
+
+
+# ---------------- agent_turn ----------------
+
+
+class TestAgentTurn:
+    def test_simple_response_no_tools(self, state, monkeypatch):
+        _mock_llm(monkeypatch, _llm_message(content="hello back"))
+        messages = [{"role": "system", "content": "x"}, {"role": "user", "content": "hi"}]
+        out = companion.agent_turn(messages, state)
+        assert out == "hello back"
+
+    def test_tool_call_dispatched(self, state, monkeypatch):
+        # First response: tool call. Second: final text.
+        tc = MagicMock()
+        tc.id = "call_1"
+        tc.function.name = "get_today"
+        tc.function.arguments = "{}"
+
+        _mock_llm(
+            monkeypatch,
+            _llm_message(content=None, tool_calls=[tc]),
+            _llm_message(content="today is X"),
+        )
+        messages = [{"role": "system", "content": "x"}, {"role": "user", "content": "what date"}]
+        out = companion.agent_turn(messages, state)
+        assert out == "today is X"
+        # Tool result should have been appended between the two assistant turns
+        roles = [m["role"] for m in messages]
+        assert "tool" in roles
+
+    def test_empty_content_gets_placeholder(self, state, monkeypatch):
+        tc = MagicMock()
+        tc.id = "c1"
+        tc.function.name = "get_today"
+        tc.function.arguments = "{}"
+        _mock_llm(
+            monkeypatch,
+            _llm_message(content=None, tool_calls=[tc]),
+            _llm_message(content="done"),
+        )
+        messages = [{"role": "system", "content": "x"}, {"role": "user", "content": "go"}]
+        companion.agent_turn(messages, state)
+        # First assistant msg (index 2) should have non-empty content
+        assistant_msg = messages[2]
+        assert assistant_msg["content"]
+        assert assistant_msg["content"] != ""
+
+    def test_iteration_cap(self, state, monkeypatch):
+        # Always return tool_calls — should stop after MAX_TOOL_LOOPS
+        tc = MagicMock()
+        tc.id = "c"
+        tc.function.name = "get_today"
+        tc.function.arguments = "{}"
+
+        msgs = [_llm_message(content=None, tool_calls=[tc]) for _ in range(companion.MAX_TOOL_LOOPS + 2)]
+        _mock_llm(monkeypatch, *msgs)
+
+        messages = [{"role": "system", "content": "x"}, {"role": "user", "content": "loop"}]
+        out = companion.agent_turn(messages, state)
+        # Exits cleanly even when capped; last assistant content placeholder returned
+        assert isinstance(out, str)
+
+
+# ---------------- chat ----------------
 
 
 class TestChat:
-    @pytest.fixture(autouse=True)
-    def setup_mocks(self, monkeypatch, fake_redis):
-        # Mock LLM client
-        self.mock_llm = MagicMock()
-        mock_response = MagicMock()
-        mock_response.choices = [MagicMock()]
-        mock_response.choices[0].message.content = "Great job on your training!"
-        self.mock_llm.chat.completions.create.return_value = mock_response
-        # Patch in companion where _call_llm uses it
-        monkeypatch.setattr(companion, "llm_client", self.mock_llm)
+    def test_persists_history(self, state, monkeypatch, fake_redis):
+        _mock_llm(monkeypatch, _llm_message(content="ok"))
+        # Avoid the cache_control probe path complicating mock count
+        monkeypatch.setattr(companion, "_cache_control_supported", False)
 
-        # Mock mem0 client in memory_manager where it's actually used
-        self.mock_mem0 = MagicMock()
-        self.mock_mem0.search.return_value = []
-        monkeypatch.setattr(memory_manager, "mem0_client", self.mock_mem0)
+        out = companion.chat("hello")
+        assert out == "ok"
+        from conversation_store import get_history
 
-        # Clear memory manager cache
-        memory_manager._query_cache = {}
-        memory_manager._cache_timestamps = {}
+        history = get_history()
+        assert len(history) == 2
+        assert history[0]["role"] == "user"
+        assert history[1] == {"role": "assistant", "content": "ok"}
 
-    def test_chat_returns_response(self):
-        from companion import chat
+    def test_returns_apology_on_error(self, state, monkeypatch, fake_redis):
+        fake = MagicMock()
+        fake.chat.completions.create.side_effect = RuntimeError("boom")
+        monkeypatch.setattr(companion, "llm_client", fake)
+        monkeypatch.setattr(companion, "_cache_control_supported", False)
 
-        result = chat("How should I train this week?", user_id="test_user")
-        assert result == "Great job on your training!"
-
-    def test_chat_calls_llm(self):
-        from companion import chat
-
-        chat("What pace for my long run?", user_id="test_user")
-        self.mock_llm.chat.completions.create.assert_called_once()
-
-    def test_chat_skips_memory_for_greeting(self):
-        from companion import chat
-
-        chat("hello", user_id="test_user")
-        self.mock_mem0.add.assert_not_called()
-
-    def test_chat_stores_memory_for_real_message(self):
-        from companion import chat
-
-        chat("I ran 18 miles today at 8:30 pace", user_id="test_user")
-        self.mock_mem0.add.assert_called_once()
-
-    def test_chat_handles_llm_error(self):
-        self.mock_llm.chat.completions.create.side_effect = Exception("LLM down")
-        from companion import chat
-
-        result = chat("test message", user_id="test_user")
-        assert "trouble" in result.lower() or "apologize" in result.lower()
+        out = companion.chat("hi")
+        assert "apologize" in out.lower() or "trouble" in out.lower()

@@ -1,8 +1,15 @@
-"""
-PRE: Running Coach Bot - Telegram handlers using shared companion pipeline
+"""PRE Telegram handlers.
+
+Slash commands (no agent round-trip): /start, /help, /today, /plan, /log,
+/race, /reset, /health. Free-text messages route to companion.chat which
+runs the full tool-use loop.
 """
 
+from __future__ import annotations
+
 import logging
+from datetime import date
+from pathlib import Path
 
 from telegram import Update
 from telegram.ext import ContextTypes
@@ -10,148 +17,120 @@ from telegram.ext import ContextTypes
 from companion import chat as companion_chat
 from companion import reset_session
 from health import format_commands_text, run_health_checks
-from memory_manager import (
-    USER_ID,
-    clear_all_memories,
-    get_all_memories,
-    store_injury,
-    update_goal,
-)
-from temporal_context import get_race_date, get_temporal_context
+from state_manager import StateManager
+from temporal_context import build_temporal_prompt, get_temporal_context
 
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+STATE_DIR = Path(__file__).resolve().parent / "state"
+_state: StateManager | None = None
 
-def get_user_id(update: Update) -> str:
-    """Always use the shared USER_ID so Telegram hits the same mem0 memories."""
-    return USER_ID
+
+def _get_state() -> StateManager:
+    global _state
+    if _state is None:
+        _state = StateManager(STATE_DIR)
+    return _state
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /start command."""
     user = update.effective_user
-    commands_text = format_commands_text()
-    welcome_message = (
-        f"Hey {user.first_name}! I'm PRE, your running coach bot.\n\n"
-        "I can help you with:\n"
-        "- Training plans and workout suggestions\n"
-        "- Race preparation and pacing strategies\n"
-        "- Recovery and injury prevention\n"
-        "- Motivation and goal setting\n\n"
-        f"Commands:\n{commands_text}\n\n"
-        "Just send me a message about your running goals or questions!"
+    welcome = (
+        f"Hey {user.first_name}, I'm PRE.\n\n"
+        f"Commands:\n{format_commands_text()}\n\n"
+        "Send a message about your training and I'll respond."
     )
-    await update.message.reply_text(welcome_message)
+    await update.message.reply_text(welcome)
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /help command."""
     await update.message.reply_text(f"Commands:\n{format_commands_text()}")
 
 
-async def goal_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /goal command."""
-    arg = " ".join(context.args) if context.args else ""
-    if not arg:
-        await update.message.reply_text("Usage: /goal <target time>  (e.g., /goal 3:25)")
-        return
-    update_goal(arg)
-    await update.message.reply_text(f"Goal updated: {arg}")
-
-
-async def injury_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /injury command."""
-    arg = " ".join(context.args) if context.args else ""
-    if not arg:
-        await update.message.reply_text("Usage: /injury <description>  (e.g., /injury left knee soreness)")
-        return
-    store_injury(arg)
-    await update.message.reply_text(f"Injury logged (14-day tracking): {arg}")
-
-
-async def race_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /race command."""
-    ctx = get_temporal_context()
-    race_date = get_race_date()
-    await update.message.reply_text(
-        f"Race: Boston Marathon - {race_date.strftime('%B %d, %Y')}\n"
-        f"Countdown: {ctx['days_to_race']} days ({ctx['weeks_to_race']} weeks)\n"
-        f"Phase: {ctx['training_phase']}"
-    )
-
-
 async def today_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /today command."""
-    ctx = get_temporal_context()
-    await update.message.reply_text(
-        f"Date: {ctx['date']}\nTime: {ctx['time_of_day']}\nDays to race: {ctx['days_to_race']}"
-    )
-
-
-async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /history command."""
-    memories = get_all_memories()
-    if not memories:
-        await update.message.reply_text("No memories stored yet.")
+    """Fast path: today's prescribed workout straight from plan.md, no LLM."""
+    state = _get_state()
+    today = date.today()
+    w = state.get_todays_workout(today)
+    if not w["found"]:
+        await update.message.reply_text(
+            f"No workout prescribed for {today.isoformat()}. Send a message and I'll fill it in."
+        )
         return
+    if w["is_rest_day"]:
+        text = f"{today.strftime('%a %b %d')}: rest day. {w['notes']}".strip()
+    else:
+        lines = [
+            f"{today.strftime('%a %b %d')}: {w['workout']}",
+            f"Pace: {w['pace_target']}" if w["pace_target"] and w["pace_target"] != "—" else None,
+            w["notes"] or None,
+        ]
+        text = "\n".join(line for line in lines if line)
+    await update.message.reply_text(text)
 
-    lines = []
-    for mem in memories:
-        if mem is None:
-            continue
-        metadata = mem.get("metadata") or {}
-        memory_text = mem.get("memory", "")
-        if metadata:
-            lines.append(f"- {memory_text} [metadata: {metadata}]")
-        else:
-            lines.append(f"- {memory_text}")
 
-    text = "Stored memories:\n" + "\n".join(lines) if lines else "No memories stored yet."
-    # Telegram has a 4096 char limit per message
+async def plan_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Print the current plan.md (truncated if needed for Telegram's 4096 limit)."""
+    plan = _get_state().load_plan()
+    if not plan.strip():
+        await update.message.reply_text("No plan set. Tell me about your goals and I'll draft one.")
+        return
+    if len(plan) > 4000:
+        plan = plan[:4000] + "\n... (truncated)"
+    await update.message.reply_text(plan)
+
+
+async def log_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Print recent sessions. Optional arg: days (default 7)."""
+    days = 7
+    if context.args:
+        try:
+            days = int(context.args[0])
+        except ValueError:
+            pass
+    sessions = _get_state().get_recent_sessions(days=days)
+    if not sessions:
+        await update.message.reply_text(f"No sessions logged in the last {days} days.")
+        return
+    lines = [f"Last {days} days ({len(sessions)} entries):"]
+    for s in sessions[-15:]:
+        miles = f" {s['miles']}mi" if s.get("miles") else ""
+        pace = f" @ {s['pace_avg']}" if s.get("pace_avg") else ""
+        notes = f" — {s['notes']}" if s.get("notes") else ""
+        lines.append(f"  {s.get('date', '?')} {s.get('type', '?')}{miles}{pace}{notes}")
+    text = "\n".join(lines)
     if len(text) > 4000:
         text = text[:4000] + "\n... (truncated)"
     await update.message.reply_text(text)
 
 
+async def race_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    ctx = get_temporal_context()
+    if ctx["days_to_race"] is None:
+        await update.message.reply_text("No target race configured in athlete.yaml.")
+        return
+    await update.message.reply_text(build_temporal_prompt())
+
+
 async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /reset command."""
-    user_id = get_user_id(update)
-    reset_session(user_id)
-    await update.message.reply_text("Session history cleared. Mem0 memories preserved.")
-
-
-async def forget_all_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /forgetall command with confirmation."""
-    args = context.args
-    if args and args[0].lower() == "confirm":
-        clear_all_memories()
-        await update.message.reply_text("All memories deleted permanently.")
-    else:
-        await update.message.reply_text(
-            "This will permanently delete ALL stored memories.\nSend /forgetall confirm to proceed."
-        )
+    reset_session()
+    await update.message.reply_text("Session history cleared.")
 
 
 async def health_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /health command."""
     results = run_health_checks()
     lines = [f"{component.capitalize()}: {'OK' if ok else 'FAIL'}" for component, ok in results.items()]
     await update.message.reply_text("Health Check:\n" + "\n".join(lines))
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle incoming messages using the shared companion pipeline."""
+    """Route free-text messages through the companion agent."""
     user_message = update.message.text
-    user_id = get_user_id(update)
-
-    logger.info(f"Message from {user_id}: {user_message[:50]}...")
-
+    logger.info(f"Message: {user_message[:50]}...")
     try:
-        # Use the same pipeline as CLI
-        response = companion_chat(user_message, user_id=user_id)
+        response = companion_chat(user_message)
         await update.message.reply_text(response)
-
     except Exception as e:
         logger.error(f"Error processing message: {e}")
         await update.message.reply_text("Sorry, I encountered an error. Please try again in a moment.")

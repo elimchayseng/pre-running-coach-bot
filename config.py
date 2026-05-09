@@ -17,8 +17,7 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 # Testing mode: skip env validation and real client initialization
 TESTING = os.getenv("TESTING", "").lower() in ("1", "true")
 
-# Required environment variables
-REQUIRED_ENV_VARS = ["MEM0_API_KEY", "HEROKU_INFERENCE_URL", "HEROKU_INFERENCE_KEY"]
+REQUIRED_ENV_VARS = ["HEROKU_INFERENCE_URL", "HEROKU_INFERENCE_KEY"]
 
 
 def validate_env() -> bool:
@@ -30,56 +29,27 @@ def validate_env() -> bool:
     return True
 
 
-# Mem0 client with custom instructions
-CUSTOM_INSTRUCTIONS = """
-Extract from marathon training conversations:
-- Race goals (target times, race dates, qualifying standards)
-- Training metrics (weekly mileage, long run distances, pace targets)
-- Physical constraints (injuries, recovery needs, cross-training requirements)
-- Preferences (time of day, terrain, weather conditions, gear)
-- Progress milestones (PRs, successful workouts, breakthroughs)
-
-Exclude:
-- Greetings and small talk
-- Filler words and casual acknowledgments
-- Hypotheticals unless planning-related
-"""
-
-CUSTOM_CATEGORIES = [
-    {"goals": "Race targets, time goals, Boston qualifying"},
-    {"training": "Weekly plans, workouts, mileage"},
-    {"constraints": "Injuries, recovery, limitations"},
-    {"preferences": "Schedule, terrain, gear preferences"},
-]
-
-HEROKU_MODEL = os.getenv("HEROKU_MODEL", "claude-3-5-sonnet")
+HEROKU_MODEL = os.getenv("HEROKU_MODEL", "claude-sonnet-4-6")
 
 if not TESTING:
-    # Validate on import
     if not validate_env():
         sys.exit(1)
 
-    from mem0 import MemoryClient
     from openai import OpenAI
-
-    # Initialize Mem0 client
-    mem0_client = MemoryClient(api_key=os.getenv("MEM0_API_KEY"))
 
     # Heroku LLM client (OpenAI-compatible)
     llm_client = OpenAI(
         base_url=os.getenv("HEROKU_INFERENCE_URL"),
         api_key=os.getenv("HEROKU_INFERENCE_KEY"),
-        timeout=30.0,  # 30 second timeout
+        timeout=30.0,
     )
 else:
-    mem0_client = None
     llm_client = None
 
 # Coach personality (condensed for token efficiency)
 PRE_PERSONALITY = (
-    "PRE is an elite marathon coach: clinical, demanding, uncompromising. "
-    "He gives brutal truth over comfort, thinks in macro/microcycles, "
-    "obsesses over biometrics (HRV, cardiac drift, GCT). "
-    "He views Boston as a tactical challenge requiring precision pacing. "
-    "He identifies mechanical leaks early and shuts down training if form breaks down."
+    "PRE is an elite endurance coach: clinical, demanding, uncompromising. "
+    "Brutal truth over comfort. Thinks macrocycle → mesocycle → microcycle → today. "
+    "Obsessive about biometrics (HRV, HR, RPE, sleep) — uses them to catch "
+    "trouble early. Shuts down training when fatigue, pain, or form warrant it."
 )

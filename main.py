@@ -1,58 +1,50 @@
-import warnings
+"""PRE running coach — CLI."""
 
-# Suppress mem0's deprecation warning (it bypasses normal filters)
-_original_warn = warnings.warn
+from __future__ import annotations
 
+from datetime import date
+from pathlib import Path
 
-def _filtered_warn(message, category=UserWarning, stacklevel=1):
-    if "output_format" in str(message):
-        return
-    _original_warn(message, category, stacklevel + 1)
+from companion import chat, reset_session
+from config import logger
+from conversation_store import check_redis_health
+from health import format_commands_text, run_health_checks
+from state_manager import StateManager
+from temporal_context import build_temporal_prompt, get_temporal_context
 
-
-warnings.warn = _filtered_warn
-
-from companion import chat, reset_session  # noqa: E402, I001
-from config import logger  # noqa: E402
-from conversation_store import check_redis_health  # noqa: E402
-from health import format_commands_text, run_health_checks  # noqa: E402
-from memory_manager import (  # noqa: E402
-    clear_all_memories,
-    get_all_memories,
-    store_agent_personality,
-    store_injury,
-    update_goal,
-)
-
-# ANSI color codes
 GREEN = "\033[92m"
 BLUE = "\033[94m"
 RED = "\033[91m"
 RESET = "\033[0m"
 
+STATE_DIR = Path(__file__).resolve().parent / "state"
+_state: StateManager | None = None
+
+
+def _get_state() -> StateManager:
+    global _state
+    if _state is None:
+        _state = StateManager(STATE_DIR)
+    return _state
+
 
 def print_pre(message: str) -> None:
-    """Print PRE's response in green."""
     print(f"{GREEN}PRE: {message}{RESET}")
 
 
 def print_system(message: str) -> None:
-    """Print system message in blue."""
     print(f"{BLUE}{message}{RESET}")
 
 
 def print_error(message: str) -> None:
-    """Print error message in red."""
     print(f"{RED}{message}{RESET}")
 
 
 def show_help() -> None:
-    """Display available commands."""
     print_system(f"\nCommands:\n{format_commands_text(include_quit=True)}\n")
 
 
 def check_health() -> bool:
-    """Run system health checks."""
     print_system("Running health checks...")
     results = run_health_checks()
     for component, ok in results.items():
@@ -63,7 +55,7 @@ def check_health() -> bool:
 
 
 def handle_command(cmd: str) -> bool:
-    """Handle slash commands. Returns True if should continue loop."""
+    """Handle slash commands. Returns True if loop should continue."""
     parts = cmd.split(maxsplit=1)
     command = parts[0].lower()
     arg = parts[1] if len(parts) > 1 else ""
@@ -72,67 +64,59 @@ def handle_command(cmd: str) -> bool:
         print_system("Goodbye! Keep running strong!")
         return False
 
-    elif command == "/help":
+    if command == "/help":
         show_help()
 
-    elif command == "/goal":
-        if not arg:
-            print_system("Usage: /goal <target time>  (e.g., /goal 3:25)")
+    elif command == "/today":
+        state = _get_state()
+        today = date.today()
+        w = state.get_todays_workout(today)
+        if not w["found"]:
+            print_system(f"No workout prescribed for {today.isoformat()}.")
+        elif w["is_rest_day"]:
+            print_system(f"{today.strftime('%a %b %d')}: rest day. {w['notes']}".strip())
         else:
-            update_goal(arg)
-            print_system(f"Goal updated: {arg}")
+            print_system(f"{today.strftime('%a %b %d')}: {w['workout']}")
+            if w["pace_target"] and w["pace_target"] != "—":
+                print_system(f"  Pace: {w['pace_target']}")
+            if w["notes"]:
+                print_system(f"  Notes: {w['notes']}")
 
-    elif command == "/injury":
-        if not arg:
-            print_system("Usage: /injury <description>  (e.g., /injury left knee soreness)")
+    elif command == "/plan":
+        plan = _get_state().load_plan()
+        if not plan.strip():
+            print_system("No plan set.")
         else:
-            store_injury(arg)
-            print_system(f"Injury logged (14-day tracking): {arg}")
+            print(plan)
+
+    elif command == "/log":
+        days = 7
+        if arg:
+            try:
+                days = int(arg.strip())
+            except ValueError:
+                pass
+        sessions = _get_state().get_recent_sessions(days=days)
+        if not sessions:
+            print_system(f"No sessions logged in the last {days} days.")
+        else:
+            print_system(f"Last {days} days ({len(sessions)} entries):")
+            for s in sessions[-15:]:
+                miles = f" {s['miles']}mi" if s.get("miles") else ""
+                pace = f" @ {s['pace_avg']}" if s.get("pace_avg") else ""
+                notes = f" — {s['notes']}" if s.get("notes") else ""
+                print(f"  {s.get('date', '?')} {s.get('type', '?')}{miles}{pace}{notes}")
 
     elif command == "/race":
-        from temporal_context import get_race_date, get_temporal_context
-
         ctx = get_temporal_context()
-        race_date = get_race_date()
-        print_system(f"Race: Boston Marathon - {race_date.strftime('%B %d, %Y')}")
-        print_system(f"Countdown: {ctx['days_to_race']} days ({ctx['weeks_to_race']} weeks)")
-        print_system(f"Phase: {ctx['training_phase']}")
-
-    elif command == "/today":
-        from temporal_context import get_temporal_context
-
-        ctx = get_temporal_context()
-        print_system(f"Date: {ctx['date']}")
-        print_system(f"Time: {ctx['time_of_day']}")
-        print_system(f"Days to race: {ctx['days_to_race']}")
-
-    elif command == "/history":
-        memories = get_all_memories()
-        if not memories:
-            print_system("No memories stored yet.")
+        if ctx["days_to_race"] is None:
+            print_system("No target race configured in athlete.yaml.")
         else:
-            print_system("Stored memories:")
-            for mem in memories:
-                if mem is None:
-                    continue
-                metadata = mem.get("metadata") or {}
-                memory_text = mem.get("memory", "")
-                if metadata:
-                    print(f"  - {memory_text} [metadata: {metadata}]")
-                else:
-                    print(f"  - {memory_text}")
+            print_system(build_temporal_prompt())
 
     elif command == "/reset":
         reset_session()
-        print_system("Session history cleared. Mem0 memories preserved.")
-
-    elif command == "/forgetall":
-        confirm = input(f"{BLUE}This will permanently delete ALL memories. Type 'yes' to confirm: {RESET}")
-        if confirm.lower() == "yes":
-            clear_all_memories()
-            print_system("All memories deleted permanently.")
-        else:
-            print_system("Cancelled.")
+        print_system("Session history cleared.")
 
     elif command == "/health":
         check_health()
@@ -144,36 +128,24 @@ def handle_command(cmd: str) -> bool:
 
 
 def main():
-    """Main chat loop."""
     print_system("=" * 50)
-    print_system("Boston Marathon Training Companion")
+    print_system("PRE Running Coach")
     print_system("=" * 50)
 
-    # Startup health check
     if not check_redis_health():
         print_error("Warning: Redis connection failed. Session history may not persist.")
         logger.warning("Redis unavailable at startup")
 
-    print_pre("Hey! I'm PRE, your running coach. Ready to help you train for Boston!")
-    print_pre("Tell me about your goals, and we'll build a plan together.")
+    print_pre("Hey, PRE here. What's the plan today?")
     print_system("Type /help for commands, /quit to exit.\n")
 
-    # Initialize coach personality
-    try:
-        store_agent_personality()
-    except Exception as e:
-        logger.warning(f"Failed to store agent personality: {e}")
-
-    # Start with clean session
     reset_session()
 
     while True:
         try:
             user_input = input("You: ").strip()
-
             if not user_input:
                 continue
-
             if user_input.startswith("/"):
                 if not handle_command(user_input):
                     break

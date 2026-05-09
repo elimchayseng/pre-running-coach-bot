@@ -1,0 +1,143 @@
+name: Ethan
+location: San Francisco, CA
+
+# Target races — ordered by priority. The agent treats the earliest non-passed
+# race as "next" for temporal context. Multiple races allow tune-up + goal
+# structure (B race embedded in build for A race).
+target_races:
+  - name: Brooklyn RBC Half Marathon
+    date: 2026-05-16
+    start_time: "07:00"
+    timezone: America/New_York
+    distance: half_marathon
+    distance_mi: 13.1
+    priority: B  # tune-up
+    terrain: road
+    elevation_gain_ft: ~150
+    goal_time: "1:20:59"
+    goal_pace: "6:10"
+    goal_context: "Sub-1:21 to qualify for NYC Marathon age-group entry"
+
+  - name: Broken Arrow Skyrace 46K
+    date: 2026-06-20
+    start_time: "07:00"
+    timezone: America/Los_Angeles
+    distance: ultra
+    distance_mi: 28.6
+    distance_km: 46
+    priority: A  # goal race
+    terrain: technical mountain / sky
+    elevation_gain_ft: ~10000
+    goal_time:
+    goal_context: "Just finish — survive the day, manage effort, no racing"
+    location: Palisades Tahoe, CA
+
+prs:
+  marathon: "2:49"  # Berlin Marathon, September 2024
+  # half / 10k / 5k not on file — fill when known
+
+# Pace zones from coach handoff. Re-evaluate after each quality session via
+# get_fitness_summary; adjust on trends, not single sessions.
+zones:
+  marathon_pace: "6:40"
+  half_pace_target: "6:10"     # Brooklyn goal
+  threshold: "6:15-6:25"
+  easy: "8:30-9:00"
+  recovery: "9:00-9:30"
+  # vo2: not on file
+  # long_run: not on file (typically easy +0:15)
+
+hr_zones:
+  resting: "44-48"
+  hrv_range: "100-128"  # Eight Sleep
+  easy_ceiling: 155
+  threshold: "175-185"
+  race_max_observed: 195  # final mile, Boston 2026
+
+# Build target for next block
+weekly_volume_ceiling_miles: 55
+
+preferences:
+  communication_style: Direct, no fluff, no positive reinforcement padding. 
+    Maintains original tone in any rewrites.
+  data_sharing: Shares Strava activity tables and lap-level workout data via 
+    screenshots.
+training_characteristics:
+  pacing_discipline: 'Tends to run faster than prescribed on workouts and easy days.
+    Thu 5/7 HM test: prescribed 6:10-6:15, ran 5:57/6:00/6:06 with HR spiking to 190
+    on second mile. Confirms handoff note about needing external load checks.'
+  unprescribed_volume_pattern: 'Adds sessions outside the plan when feeling good.
+    Week of 5/4: added Mon 3mi run (was rest), turned Wed recovery spin into 18.18mi/1,266ft
+    climbing ride.'
+cross_training:
+  cycling: "20-30mi rides typical, gravitates toward elevation. Needs explicit no-climbing
+    rules on recovery rides."
+  swimming: "Used for recovery."
+
+  yoga: Has regular practice. Willing to slot in when prescribed.
+strength_training:
+  frequency: "3-4x/week"
+  focus_lifts:
+    - Front Squat
+    - Incline Bench
+    - Hang Clean
+  accessory:
+    - RDL
+    - Bulgarian split squat
+    - Pull-ups
+    - Calf raises (eccentric + concentric)
+
+# Standing PT protocol — used during recent Achilles rehab; reference for any
+# calf/Achilles flare-up.
+  equipment_access: Full gym (barbell, rack, machines).
+  race_week_protocol: 'Last lift no later than 4 days pre-race. Primer format: trap
+    bar DL 3x3 @60%, box jumps 3x3, single-leg calf raises 2x10. No grinding, no failure
+    sets, no accessory work.'
+pt_protocol_achilles:
+  - "Eccentric heel drops: straight leg + bent knee"
+  - "Glute bridges"
+  - "Glute med work"
+  - "Quad engagement / loading"
+  - "Calf raises (eccentric + concentric)"
+
+injury_history:
+  - date: 2023-04
+    description: "Right peroneal tendon surgery"
+    status: resolved
+    note: "Ran Boston 2023 in 3:12-3:13 on torn tendon, surgery following week"
+  - date: 2024-10
+    description: "Left hip labrum irritation (post-Berlin 2024)"
+    status: resolved
+    rehab: "Strength training emphasis"
+  - date: 2025-12
+    description: "Bronchitis"
+    status: resolved
+    impact: "2-week deload"
+  - date: 2026-01-23
+    description: "Left calf strain → Achilles tendinopathy"
+    diagnosed: 2026-02-06
+    resolved: 2026-03-08
+    status: resolved
+    pt_protocol_ref: pt_protocol_achilles
+
+race_history:
+  - race: Boston Marathon 2023
+    date: 2023-04-17
+    finish: "3:12-3:13"
+    notes: "On torn right peroneal tendon; surgery the following week"
+  - race: Berlin Marathon 2024
+    date: 2024-09-29
+    finish: "2:49"
+    notes: "PR"
+  - race: Boston Marathon 2026
+    date: 2026-04-20
+    finish: "3:00:45"
+    distance_watch_mi: 26.36
+    elevation_gain_ft: 935
+    half_split: "~1:28:30"
+    notes: |
+      Returning from Achilles tendinopathy. Conservative start (6:51), held
+      6:42-6:52 through mile 16. Newton Hills handled well (avg 6:51 for
+      miles 17-21). Faded miles 24-26 (6:56 → 7:13 → 7:27). Lost ~45s to
+      target in final 5K. Limiter: volume — 40mi peak likely insufficient
+      for sub-3:00.

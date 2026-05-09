@@ -23,14 +23,13 @@ def client():
 
 
 class TestHealthCheck:
-    @patch("health.run_health_checks", return_value={"redis": True, "mem0": True, "llm": True})
+    @patch("health.run_health_checks", return_value={"redis": True, "llm": True})
     def test_health_returns_200_when_all_ok(self, mock_checks, client):
         resp = client.get("/")
         assert resp.status_code == 200
         data = resp.get_json()
         assert data["status"] == "healthy"
         assert data["redis"] == "ok"
-        assert data["mem0"] == "ok"
         assert data["llm"] == "ok"
 
     def test_health_contains_bot_name(self, client):
@@ -38,7 +37,7 @@ class TestHealthCheck:
         data = resp.get_json()
         assert "PRE" in data["bot"]
 
-    @patch("health.run_health_checks", return_value={"redis": False, "mem0": True, "llm": True})
+    @patch("health.run_health_checks", return_value={"redis": False, "llm": True})
     def test_health_returns_503_when_redis_down(self, mock_checks, client):
         resp = client.get("/")
         assert resp.status_code == 503

@@ -13,13 +13,11 @@ from telegram import Bot, Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters
 
 from bot import (
-    forget_all_command,
-    goal_command,
     handle_message,
     health_command,
     help_command,
-    history_command,
-    injury_command,
+    log_command,
+    plan_command,
     race_command,
     reset_command,
     start_command,
@@ -65,13 +63,11 @@ def get_telegram_app():
         telegram_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
         telegram_app.add_handler(CommandHandler("start", start_command))
         telegram_app.add_handler(CommandHandler("help", help_command))
-        telegram_app.add_handler(CommandHandler("goal", goal_command))
-        telegram_app.add_handler(CommandHandler("injury", injury_command))
-        telegram_app.add_handler(CommandHandler("race", race_command))
         telegram_app.add_handler(CommandHandler("today", today_command))
-        telegram_app.add_handler(CommandHandler("history", history_command))
+        telegram_app.add_handler(CommandHandler("plan", plan_command))
+        telegram_app.add_handler(CommandHandler("log", log_command))
+        telegram_app.add_handler(CommandHandler("race", race_command))
         telegram_app.add_handler(CommandHandler("reset", reset_command))
-        telegram_app.add_handler(CommandHandler("forgetall", forget_all_command))
         telegram_app.add_handler(CommandHandler("health", health_command))
         telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
         # Must initialize before process_update can be called
@@ -81,7 +77,7 @@ def get_telegram_app():
 
 @app.route("/", methods=["GET"])
 def health_check():
-    """Health check endpoint for Railway — checks Redis and Mem0."""
+    """Health check endpoint for Railway — checks Redis and the LLM."""
     from health import run_health_checks
 
     results = run_health_checks()
