@@ -61,3 +61,9 @@ Adjustments made for 5/8-5/16: Sat long run cut from 9-10mi to 8mi strict with H
 ## 2026-05-08 20:38
 
 Race-week travel context now visible on calendar: arrives Newark Thu 5/14 ~2:37pm ET, Hoxton Williamsburg through 5/18, race Sat 5/16. Tight ET adaptation window — flagged shifting sleep schedule earlier starting Tuesday.
+
+---
+
+## 2026-05-08 21:25
+
+Plan formalized and synced from coaching conversation. Phase 1 (race week → Brooklyn 5/16) locked at daily resolution; Phase 2 (Brooklyn → Broken Arrow) skeleton only, pending fall-goal decision. Two active issues being managed: pacing discipline (race-day pace floor on mile 1) and unprescribed volume (Sat long run cut to 8mi, Sun ride cut to 75min no-climbing). Brooklyn promoted to A race for this cycle; Broken Arrow demoted to fun race / no time goal.
