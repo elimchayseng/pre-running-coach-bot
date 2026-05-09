@@ -126,7 +126,10 @@ async def health_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Route free-text messages through the companion agent."""
     user_message = update.message.text
-    logger.info(f"Message: {user_message[:50]}...")
+    chat_id = update.effective_chat.id if update.effective_chat else None
+    # Log chat_id at INFO so it shows up in Railway logs — helpful for the
+    # one-time USER_TELEGRAM_CHAT_ID setup.
+    logger.info(f"Message from chat_id={chat_id}: {user_message[:50]}...")
     try:
         response = companion_chat(user_message)
         await update.message.reply_text(response)

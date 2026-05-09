@@ -92,6 +92,49 @@ def health_check():
     ), status_code
 
 
+@app.route("/strava/webhook", methods=["GET"])
+def strava_webhook_verify():
+    """Strava subscription handshake.
+
+    Strava GETs callback_url with ?hub.mode=subscribe&hub.challenge=X&hub.verify_token=Y
+    after we POST a subscription request. We verify the token matches our
+    shared secret and echo the challenge back.
+    """
+    expected = os.getenv("STRAVA_VERIFY_TOKEN")
+    got = request.args.get("hub.verify_token", "")
+    if not expected or got != expected:
+        logger.warning("Strava verify request rejected: token mismatch")
+        return jsonify({"status": "forbidden"}), 403
+    challenge = request.args.get("hub.challenge", "")
+    return jsonify({"hub.challenge": challenge}), 200
+
+
+@app.route("/strava/webhook", methods=["POST"])
+def strava_webhook_event():
+    """Receive a Strava activity event.
+
+    Strava expects a 200 within 2s — we ack immediately and process in a
+    background thread.
+    """
+    try:
+        payload = request.get_json(force=True, silent=True) or {}
+    except Exception:
+        payload = {}
+    logger.info(
+        "Strava webhook event: aspect=%s object=%s id=%s",
+        payload.get("aspect_type"),
+        payload.get("object_type"),
+        payload.get("object_id"),
+    )
+    try:
+        from strava.handler import handle_event
+
+        threading.Thread(target=handle_event, args=(payload,), daemon=True).start()
+    except Exception as e:
+        logger.error(f"Failed to dispatch Strava event: {e}")
+    return jsonify({"status": "ok"}), 200
+
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
     """Handle incoming Telegram webhook updates."""
