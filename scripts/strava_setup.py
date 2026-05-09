@@ -35,7 +35,11 @@ load_dotenv()
 from strava import auth, client  # noqa: E402
 
 REDIRECT_URI = "http://localhost"
-SCOPES = "activity:read,read"
+# activity:read_all is required to fetch activities marked "Only You" or with
+# privacy zones. Without it, get_activity returns 404 even for activities our
+# webhook subscription is notified about. activity:read alone is too narrow
+# for any user with default-private activities.
+SCOPES = "activity:read_all,read"
 
 
 # ---------- printing helpers ----------
