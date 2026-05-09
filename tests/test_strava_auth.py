@@ -92,3 +92,100 @@ class TestGetAccessToken:
         with pytest.raises(auth.StravaAuthError) as exc:
             auth.get_access_token()
         assert "Redis" in str(exc.value) or "redis" in str(exc.value)
+
+
+class TestStorageUnreachableSurfaces:
+    """When Redis itself is unreachable, the error message must NOT tell the
+    user to re-auth — that's misleading. It should say infrastructure issue.
+    """
+
+    def test_redis_unreachable_raises_token_storage_unavailable(self, monkeypatch):
+        monkeypatch.setenv("STRAVA_TOKENS_BACKEND", "redis")
+
+        # Force conversation_store._get_redis to raise (simulate Redis down)
+        import conversation_store
+
+        def _boom():
+            raise ConnectionError("connection refused")
+
+        monkeypatch.setattr(conversation_store, "_get_redis", _boom)
+        with pytest.raises(auth.TokenStorageUnavailable):
+            auth._read_tokens_redis()
+
+    def test_get_access_token_translates_unavailable_to_infra_message(self, monkeypatch, tmp_path):
+        # Redis-backend, with Redis down.
+        monkeypatch.setenv("STRAVA_TOKENS_BACKEND", "redis")
+        import conversation_store
+
+        def _boom():
+            raise ConnectionError("connection refused")
+
+        monkeypatch.setattr(conversation_store, "_get_redis", _boom)
+        with pytest.raises(auth.StravaAuthError) as exc:
+            auth.get_access_token()
+        msg = str(exc.value)
+        # The message should NOT tell the user to re-auth.
+        assert "scripts/strava_setup.py auth" not in msg
+        assert "infrastructure" in msg.lower() or "unreachable" in msg.lower() or "unavailable" in msg.lower()
+
+
+class TestRefreshRetry:
+    """The _refresh function should retry on transient network errors but
+    propagate on Strava 4xx (e.g., revoked refresh token)."""
+
+    def test_refresh_retries_on_connection_error(self, monkeypatch):
+        import requests as _requests
+
+        from strava import auth as _auth
+
+        # Two ConnectionErrors then success
+        attempts = {"n": 0}
+
+        class _Resp:
+            status_code = 200
+
+            def json(self):
+                return {
+                    "access_token": "new_access",
+                    "refresh_token": "rotated_refresh",
+                    "expires_at": 9999999999,
+                }
+
+        def _post(url, data, timeout):
+            attempts["n"] += 1
+            if attempts["n"] < 3:
+                raise _requests.ConnectionError("flaky")
+            return _Resp()
+
+        monkeypatch.setenv("STRAVA_CLIENT_ID", "x")
+        monkeypatch.setenv("STRAVA_CLIENT_SECRET", "y")
+        monkeypatch.setattr(_requests, "post", _post)
+        # Tenacity wraps the function; retry count includes the initial call.
+        result = _auth._refresh.retry_with(stop=__import__("tenacity").stop_after_attempt(3))("rt")
+        assert result["access_token"] == "new_access"
+        assert attempts["n"] == 3
+
+    def test_refresh_4xx_does_not_retry(self, monkeypatch):
+        import requests as _requests
+
+        from strava import auth as _auth
+
+        attempts = {"n": 0}
+
+        class _Resp:
+            status_code = 400
+            text = "invalid refresh"
+
+            def json(self):
+                return {}
+
+        def _post(*a, **kw):
+            attempts["n"] += 1
+            return _Resp()
+
+        monkeypatch.setenv("STRAVA_CLIENT_ID", "x")
+        monkeypatch.setenv("STRAVA_CLIENT_SECRET", "y")
+        monkeypatch.setattr(_requests, "post", _post)
+        with pytest.raises(auth.StravaAuthError):
+            _auth._refresh("rt")
+        assert attempts["n"] == 1  # No retry on 4xx

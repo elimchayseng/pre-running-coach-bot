@@ -19,11 +19,18 @@ from __future__ import annotations
 import json
 import logging
 import os
+import tempfile
 import time
 from pathlib import Path
 from typing import Optional
 
 import requests
+from tenacity import (
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
 
 logger = logging.getLogger("pre_coach.strava.auth")
 
@@ -42,6 +49,12 @@ def _backend() -> str:
 
 class StravaAuthError(RuntimeError):
     """Auth failure that callers can distinguish from generic HTTP errors."""
+
+
+class TokenStorageUnavailable(RuntimeError):
+    """The configured token store is reachable-but-empty vs. fundamentally
+    unreachable. Lets callers print a helpful message that doesn't tell the
+    user to re-auth when Redis is just down."""
 
 
 def _client_credentials() -> tuple[str, str]:
@@ -76,8 +89,23 @@ def _read_tokens_file() -> Optional[dict]:
 
 
 def _write_tokens_file(tokens: dict) -> None:
+    """Atomic file write: write to .tmp + rename. Crash-safe."""
     TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
-    TOKEN_FILE.write_text(json.dumps(tokens, indent=2))
+    fd, tmp_path = tempfile.mkstemp(
+        dir=TOKEN_FILE.parent,
+        prefix=f".{TOKEN_FILE.name}.",
+        suffix=".tmp",
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(json.dumps(tokens, indent=2))
+        os.replace(tmp_path, TOKEN_FILE)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
     # 0600 so the secret isn't world-readable on shared hosts.
     try:
         TOKEN_FILE.chmod(0o600)
@@ -86,13 +114,16 @@ def _write_tokens_file(tokens: dict) -> None:
 
 
 def _read_tokens_redis() -> Optional[dict]:
+    """Read tokens from Redis. Raises TokenStorageUnavailable if Redis is
+    unreachable (vs. returning None if the key just doesn't exist).
+    """
     try:
         from conversation_store import _get_redis
 
         data = _get_redis().get(TOKENS_REDIS_KEY)
     except Exception as e:
-        logger.warning(f"Redis read for Strava tokens failed: {e}")
-        return None
+        logger.warning(f"Redis unreachable for Strava tokens: {e}")
+        raise TokenStorageUnavailable(f"Redis unreachable: {e}") from e
     if not data:
         return None
     try:
@@ -110,7 +141,7 @@ def _write_tokens_redis(tokens: dict) -> None:
         logger.info("Wrote Strava tokens to Redis (key=%s)", TOKENS_REDIS_KEY)
     except Exception as e:
         logger.error(f"Redis write for Strava tokens failed: {e}")
-        raise
+        raise TokenStorageUnavailable(f"Redis write failed: {e}") from e
 
 
 def exchange_code_for_tokens(code: str) -> dict:
@@ -144,8 +175,14 @@ def exchange_code_for_tokens(code: str) -> dict:
     return tokens
 
 
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=1, max=8),
+    retry=retry_if_exception_type((requests.ConnectionError, requests.Timeout)),
+)
 def _refresh(refresh_token: str) -> dict:
-    """Exchange a refresh token for a fresh access token."""
+    """Exchange a refresh token for a fresh access token. Retries on
+    transient network errors only — 4xx propagates immediately."""
     cid, secret = _client_credentials()
     resp = requests.post(
         TOKEN_URL,
@@ -174,7 +211,17 @@ def get_access_token() -> str:
     Raises StravaAuthError if no token file exists (run setup first) or if
     refresh fails.
     """
-    tokens = _read_tokens()
+    try:
+        tokens = _read_tokens()
+    except TokenStorageUnavailable as e:
+        # Storage backend (Redis) is unreachable — distinct from "no tokens".
+        # Don't tell the user to re-auth.
+        raise StravaAuthError(
+            f"Strava token storage unavailable ({_backend()} backend): {e}. "
+            "Infrastructure issue, not auth — tokens are not lost. "
+            "Verify REDIS_URL connectivity."
+        ) from e
+
     if not tokens or "refresh_token" not in tokens:
         location = f"Redis key {TOKENS_REDIS_KEY}" if _backend() == "redis" else f"{TOKEN_FILE}"
         raise StravaAuthError(f"No Strava tokens at {location}. Run `python scripts/strava_setup.py auth` first.")
