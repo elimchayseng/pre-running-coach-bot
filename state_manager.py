@@ -82,6 +82,28 @@ class StateManager:
     def get_sessions_in_range(self, start: date, end: date) -> list[dict]:
         return self._load_log_entries(lambda d: start <= d <= end)
 
+    def existing_strava_ids(self) -> set[int]:
+        """Return all `details.strava_id` values from log.jsonl. Used by
+        Strava backfill + webhook handler for idempotency."""
+        if not self.log_path.exists():
+            return set()
+        out: set[int] = set()
+        with self.log_path.open("r", encoding="utf-8") as f:
+            for raw in f:
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    entry = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                sid = (entry.get("details") or {}).get("strava_id")
+                if isinstance(sid, int):
+                    out.add(sid)
+                elif isinstance(sid, str) and sid.isdigit():
+                    out.add(int(sid))
+        return out
+
     def _load_log_entries(self, date_pred: Callable[[date], bool]) -> list[dict]:
         if not self.log_path.exists():
             return []

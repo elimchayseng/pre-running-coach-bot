@@ -24,6 +24,18 @@ def run_health_checks() -> dict[str, bool]:
         logger.error(f"LLM health check failed: {e}")
         results["llm"] = False
 
+    # Strava is optional — only check if creds are present.
+    import os
+
+    if os.getenv("STRAVA_CLIENT_ID") and os.getenv("STRAVA_CLIENT_SECRET"):
+        try:
+            from strava.auth import health_check as strava_health
+
+            results["strava"] = strava_health()
+        except Exception as e:
+            logger.error(f"Strava health check failed: {e}")
+            results["strava"] = False
+
     return results
 
 
