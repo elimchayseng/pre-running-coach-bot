@@ -5,6 +5,8 @@ from __future__ import annotations
 from datetime import date, timedelta
 from typing import Optional
 
+from temporal_context import today_local
+
 SCHEMAS = [
     {
         "type": "function",
@@ -65,7 +67,7 @@ SCHEMAS = [
 
 
 def _get_today(args: dict, state) -> dict:
-    today = date.today()
+    today = today_local()
     athlete = state.load_athlete()
     races = athlete.get("target_races", []) or []
     next_race = _next_race(races, today)
@@ -92,13 +94,13 @@ def _get_today(args: dict, state) -> dict:
 
 
 def _get_todays_workout(args: dict, state) -> dict:
-    target = _parse_date(args.get("date")) or date.today()
+    target = _parse_date(args.get("date")) or today_local()
     return state.get_todays_workout(target)
 
 
 def _get_week_plan(args: dict, state) -> dict:
     offset = int(args.get("week_offset", 0))
-    today = date.today()
+    today = today_local()
     monday = today - timedelta(days=today.weekday())
     target_monday = monday + timedelta(weeks=offset)
     rows = []

@@ -11,12 +11,15 @@ target_races:
     timezone: America/New_York
     distance: half_marathon
     distance_mi: 13.1
-    priority: B  # tune-up
+    priority: A  # goal race for this cycle (NYC qualifier)
     terrain: road
     elevation_gain_ft: ~150
     goal_time: "1:20:59"
     goal_pace: "6:10"
-    goal_context: "Sub-1:21 to qualify for NYC Marathon age-group entry"
+    goal_context: |
+      Sub-1:21 NYC Marathon age-group qualifier. Pacing discipline is the
+      limiter — fitness is there. Hard pace floor mile 1: 6:15-6:20; back
+      off if any faster. HR cap miles 1-3: 178.
 
   - name: Broken Arrow Skyrace 46K
     date: 2026-06-20
@@ -25,12 +28,21 @@ target_races:
     distance: ultra
     distance_mi: 28.6
     distance_km: 46
-    priority: A  # goal race
+    priority: B  # fun race, no time goal
     terrain: technical mountain / sky
     elevation_gain_ft: ~10000
     goal_time:
-    goal_context: "Just finish — survive the day, manage effort, no racing"
+    goal_context: "Fun race — no time goal, just finish. Manage effort, survive the day."
     location: Palisades Tahoe, CA
+
+# Forward-looking — not committed yet. Fall goal will determine whether the
+# Brooklyn → Broken Arrow bridge phase is base-building, vert-specific, or
+# recovery-focused.
+fall_goal:
+  status: under_consideration
+  candidates:
+    - "Sub-3:00 marathon (CIM, NYC if Saturday qualifies, other)"
+  decision_by: "TBD before May 24 (Phase 2 build-out)"
 
 prs:
   marathon: "2:49"  # Berlin Marathon, September 2024
