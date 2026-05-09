@@ -74,19 +74,17 @@ class TestRaceDateResolution:
         monkeypatch.delenv("RACE_DATE", raising=False)
         # Repoint state dir to an empty tmp_path so no athlete.yaml exists
         import temporal_context
+
         monkeypatch.setattr(temporal_context, "_state_dir", lambda: tmp_path)
         assert get_race_date() is None
 
     def test_state_provides_next_race(self, monkeypatch, tmp_path):
         monkeypatch.delenv("RACE_DATE", raising=False)
         (tmp_path / "athlete.yaml").write_text(
-            "target_races:\n"
-            "  - name: Past Race\n"
-            "    date: 2020-01-01\n"
-            "  - name: Future Race\n"
-            "    date: 2099-06-15\n"
+            "target_races:\n  - name: Past Race\n    date: 2020-01-01\n  - name: Future Race\n    date: 2099-06-15\n"
         )
         import temporal_context
+
         monkeypatch.setattr(temporal_context, "_state_dir", lambda: tmp_path)
         info = get_next_race()
         assert info["name"] == "Future Race"
@@ -106,6 +104,7 @@ class TestGetTemporalContext:
     def test_no_race_yields_none_fields(self, monkeypatch, tmp_path):
         monkeypatch.delenv("RACE_DATE", raising=False)
         import temporal_context
+
         monkeypatch.setattr(temporal_context, "_state_dir", lambda: tmp_path)
         ctx = get_temporal_context()
         assert ctx["days_to_race"] is None
@@ -117,6 +116,7 @@ class TestBuildTemporalPrompt:
     def test_no_race_message(self, monkeypatch, tmp_path):
         monkeypatch.delenv("RACE_DATE", raising=False)
         import temporal_context
+
         monkeypatch.setattr(temporal_context, "_state_dir", lambda: tmp_path)
         prompt = build_temporal_prompt()
         assert "RACE COUNTDOWN" in prompt
@@ -124,12 +124,9 @@ class TestBuildTemporalPrompt:
 
     def test_includes_race_name_from_state(self, monkeypatch, tmp_path):
         monkeypatch.delenv("RACE_DATE", raising=False)
-        (tmp_path / "athlete.yaml").write_text(
-            "target_races:\n"
-            "  - name: Tahoe 50K\n"
-            "    date: 2099-06-15\n"
-        )
+        (tmp_path / "athlete.yaml").write_text("target_races:\n  - name: Tahoe 50K\n    date: 2099-06-15\n")
         import temporal_context
+
         monkeypatch.setattr(temporal_context, "_state_dir", lambda: tmp_path)
         prompt = build_temporal_prompt()
         assert "Tahoe 50K" in prompt
@@ -198,9 +195,11 @@ class TestTimezoneAwareness:
     def test_timezone_env_override(self, monkeypatch):
         monkeypatch.setenv("USER_TIMEZONE", "America/New_York")
         from temporal_context import _get_user_tz
+
         assert _get_user_tz() is not None
 
     def test_invalid_timezone_falls_back(self, monkeypatch):
         monkeypatch.setenv("USER_TIMEZONE", "Not/A/Timezone")
         from temporal_context import _get_user_tz
+
         assert _get_user_tz() is None

@@ -49,6 +49,7 @@ def _seed_athlete(state_dir: Path, content: str = ATHLETE_YAML) -> None:
 
 # ---------------- athlete ----------------
 
+
 class TestAthlete:
     def test_load_returns_parsed_dict(self, state, state_dir):
         _seed_athlete(state_dir)
@@ -85,6 +86,7 @@ class TestAthlete:
 
 # ---------------- plan + changelog ----------------
 
+
 class TestPlan:
     def test_load_returns_text(self, state, state_dir):
         (state_dir / "plan.md").write_text("# My Plan\nfoo")
@@ -108,6 +110,7 @@ class TestPlan:
 
 
 # ---------------- log.jsonl ----------------
+
 
 class TestLog:
     def test_append_writes_json_line(self, state, state_dir):
@@ -143,14 +146,13 @@ class TestLog:
         assert {e["type"] for e in out} == {"y", "z"}
 
     def test_malformed_line_skipped(self, state, state_dir):
-        (state_dir / "log.jsonl").write_text(
-            'not json\n{"date": "2026-04-26", "type": "ok"}\n'
-        )
+        (state_dir / "log.jsonl").write_text('not json\n{"date": "2026-04-26", "type": "ok"}\n')
         out = state.get_sessions_in_range(date(2026, 4, 26), date(2026, 4, 26))
         assert len(out) == 1
 
 
 # ---------------- journal ----------------
+
 
 class TestJournal:
     def test_append_creates_with_header(self, state, state_dir):
@@ -175,6 +177,7 @@ class TestJournal:
 
 
 # ---------------- get_todays_workout ----------------
+
 
 class TestGetTodaysWorkout:
     def test_finds_iso_date_row(self, state, state_dir):
@@ -205,6 +208,7 @@ class TestGetTodaysWorkout:
 
 
 # ---------------- load_full_context ----------------
+
 
 class TestLoadFullContext:
     def test_includes_all_sections(self, state, state_dir):

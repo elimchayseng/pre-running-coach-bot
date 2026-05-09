@@ -233,27 +233,39 @@ class TestFitnessSummary:
 
     def test_low_hr_fast_signal(self, state):
         today = date.today()
-        self._seed_runs(state, today, [
-            (5, {"type": "workout", "miles": 8, "pace_avg": "6:30", "hr_avg": 160}),
-            (3, {"type": "workout", "miles": 8, "pace_avg": "6:35", "hr_avg": 162}),
-        ])
+        self._seed_runs(
+            state,
+            today,
+            [
+                (5, {"type": "workout", "miles": 8, "pace_avg": "6:30", "hr_avg": 160}),
+                (3, {"type": "workout", "miles": 8, "pace_avg": "6:35", "hr_avg": 162}),
+            ],
+        )
         out = execute_tool("get_fitness_summary", {"window_days": 14}, state)
         signals_text = " | ".join(out["signals"])
         assert "below" in signals_text or "fitness" in signals_text.lower()
 
     def test_data_gap_when_hr_missing(self, state):
         today = date.today()
-        self._seed_runs(state, today, [
-            (5, {"type": "workout", "miles": 8, "pace_avg": "6:30"}),
-            (3, {"type": "workout", "miles": 8, "pace_avg": "6:35"}),
-        ])
+        self._seed_runs(
+            state,
+            today,
+            [
+                (5, {"type": "workout", "miles": 8, "pace_avg": "6:30"}),
+                (3, {"type": "workout", "miles": 8, "pace_avg": "6:35"}),
+            ],
+        )
         out = execute_tool("get_fitness_summary", {"window_days": 14}, state)
         assert any("HR missing" in g for g in out["data_gaps"])
 
     def test_no_quality_signal_in_long_window(self, state):
         today = date.today()
-        self._seed_runs(state, today, [
-            (5, {"type": "easy", "miles": 4}),
-        ])
+        self._seed_runs(
+            state,
+            today,
+            [
+                (5, {"type": "easy", "miles": 4}),
+            ],
+        )
         out = execute_tool("get_fitness_summary", {"window_days": 21}, state)
         assert any("No quality sessions" in s for s in out["signals"])

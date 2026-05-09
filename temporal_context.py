@@ -52,6 +52,7 @@ def _next_race_from_state() -> Optional[dict]:
     """Read athlete.yaml and return the earliest non-passed target race."""
     try:
         from state_manager import StateManager
+
         athlete = StateManager(_state_dir()).load_athlete()
     except Exception as e:
         logger.warning(f"Failed to load athlete.yaml for race date: {e}")
@@ -193,9 +194,20 @@ def resolve_day_name_to_date(day_name: str, intent: str = "past") -> date:
     intent='past' -> closest past or today; 'future' -> closest future or today.
     """
     day_map = {
-        "monday": 0, "mon": 0, "tuesday": 1, "tue": 1, "wednesday": 2, "wed": 2,
-        "thursday": 3, "thu": 3, "friday": 4, "fri": 4, "saturday": 5, "sat": 5,
-        "sunday": 6, "sun": 6,
+        "monday": 0,
+        "mon": 0,
+        "tuesday": 1,
+        "tue": 1,
+        "wednesday": 2,
+        "wed": 2,
+        "thursday": 3,
+        "thu": 3,
+        "friday": 4,
+        "fri": 4,
+        "saturday": 5,
+        "sat": 5,
+        "sunday": 6,
+        "sun": 6,
     }
     target = day_map.get(day_name.lower().strip())
     if target is None:

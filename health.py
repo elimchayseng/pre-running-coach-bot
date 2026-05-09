@@ -8,10 +8,12 @@ def run_health_checks() -> dict[str, bool]:
     results = {}
 
     from conversation_store import check_redis_health
+
     results["redis"] = check_redis_health()
 
     try:
         from config import llm_client
+
         llm_client.chat.completions.create(
             model=HEROKU_MODEL,
             messages=[{"role": "user", "content": "ping"}],

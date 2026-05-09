@@ -94,6 +94,7 @@ def _mock_llm(monkeypatch, *responses) -> MagicMock:
 
 # ---------------- build_system_prompt ----------------
 
+
 class TestBuildSystemPrompt:
     def test_contains_required_sections(self, state):
         p = companion.build_system_prompt(state)
@@ -110,7 +111,7 @@ class TestBuildSystemPrompt:
     def test_includes_state_blob(self, state):
         p = companion.build_system_prompt(state)
         assert "Future Race" in p  # athlete.yaml content
-        assert "Easy 4mi" in p     # plan.md content
+        assert "Easy 4mi" in p  # plan.md content
 
     def test_voice_norms_present(self, state):
         p = companion.build_system_prompt(state)
@@ -119,6 +120,7 @@ class TestBuildSystemPrompt:
 
 
 # ---------------- agent_turn ----------------
+
 
 class TestAgentTurn:
     def test_simple_response_no_tools(self, state, monkeypatch):
@@ -181,6 +183,7 @@ class TestAgentTurn:
 
 # ---------------- chat ----------------
 
+
 class TestChat:
     def test_persists_history(self, state, monkeypatch, fake_redis):
         _mock_llm(monkeypatch, _llm_message(content="ok"))
@@ -190,6 +193,7 @@ class TestChat:
         out = companion.chat("hello")
         assert out == "ok"
         from conversation_store import get_history
+
         history = get_history()
         assert len(history) == 2
         assert history[0]["role"] == "user"

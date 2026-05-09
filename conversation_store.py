@@ -72,7 +72,7 @@ def add_turn(role: str, content: str) -> None:
         history = get_history()
         history.append({"role": role, "content": content})
         if len(history) > MAX_HISTORY_TURNS * 2:
-            history = history[-(MAX_HISTORY_TURNS * 2):]
+            history = history[-(MAX_HISTORY_TURNS * 2) :]
         r.setex(SESSION_KEY, SESSION_TTL_SECONDS, json.dumps(history))
     except (redis.ConnectionError, redis.TimeoutError) as e:
         logger.warning(f"Redis connection error, resetting client: {e}")

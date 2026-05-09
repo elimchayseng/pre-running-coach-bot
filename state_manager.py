@@ -106,11 +106,7 @@ class StateManager:
 
     def load_full_context(self, recent_days: int = 21, journal_entries: int = 5) -> str:
         """Format all state into a single markdown blob for the system prompt."""
-        athlete_yaml = (
-            self.athlete_path.read_text(encoding="utf-8")
-            if self.athlete_path.exists()
-            else ""
-        )
+        athlete_yaml = self.athlete_path.read_text(encoding="utf-8") if self.athlete_path.exists() else ""
         plan_text = self.load_plan()
         recent = self.get_recent_sessions(days=recent_days)
         journal = self.load_journal(max_entries=journal_entries)
@@ -158,11 +154,7 @@ class StateManager:
         block = f"\n---\n\n## {ts}\n\n{entry.rstrip()}\n"
         self.journal_path.parent.mkdir(parents=True, exist_ok=True)
         if not self.journal_path.exists():
-            block = (
-                "# Journal\n\n"
-                "Append-only freeform notes. Newest entries at the bottom.\n"
-                + block
-            )
+            block = "# Journal\n\nAppend-only freeform notes. Newest entries at the bottom.\n" + block
         with self.journal_path.open("a", encoding="utf-8") as f:
             f.write(block)
 
@@ -215,6 +207,7 @@ class StateManager:
 
 
 # ---------- module helpers ----------
+
 
 def _parse_entry_date(value: Any) -> Optional[date]:
     if isinstance(value, datetime):

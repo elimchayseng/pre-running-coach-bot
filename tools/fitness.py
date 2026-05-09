@@ -137,20 +137,11 @@ def _session_context(session: dict, zones: dict, hr_zones: dict) -> dict:
         if zone_match:
             name, lo, hi = zone_match
             if pace_sec < lo:
-                out["vs_zone"] = (
-                    f"{lo - pace_sec} sec/mi faster than {name} "
-                    f"({_sec_to_pace(lo)})"
-                )
+                out["vs_zone"] = f"{lo - pace_sec} sec/mi faster than {name} ({_sec_to_pace(lo)})"
             elif pace_sec > hi:
-                out["vs_zone"] = (
-                    f"{pace_sec - hi} sec/mi slower than {name} "
-                    f"({_sec_to_pace(hi)})"
-                )
+                out["vs_zone"] = f"{pace_sec - hi} sec/mi slower than {name} ({_sec_to_pace(hi)})"
             else:
-                out["vs_zone"] = (
-                    f"within {name} zone "
-                    f"({_sec_to_pace(lo)}-{_sec_to_pace(hi)})"
-                )
+                out["vs_zone"] = f"within {name} zone ({_sec_to_pace(lo)}-{_sec_to_pace(hi)})"
     hr = session.get("hr_avg")
     if hr is not None and hr_zones:
         out["hr_context"] = _hr_context(hr, hr_zones)
@@ -168,8 +159,7 @@ def _volume_signals(weekly_volume: list[dict]) -> list[str]:
         if abs(pct) >= 30:
             direction = "increase" if pct > 0 else "decrease"
             signals.append(
-                f"Weekly volume {direction} of {abs(pct)}% week-over-week "
-                f"({miles[-2]:.0f} -> {miles[-1]:.0f} mi)"
+                f"Weekly volume {direction} of {abs(pct)}% week-over-week ({miles[-2]:.0f} -> {miles[-1]:.0f} mi)"
             )
     if len(miles) >= 3 and all(m > 0 for m in miles[-3:]):
         if miles[-1] > miles[-2] > miles[-3]:
@@ -193,11 +183,7 @@ def _quality_signals(quality: list[dict]) -> list[str]:
             f"{slower} quality sessions came in slower than current zones — "
             f"investigate fatigue, environment, or whether zones need loosening"
         )
-    low_hr_fast = [
-        q for q in quality
-        if "faster than" in q.get("vs_zone", "")
-        and "below" in q.get("hr_context", "")
-    ]
+    low_hr_fast = [q for q in quality if "faster than" in q.get("vs_zone", "") and "below" in q.get("hr_context", "")]
     if low_hr_fast:
         signals.append(
             f"{len(low_hr_fast)} session(s) hit faster than zone at HR below "

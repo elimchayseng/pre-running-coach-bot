@@ -55,8 +55,7 @@ async def today_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     w = state.get_todays_workout(today)
     if not w["found"]:
         await update.message.reply_text(
-            f"No workout prescribed for {today.isoformat()}. "
-            "Send a message and I'll fill it in."
+            f"No workout prescribed for {today.isoformat()}. Send a message and I'll fill it in."
         )
         return
     if w["is_rest_day"]:
