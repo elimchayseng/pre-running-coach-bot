@@ -10,9 +10,18 @@ import logging
 from pathlib import Path
 from typing import Optional
 
+from tenacity import (
+    RetryCallState,
+    retry,
+    retry_if_exception,
+    stop_after_attempt,
+    wait_exponential,
+)
+
 from state_manager import StateManager
 
 from . import client, notify, translator
+from .client import StravaAPIError
 
 logger = logging.getLogger("pre_coach.strava.handler")
 
@@ -25,6 +34,42 @@ def _get_state() -> StateManager:
     if _state is None:
         _state = StateManager(STATE_DIR)
     return _state
+
+
+def _is_propagation_404(exc: BaseException) -> bool:
+    """Strava's webhook bus and read API are eventually consistent — the
+    `create` event can fire seconds before the activity is fetchable. A 404
+    immediately after a webhook is almost always propagation, not a missing
+    activity. Retry it.
+    """
+    return isinstance(exc, StravaAPIError) and "-> 404" in str(exc)
+
+
+def _log_retry(state: RetryCallState) -> None:
+    attempt = state.attempt_number
+    next_action = state.next_action
+    delay = getattr(next_action, "sleep", None) if next_action else None
+    logger.info(
+        "Strava activity not yet propagated (attempt %d, sleeping %.1fs before retry)",
+        attempt,
+        delay if delay is not None else -1,
+    )
+
+
+@retry(
+    stop=stop_after_attempt(6),
+    wait=wait_exponential(multiplier=2, min=2, max=32),
+    retry=retry_if_exception(_is_propagation_404),
+    before_sleep=_log_retry,
+    reraise=True,
+)
+def _fetch_with_propagation_retry(activity_id: int) -> dict:
+    """Fetch an activity, retrying on transient 404 (Strava propagation lag).
+
+    Backs off 2 → 4 → 8 → 16 → 32s, total ~62s of waiting across 6 attempts.
+    Most propagation completes within 5–15s; the long tail is rare but real.
+    """
+    return client.get_activity(activity_id)
 
 
 def handle_event(payload: dict) -> None:
@@ -60,7 +105,17 @@ def handle_event(payload: dict) -> None:
         return
 
     try:
-        activity = client.get_activity(activity_id)
+        activity = _fetch_with_propagation_retry(activity_id)
+    except StravaAPIError as e:
+        if "-> 404" in str(e):
+            logger.error(
+                "Activity %s never became fetchable after retries — likely "
+                "deleted between create and our fetch. Giving up.",
+                activity_id,
+            )
+        else:
+            logger.error(f"Failed to fetch Strava activity {activity_id}: {e}")
+        return
     except Exception as e:
         logger.error(f"Failed to fetch Strava activity {activity_id}: {e}")
         return
