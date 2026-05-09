@@ -1,0 +1,146 @@
+"""Tests for strava.handler — webhook event dispatch and propagation retry.
+
+Strava's webhook bus and read API are eventually consistent: a `create`
+event fires seconds before the activity becomes fetchable. handler.py
+retries on 404 with exponential backoff to ride out the gap.
+"""
+
+from __future__ import annotations
+
+import json
+from datetime import date
+from pathlib import Path
+from unittest.mock import MagicMock
+
+import pytest
+from tenacity import stop_after_attempt, wait_fixed
+
+from state_manager import StateManager
+from strava import handler
+from strava.client import StravaAPIError
+
+FIXTURES = Path(__file__).resolve().parent / "fixtures"
+
+# Tenacity's retry config is captured at decoration time. Use retry_with() to
+# override stop/wait at call time without doing real-time sleeps in tests.
+_FAST_KW = dict(wait=wait_fixed(0), stop=stop_after_attempt(3))
+
+
+def _fast_fetch(activity_id: int):
+    """retry_with() returns a fresh callable with overridden config."""
+    return handler._fetch_with_propagation_retry.retry_with(**_FAST_KW)(activity_id)
+
+
+@pytest.fixture
+def state_dir(tmp_path: Path, monkeypatch) -> Path:
+    """Tmp state dir, wired into handler module's globals."""
+    d = tmp_path / "state"
+    d.mkdir()
+    (d / "athlete.yaml").write_text("hr_zones:\n  easy_ceiling: 155\n")
+    monkeypatch.setattr(handler, "STATE_DIR", d)
+    monkeypatch.setattr(handler, "_state", None)
+    return d
+
+
+def _easy_run_activity() -> dict:
+    return json.loads((FIXTURES / "strava_activity_easy.json").read_text())
+
+
+# ---------- 404 predicate ----------
+
+
+class TestPropagationPredicate:
+    def test_404_predicate_matches_strava_404(self):
+        err = StravaAPIError("GET /activities/123 -> 404: Not Found")
+        assert handler._is_propagation_404(err) is True
+
+    def test_404_predicate_rejects_other_status(self):
+        assert handler._is_propagation_404(StravaAPIError("GET /x -> 401: Unauth")) is False
+        assert handler._is_propagation_404(StravaAPIError("GET /x -> 500: oops")) is False
+
+    def test_404_predicate_rejects_non_strava_errors(self):
+        assert handler._is_propagation_404(ValueError("nope")) is False
+
+
+# ---------- retry behaviour (using retry_with for fast tests) ----------
+
+
+class TestPropagationRetry:
+    def test_succeeds_after_two_404s(self, monkeypatch):
+        attempts = {"n": 0}
+        ok = _easy_run_activity()
+
+        def _flaky(activity_id):
+            attempts["n"] += 1
+            if attempts["n"] < 3:
+                raise StravaAPIError(f"GET /activities/{activity_id} -> 404: Not Found")
+            return ok
+
+        monkeypatch.setattr(handler.client, "get_activity", _flaky)
+        result = _fast_fetch(999)
+        assert result == ok
+        assert attempts["n"] == 3
+
+    def test_gives_up_after_max_attempts(self, monkeypatch):
+        attempts = {"n": 0}
+
+        def _always_404(activity_id):
+            attempts["n"] += 1
+            raise StravaAPIError(f"GET /activities/{activity_id} -> 404: Not Found")
+
+        monkeypatch.setattr(handler.client, "get_activity", _always_404)
+        with pytest.raises(StravaAPIError):
+            _fast_fetch(999)
+        assert attempts["n"] == 3
+
+    def test_non_404_does_not_retry(self, monkeypatch):
+        attempts = {"n": 0}
+
+        def _401(activity_id):
+            attempts["n"] += 1
+            raise StravaAPIError(f"GET /activities/{activity_id} -> 401: Unauthorized")
+
+        monkeypatch.setattr(handler.client, "get_activity", _401)
+        with pytest.raises(StravaAPIError):
+            _fast_fetch(999)
+        assert attempts["n"] == 1
+
+
+# ---------- handle_event end-to-end ----------
+
+
+class TestHandleEvent:
+    def test_skip_non_create_aspect(self, monkeypatch, state_dir):
+        get_mock = MagicMock()
+        monkeypatch.setattr(handler.client, "get_activity", get_mock)
+        handler.handle_event({"aspect_type": "update", "object_type": "activity", "object_id": 1})
+        get_mock.assert_not_called()
+
+    def test_skip_non_activity_object(self, monkeypatch, state_dir):
+        get_mock = MagicMock()
+        monkeypatch.setattr(handler.client, "get_activity", get_mock)
+        handler.handle_event({"aspect_type": "create", "object_type": "athlete", "object_id": 1})
+        get_mock.assert_not_called()
+
+    def test_skip_when_already_logged(self, monkeypatch, state_dir):
+        s = StateManager(state_dir)
+        s.append_session({"date": "2026-05-01", "type": "easy", "miles": 4, "details": {"strava_id": 123}})
+
+        get_mock = MagicMock()
+        monkeypatch.setattr(handler.client, "get_activity", get_mock)
+        handler.handle_event({"aspect_type": "create", "object_type": "activity", "object_id": 123})
+        get_mock.assert_not_called()
+
+    def test_full_path_writes_log_and_pings(self, monkeypatch, state_dir):
+        # Patch get_activity to return success on first try (no retries needed).
+        monkeypatch.setattr(handler.client, "get_activity", lambda aid: _easy_run_activity())
+        ping_mock = MagicMock(return_value=True)
+        monkeypatch.setattr(handler.notify, "send_activity_ping", ping_mock)
+
+        handler.handle_event({"aspect_type": "create", "object_type": "activity", "object_id": 12345678902})
+
+        s = StateManager(state_dir)
+        sessions = s.get_sessions_in_range(date(2026, 5, 11), date(2026, 5, 11))
+        assert len(sessions) == 1
+        assert sessions[0]["details"]["strava_id"] == 12345678902
+        ping_mock.assert_called_once()
