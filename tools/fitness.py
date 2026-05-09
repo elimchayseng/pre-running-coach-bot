@@ -10,6 +10,8 @@ from collections import defaultdict
 from datetime import date, timedelta
 from typing import Optional
 
+from temporal_context import today_local
+
 SCHEMAS = [
     {
         "type": "function",
@@ -44,7 +46,7 @@ QUALITY_TYPES = {"workout", "race", "long_run", "strides"}
 
 def _get_fitness_summary(args: dict, state) -> dict:
     window = int(args.get("window_days", 21))
-    today = date.today()
+    today = today_local()
     sessions = state.get_recent_sessions(days=window, today=today)
     athlete = state.load_athlete()
     zones = athlete.get("zones", {}) or {}

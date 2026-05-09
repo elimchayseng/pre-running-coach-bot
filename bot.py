@@ -8,7 +8,6 @@ runs the full tool-use loop.
 from __future__ import annotations
 
 import logging
-from datetime import date
 from pathlib import Path
 
 from telegram import Update
@@ -18,7 +17,7 @@ from companion import chat as companion_chat
 from companion import reset_session
 from health import format_commands_text, run_health_checks
 from state_manager import StateManager
-from temporal_context import build_temporal_prompt, get_temporal_context
+from temporal_context import build_temporal_prompt, get_temporal_context, today_local
 
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -51,7 +50,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def today_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Fast path: today's prescribed workout straight from plan.md, no LLM."""
     state = _get_state()
-    today = date.today()
+    today = today_local()
     w = state.get_todays_workout(today)
     if not w["found"]:
         await update.message.reply_text(

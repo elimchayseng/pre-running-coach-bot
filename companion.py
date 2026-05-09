@@ -11,7 +11,6 @@ in-conversation history lives in Redis (see conversation_store).
 from __future__ import annotations
 
 import json
-from datetime import date
 from pathlib import Path
 from typing import Optional
 
@@ -21,6 +20,7 @@ from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_ex
 from config import HEROKU_MODEL, PRE_PERSONALITY, llm_client, logger
 from conversation_store import add_turn, clear_history, get_history
 from state_manager import StateManager
+from temporal_context import today_local
 from tools import ALL_TOOLS, execute_tool
 
 STATE_DIR = Path(__file__).resolve().parent / "state"
@@ -39,7 +39,7 @@ def _get_state() -> StateManager:
 
 def build_system_prompt(state: StateManager) -> str:
     """Compose the system prompt: personality + voice rules + today + state blob + tool norms."""
-    today = date.today()
+    today = today_local()
     blob = state.load_full_context()
     return "\n".join(
         [

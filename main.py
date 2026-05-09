@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from datetime import date
 from pathlib import Path
 
 from companion import chat, reset_session
@@ -10,7 +9,7 @@ from config import logger
 from conversation_store import check_redis_health
 from health import format_commands_text, run_health_checks
 from state_manager import StateManager
-from temporal_context import build_temporal_prompt, get_temporal_context
+from temporal_context import build_temporal_prompt, get_temporal_context, today_local
 
 GREEN = "\033[92m"
 BLUE = "\033[94m"
@@ -69,7 +68,7 @@ def handle_command(cmd: str) -> bool:
 
     elif command == "/today":
         state = _get_state()
-        today = date.today()
+        today = today_local()
         w = state.get_todays_workout(today)
         if not w["found"]:
             print_system(f"No workout prescribed for {today.isoformat()}.")
