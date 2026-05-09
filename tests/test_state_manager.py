@@ -6,7 +6,6 @@ import pytest
 
 from state_manager import StateManager
 
-
 ATHLETE_YAML = """\
 name: TestRunner
 # inline comment about target_races

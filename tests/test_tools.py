@@ -14,7 +14,6 @@ from tools.fitness import (
     _zone_range,
 )
 
-
 ATHLETE_YAML = """\
 name: Test
 target_races:

@@ -5,7 +5,6 @@ Mocks llm_client (no real LLM calls) and uses fake_redis + a tmp state dir.
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -13,7 +12,6 @@ import pytest
 
 import companion
 from state_manager import StateManager
-
 
 ATHLETE_YAML = """\
 name: Test
@@ -65,7 +63,14 @@ def _llm_message(content: str | None = None, tool_calls=None) -> MagicMock:
             d["content"] = content
         if tool_calls:
             d["tool_calls"] = [
-                {"id": tc.id, "type": "function", "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
+                {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {
+                        "name": tc.function.name,
+                        "arguments": tc.function.arguments,
+                    },
+                }
                 for tc in tool_calls
             ]
         return d

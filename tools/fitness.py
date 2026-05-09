@@ -10,7 +10,6 @@ from collections import defaultdict
 from datetime import date, timedelta
 from typing import Optional
 
-
 SCHEMAS = [
     {
         "type": "function",

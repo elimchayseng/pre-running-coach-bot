@@ -53,7 +53,8 @@ def build_system_prompt(state: StateManager) -> str:
         "  Don't bold every cell or section header.",
         "- Never repeat the same content in two formats (list -> table -> summary).",
         "- Drop 'Bottom line:' labels. The bottom line is the last sentence.",
-        "- Declaratives, not suggestions. 'Run 6:20 for the threshold reps' beats 'you might consider trying around 6:20'.",
+        "- Declaratives, not suggestions. 'Run 6:20 for the threshold reps' beats"
+        " 'you might consider trying around 6:20'.",
         "",
         "=== TODAY ===",
         f"{today.isoformat()} ({today.strftime('%A')})",
