@@ -87,9 +87,7 @@ def _build_messages(entry: dict, state: StateManager) -> list[dict]:
     # Drop the just-logged entry from "recent" so the model isn't confused.
     sid = (entry.get("details") or {}).get("strava_id")
     if sid is not None:
-        recent = [
-            r for r in recent if (r.get("details") or {}).get("strava_id") != sid
-        ]
+        recent = [r for r in recent if (r.get("details") or {}).get("strava_id") != sid]
     athlete = state.load_athlete()
     plan_md = state.load_plan()
 
