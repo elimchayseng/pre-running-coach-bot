@@ -173,7 +173,24 @@ def _log_session(args: dict, state) -> dict:
 
 def _update_plan(args: dict, state) -> dict:
     state.update_plan(args["new_plan_markdown"], args["change_reason"])
-    return {"ok": True, "change_reason": args["change_reason"]}
+    result = {"ok": True, "change_reason": args["change_reason"]}
+    # After write, verify today's row is parseable. The locked
+    # "| Day | Date | Workout | Pace target | Notes |" table format is what
+    # /today depends on — if the agent's write broke it, surface a warning
+    # the agent can act on (vs. silent failure when /today returns "no
+    # workout prescribed").
+    from temporal_context import today_local
+
+    today_check = state.get_todays_workout(today_local())
+    if not today_check["found"]:
+        result["warning"] = (
+            "Today's row not parseable from the new plan. The locked "
+            "'| Day | Date | Workout | Pace target | Notes |' table format "
+            "must be preserved for the current week — /today depends on it. "
+            "Re-check the plan and call update_plan again if the table is "
+            "missing or misformatted."
+        )
+    return result
 
 
 def _append_journal(args: dict, state) -> dict:

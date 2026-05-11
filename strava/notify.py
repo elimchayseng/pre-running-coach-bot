@@ -78,14 +78,21 @@ def send_activity_ping(entry: dict, chat_id: Optional[str] = None) -> bool:
         asyncio.run(_send())
         return True
     except RuntimeError:
-        # If we're already in a running loop (Flask thread + async telegram),
-        # spin up a fresh loop in this thread.
-        loop = asyncio.new_event_loop()
+        # asyncio.run() typically only raises RuntimeError for "cannot be
+        # called from a running event loop" or "event loop is closed".
+        # Fall back to a fresh loop. If the SEND itself raised RuntimeError
+        # (network blip, telegram lib error), this fallback will re-raise
+        # and be caught by the outer except Exception below.
         try:
-            loop.run_until_complete(_send())
-            return True
-        finally:
-            loop.close()
+            loop = asyncio.new_event_loop()
+            try:
+                loop.run_until_complete(_send())
+                return True
+            finally:
+                loop.close()
+        except Exception as e:
+            logger.error(f"Failed to send Strava ping (fallback path): {e}")
+            return False
     except Exception as e:
         logger.error(f"Failed to send Strava ping: {e}")
         return False

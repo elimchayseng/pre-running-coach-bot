@@ -82,12 +82,18 @@ def handle_event(payload: dict) -> None:
          "owner_id": <int>,
          "subscription_id": <int>,
          "event_time": <unix>}
+
+    We handle two cases:
+      - create: fetch, translate, append, ping
+      - update: fetch, translate, replace existing log entry (no ping —
+        update events fire for gear assignment, name edits, workout-type
+        retags after upload, etc. They shouldn't spam the user.)
     """
     aspect = payload.get("aspect_type")
     obj_type = payload.get("object_type")
     obj_id = payload.get("object_id")
 
-    if obj_type != "activity" or aspect != "create":
+    if obj_type != "activity" or aspect not in ("create", "update"):
         logger.info(f"Skipping Strava event: {aspect} {obj_type} {obj_id}")
         return
 
@@ -99,34 +105,20 @@ def handle_event(payload: dict) -> None:
 
     state = _get_state()
 
+    if aspect == "create":
+        _handle_create(state, activity_id)
+    else:  # "update"
+        _handle_update(state, activity_id)
+
+
+def _handle_create(state: StateManager, activity_id: int) -> None:
     # Idempotency: if we already logged this activity, skip.
     if activity_id in state.existing_strava_ids():
         logger.info(f"Strava activity {activity_id} already logged; skipping")
         return
 
-    try:
-        activity = _fetch_with_propagation_retry(activity_id)
-    except StravaAPIError as e:
-        if "-> 404" in str(e):
-            logger.error(
-                "Activity %s never became fetchable after retries — likely "
-                "deleted between create and our fetch. Giving up.",
-                activity_id,
-            )
-        else:
-            logger.error(f"Failed to fetch Strava activity {activity_id}: {e}")
-        return
-    except Exception as e:
-        logger.error(f"Failed to fetch Strava activity {activity_id}: {e}")
-        return
-
-    athlete = state.load_athlete()
-    hr_zones = (athlete.get("hr_zones") if isinstance(athlete, dict) else None) or {}
-
-    try:
-        entry = translator.activity_to_log_entry(activity, hr_zones=hr_zones)
-    except Exception as e:
-        logger.error(f"Failed to translate activity {activity_id}: {e}")
+    entry = _fetch_and_translate(state, activity_id)
+    if entry is None:
         return
 
     try:
@@ -137,3 +129,58 @@ def handle_event(payload: dict) -> None:
         return
 
     notify.send_activity_ping(entry)
+
+
+def _handle_update(state: StateManager, activity_id: int) -> None:
+    # Only update if we already have this activity logged. Ignoring updates
+    # for activities we never created entries for (probably synced before
+    # we were running) keeps the log focused.
+    if activity_id not in state.existing_strava_ids():
+        logger.info(f"Update event for unknown activity {activity_id}; ignoring")
+        return
+
+    entry = _fetch_and_translate(state, activity_id)
+    if entry is None:
+        return
+
+    try:
+        replaced = state.update_session_by_strava_id(activity_id, entry)
+    except Exception as e:
+        logger.error(f"Failed to update session for activity {activity_id}: {e}")
+        return
+
+    if replaced:
+        logger.info(f"Updated Strava activity {activity_id}: now {entry.get('type')} {entry.get('miles')}mi")
+    else:
+        # Race: we saw it in existing_strava_ids() above but missed it on
+        # rewrite. Unusual but not fatal.
+        logger.warning(f"Update event for activity {activity_id}: entry not found on rewrite")
+
+
+def _fetch_and_translate(state: StateManager, activity_id: int) -> Optional[dict]:
+    """Shared fetch + translate flow. Returns the translated entry or None
+    on any error (errors logged inline)."""
+    try:
+        activity = _fetch_with_propagation_retry(activity_id)
+    except StravaAPIError as e:
+        if "-> 404" in str(e):
+            logger.error(
+                "Activity %s never became fetchable after retries — likely "
+                "deleted between event and our fetch. Giving up.",
+                activity_id,
+            )
+        else:
+            logger.error(f"Failed to fetch Strava activity {activity_id}: {e}")
+        return None
+    except Exception as e:
+        logger.error(f"Failed to fetch Strava activity {activity_id}: {e}")
+        return None
+
+    athlete = state.load_athlete()
+    hr_zones = (athlete.get("hr_zones") if isinstance(athlete, dict) else None) or {}
+
+    try:
+        return translator.activity_to_log_entry(activity, hr_zones=hr_zones)
+    except Exception as e:
+        logger.error(f"Failed to translate activity {activity_id}: {e}")
+        return None

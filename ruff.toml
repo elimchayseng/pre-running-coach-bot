@@ -12,6 +12,7 @@ known-first-party = [
     "health",
     "conversation_store",
     "state_manager",
+    "strava",
     "temporal_context",
     "tools",
 ]
