@@ -110,10 +110,11 @@ class TestPropagationRetry:
 
 
 class TestHandleEvent:
-    def test_skip_non_create_aspect(self, monkeypatch, state_dir):
+    def test_skip_delete_aspect(self, monkeypatch, state_dir):
+        """Only create and update events trigger work; delete is ignored."""
         get_mock = MagicMock()
         monkeypatch.setattr(handler.client, "get_activity", get_mock)
-        handler.handle_event({"aspect_type": "update", "object_type": "activity", "object_id": 1})
+        handler.handle_event({"aspect_type": "delete", "object_type": "activity", "object_id": 1})
         get_mock.assert_not_called()
 
     def test_skip_non_activity_object(self, monkeypatch, state_dir):
@@ -122,7 +123,7 @@ class TestHandleEvent:
         handler.handle_event({"aspect_type": "create", "object_type": "athlete", "object_id": 1})
         get_mock.assert_not_called()
 
-    def test_skip_when_already_logged(self, monkeypatch, state_dir):
+    def test_skip_create_when_already_logged(self, monkeypatch, state_dir):
         s = StateManager(state_dir)
         s.append_session({"date": "2026-05-01", "type": "easy", "miles": 4, "details": {"strava_id": 123}})
 
@@ -131,7 +132,7 @@ class TestHandleEvent:
         handler.handle_event({"aspect_type": "create", "object_type": "activity", "object_id": 123})
         get_mock.assert_not_called()
 
-    def test_full_path_writes_log_and_pings(self, monkeypatch, state_dir):
+    def test_full_create_path_writes_log_and_pings(self, monkeypatch, state_dir):
         # Patch get_activity to return success on first try (no retries needed).
         monkeypatch.setattr(handler.client, "get_activity", lambda aid: _easy_run_activity())
         ping_mock = MagicMock(return_value=True)
@@ -144,3 +145,51 @@ class TestHandleEvent:
         assert len(sessions) == 1
         assert sessions[0]["details"]["strava_id"] == 12345678902
         ping_mock.assert_called_once()
+
+
+# ---------- aspect_type=update behaviour ----------
+
+
+class TestHandleUpdateEvent:
+    def test_update_replaces_existing_entry(self, monkeypatch, state_dir):
+        """Pre-existing entry tagged as 'easy' is replaced when Strava
+        reports the activity is now workout_type=3 (workout)."""
+        # Seed the log with the same activity classified as easy
+        s = StateManager(state_dir)
+        original = {
+            "date": "2026-05-11",
+            "type": "easy",
+            "miles": 4.0,
+            "details": {"strava_id": 12345678902, "workout_type": None},
+        }
+        s.append_session(original)
+
+        # Update event: Strava now reports workout_type=3 (workout)
+        updated_activity = _easy_run_activity()
+        updated_activity["workout_type"] = 3
+        monkeypatch.setattr(handler.client, "get_activity", lambda aid: updated_activity)
+        ping_mock = MagicMock(return_value=True)
+        monkeypatch.setattr(handler.notify, "send_activity_ping", ping_mock)
+
+        handler.handle_event({"aspect_type": "update", "object_type": "activity", "object_id": 12345678902})
+
+        # Entry should be replaced (not duplicated), type now 'workout'
+        sessions = s.get_sessions_in_range(date(2026, 5, 11), date(2026, 5, 11))
+        assert len(sessions) == 1, "update should replace, not append"
+        assert sessions[0]["type"] == "workout"
+        assert sessions[0]["details"]["strava_id"] == 12345678902
+
+        # Update path does NOT ping (avoids spam on metadata edits)
+        ping_mock.assert_not_called()
+
+    def test_update_for_unknown_activity_is_noop(self, monkeypatch, state_dir):
+        """If we don't have the activity in our log, ignore the update.
+        Don't fetch, don't append. Probably synced before we started running."""
+        get_mock = MagicMock()
+        monkeypatch.setattr(handler.client, "get_activity", get_mock)
+        handler.handle_event({"aspect_type": "update", "object_type": "activity", "object_id": 99999})
+        get_mock.assert_not_called()
+
+        # log.jsonl should remain empty (or just whatever was there before)
+        s = StateManager(state_dir)
+        assert s.existing_strava_ids() == set()

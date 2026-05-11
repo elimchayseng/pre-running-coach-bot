@@ -102,14 +102,52 @@ class TestStateTools:
         line = state.log_path.read_text().strip()
         assert "rpe" not in json.loads(line)
 
-    def test_update_plan(self, state):
+    def test_update_plan_with_valid_today_row_no_warning(self, state, monkeypatch):
+        """Plan contains today's row → tool returns ok with no warning."""
+        # Pin today to a known date and write a plan that includes that row.
+        from datetime import date as _date
+
+        import temporal_context
+
+        target = _date(2026, 4, 28)
+        monkeypatch.setattr(temporal_context, "today_local", lambda: target)
+
+        plan = (
+            "# Plan\n\n## This Week\n\n"
+            "| Day | Date | Workout | Pace target | Notes |\n"
+            "|-----|------|---------|-------------|-------|\n"
+            "| Tue | 2026-04-28 | Easy 4mi | 8:45-9:15 | |\n"
+        )
         out = execute_tool(
             "update_plan",
-            {"new_plan_markdown": "# v2", "change_reason": "test"},
+            {"new_plan_markdown": plan, "change_reason": "test"},
             state,
         )
         assert out["ok"] is True
-        assert state.load_plan() == "# v2"
+        assert "warning" not in out
+        assert state.load_plan() == plan
+
+    def test_update_plan_breaks_table_returns_warning(self, state, monkeypatch):
+        """Plan without a parseable today row → tool returns a warning so
+        the agent can self-correct."""
+        from datetime import date as _date
+
+        import temporal_context
+
+        monkeypatch.setattr(temporal_context, "today_local", lambda: _date(2026, 4, 28))
+
+        # No table at all — definitely no row for today
+        out = execute_tool(
+            "update_plan",
+            {"new_plan_markdown": "# Plan v2 with no table", "change_reason": "test"},
+            state,
+        )
+        assert out["ok"] is True
+        assert "warning" in out
+        assert "not parseable" in out["warning"]
+        assert "table format" in out["warning"]
+        # Plan still written despite warning (agent decides whether to retry)
+        assert state.load_plan() == "# Plan v2 with no table"
 
     def test_append_journal(self, state):
         execute_tool("append_journal", {"entry": "feeling great"}, state)

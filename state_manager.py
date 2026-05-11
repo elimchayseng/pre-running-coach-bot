@@ -161,6 +161,47 @@ class StateManager:
         with self.log_path.open("a", encoding="utf-8") as f:
             f.write(line)
 
+    def update_session_by_strava_id(self, activity_id: int, new_entry: dict) -> bool:
+        """Find the log.jsonl line with details.strava_id == activity_id and
+        replace it with new_entry. Atomic via tempfile + rename.
+
+        Returns True if the entry was found and replaced; False if no matching
+        entry exists (caller decides whether to append instead).
+
+        Used by the Strava webhook handler when an aspect_type=update event
+        fires (e.g., the user retags a Run as a Workout after upload).
+        """
+        if "date" not in new_entry:
+            raise ValueError("new_entry must include a 'date' field")
+        if not self.log_path.exists():
+            return False
+
+        replaced = False
+        out_lines: list[str] = []
+        with self.log_path.open("r", encoding="utf-8") as f:
+            for raw in f:
+                stripped = raw.strip()
+                if not stripped:
+                    out_lines.append(raw)
+                    continue
+                try:
+                    entry = json.loads(stripped)
+                except json.JSONDecodeError:
+                    # Preserve malformed lines untouched
+                    out_lines.append(raw)
+                    continue
+                sid = (entry.get("details") or {}).get("strava_id")
+                if sid == activity_id and not replaced:
+                    out_lines.append(json.dumps(new_entry, ensure_ascii=False) + "\n")
+                    replaced = True
+                else:
+                    out_lines.append(raw if raw.endswith("\n") else raw + "\n")
+
+        if not replaced:
+            return False
+        _atomic_write(self.log_path, "".join(out_lines))
+        return True
+
     def update_plan(self, new_plan_md: str, change_note: str) -> None:
         """Replace plan.md atomically and append change_note to plan_changelog.md."""
         _atomic_write(self.plan_path, new_plan_md)
