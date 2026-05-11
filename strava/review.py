@@ -31,6 +31,14 @@ logger = logging.getLogger("pre_coach.strava.review")
 
 RUN_TYPES = {"run", "easy", "long_run", "workout", "race", "strides", "return_test"}
 
+# Telegram caps a single message at 4096 chars. Cap a little under that so
+# the appended proposal/header lines don't push us over.
+_TELEGRAM_MAX_CHARS = 3900
+# Defensive size guard on LLM-proposed new_plan_md. A typical plan.md is
+# 1-3 KB; anything past 32 KB is the model going off the rails. Drop the
+# plan_change in that case so we don't bloat Redis or the next system prompt.
+_MAX_NEW_PLAN_MD_CHARS = 32 * 1024
+
 # Activity-entry fields kept in the prompt. The full Strava blob has 30+
 # fields and full lap/split arrays — we trim aggressively to keep the prompt
 # focused and avoid blowing past cache. The agent doesn't need gear_id or
@@ -188,8 +196,8 @@ def _parse_review_output(raw: str) -> Optional[dict]:
     except json.JSONDecodeError as e:
         logger.error(f"Review LLM returned malformed JSON: {e}; raw: {raw[:300]}")
         return None
-    if not isinstance(data, dict) or "feedback" not in data:
-        logger.error(f"Review LLM JSON missing required keys: {raw[:300]}")
+    if not isinstance(data, dict) or not isinstance(data.get("feedback"), str) or not data["feedback"].strip():
+        logger.error(f"Review LLM JSON missing/empty feedback: {raw[:300]}")
         return None
     plan_change = data.get("plan_change")
     if plan_change is not None:
@@ -200,6 +208,9 @@ def _parse_review_output(raw: str) -> Optional[dict]:
             required = ("summary", "new_plan_md", "reason")
             if not all(isinstance(plan_change.get(k), str) and plan_change.get(k) for k in required):
                 logger.error("plan_change missing required string fields; dropping")
+                data["plan_change"] = None
+            elif len(plan_change["new_plan_md"]) > _MAX_NEW_PLAN_MD_CHARS:
+                logger.error(f"plan_change.new_plan_md exceeds {_MAX_NEW_PLAN_MD_CHARS} chars; dropping")
                 data["plan_change"] = None
     return data
 
@@ -225,7 +236,10 @@ def _format_user_message(parsed: dict, entry: dict) -> str:
         lines.append("")
         lines.append(f"Proposed plan change: {plan_change['summary'].strip()}")
         lines.append("Reply 'yes' to apply, or tell me what to adjust.")
-    return "\n".join(lines)
+    text = "\n".join(lines)
+    if len(text) > _TELEGRAM_MAX_CHARS:
+        text = text[: _TELEGRAM_MAX_CHARS - 1] + "…"
+    return text
 
 
 def run_post_activity_review(entry: dict, state: StateManager) -> Optional[str]:

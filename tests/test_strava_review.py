@@ -186,6 +186,26 @@ class TestParseReviewOutput:
         parsed = review._parse_review_output(raw)
         assert parsed["plan_change"] is None
 
+    def test_empty_feedback_returns_none(self):
+        """A model returning an empty feedback string is treated as malformed —
+        otherwise we'd ship a Telegram message that's just the 'Logged: …' header."""
+        assert review._parse_review_output(json.dumps({"feedback": "", "plan_change": None})) is None
+        assert review._parse_review_output(json.dumps({"feedback": "   ", "plan_change": None})) is None
+
+    def test_oversized_new_plan_md_dropped(self):
+        """Defensive: an LLM that returns a huge new_plan_md gets its plan_change
+        dropped so we don't bloat Redis / the next system prompt."""
+        huge = "x" * (review._MAX_NEW_PLAN_MD_CHARS + 1)
+        raw = json.dumps(
+            {
+                "feedback": "fine",
+                "plan_change": {"summary": "s", "new_plan_md": huge, "reason": "r"},
+            }
+        )
+        parsed = review._parse_review_output(raw)
+        assert parsed["feedback"] == "fine"
+        assert parsed["plan_change"] is None
+
 
 # ---------- _format_user_message ----------
 
@@ -208,6 +228,14 @@ class TestFormatUserMessage:
         msg = review._format_user_message(parsed, easy_entry)
         assert "Proposed plan change: Shift threshold" in msg
         assert "Reply 'yes' to apply" in msg
+
+    def test_truncates_to_telegram_limit(self, easy_entry):
+        """A pathologically long feedback string gets truncated so Telegram
+        won't reject the message (4096-char hard cap)."""
+        parsed = {"feedback": "x" * 10000, "plan_change": None}
+        msg = review._format_user_message(parsed, easy_entry)
+        assert len(msg) <= review._TELEGRAM_MAX_CHARS
+        assert msg.endswith("…")
 
 
 # ---------- run_post_activity_review (integration of helpers) ----------
@@ -277,3 +305,32 @@ class TestRunPostActivityReview:
         monkeypatch.setattr(review, "llm_client", None)
         out = review.run_post_activity_review(easy_entry, state)
         assert out is None
+
+    def test_proposal_stash_failure_still_delivers_feedback(self, state, easy_entry, monkeypatch, fake_redis):
+        """Redis down: stashing the proposal raises after retries, but the
+        review still delivers the analysis message to the user — with the
+        proposal stripped since it isn't applyable without Redis."""
+        _mock_llm_response(
+            monkeypatch,
+            json.dumps(
+                {
+                    "feedback": "Overcooked the easy.",
+                    "plan_change": {
+                        "summary": "Demote Thursday tempo",
+                        "new_plan_md": "# revised\n",
+                        "reason": "overreach",
+                    },
+                }
+            ),
+        )
+
+        def _raise(_payload):
+            raise RuntimeError("redis unreachable")
+
+        monkeypatch.setattr(review, "set_pending_plan_proposal", _raise)
+
+        out = review.run_post_activity_review(easy_entry, state)
+        assert out is not None
+        assert "Overcooked the easy." in out
+        # Proposal lines must NOT appear, since it couldn't be stashed.
+        assert "Proposed plan change" not in out
