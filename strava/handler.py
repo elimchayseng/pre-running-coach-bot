@@ -20,7 +20,7 @@ from tenacity import (
 
 from state_manager import StateManager
 
-from . import client, notify, translator
+from . import client, notify, review, translator
 from .client import StravaAPIError
 
 logger = logging.getLogger("pre_coach.strava.handler")
@@ -128,6 +128,15 @@ def _handle_create(state: StateManager, activity_id: int) -> None:
         logger.error(f"Failed to append session for activity {activity_id}: {e}")
         return
 
+    # Runs get LLM analysis vs. today's plan; other activity types still get
+    # the deterministic templated ping. If the review fails for any reason,
+    # fall back to the templated ping so the user always hears something.
+    if review.is_run_type(entry):
+        message = review.run_post_activity_review(entry, state)
+        if message:
+            notify.send_telegram_text(message)
+            return
+        logger.info(f"Review unavailable for activity {activity_id}; falling back to templated ping")
     notify.send_activity_ping(entry)
 
 

@@ -127,6 +127,34 @@ class TestStateTools:
         assert "warning" not in out
         assert state.load_plan() == plan
 
+    def test_update_plan_clears_pending_proposal(self, state, monkeypatch, fake_redis):
+        """A successful plan write consumes any pending post-activity proposal,
+        so the next chat turn's system prompt doesn't keep showing it."""
+        from datetime import date as _date
+
+        import temporal_context
+        from pending_proposal_store import (
+            get_pending_plan_proposal,
+            set_pending_plan_proposal,
+        )
+
+        monkeypatch.setattr(temporal_context, "today_local", lambda: _date(2026, 4, 28))
+        set_pending_plan_proposal({"summary": "x", "new_plan_md": "...", "reason": "..."})
+        assert get_pending_plan_proposal() is not None
+
+        plan = (
+            "# Plan\n\n## This Week\n\n"
+            "| Day | Date | Workout | Pace target | Notes |\n"
+            "|-----|------|---------|-------------|-------|\n"
+            "| Tue | 2026-04-28 | Easy 4mi | 8:45-9:15 | |\n"
+        )
+        execute_tool(
+            "update_plan",
+            {"new_plan_markdown": plan, "change_reason": "apply pending"},
+            state,
+        )
+        assert get_pending_plan_proposal() is None
+
     def test_update_plan_breaks_table_returns_warning(self, state, monkeypatch):
         """Plan without a parseable today row → tool returns a warning so
         the agent can self-correct."""

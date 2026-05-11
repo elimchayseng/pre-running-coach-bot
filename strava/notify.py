@@ -49,8 +49,9 @@ def _format_ping(entry: dict) -> str:
     return "\n".join(line for line in [line1, line2, line3] if line)
 
 
-def send_activity_ping(entry: dict, chat_id: Optional[str] = None) -> bool:
-    """Send the templated ping via the Telegram Bot API.
+def send_telegram_text(text: str, chat_id: Optional[str] = None) -> bool:
+    """Send arbitrary text to Telegram. Shared by templated pings and
+    LLM-generated post-activity analysis.
 
     chat_id defaults to USER_TELEGRAM_CHAT_ID env var. Returns True on success.
     Logs and returns False on any failure — never raises (called from a
@@ -59,15 +60,13 @@ def send_activity_ping(entry: dict, chat_id: Optional[str] = None) -> bool:
     chat_id = chat_id or os.getenv("USER_TELEGRAM_CHAT_ID")
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not chat_id or not token:
-        logger.warning("Cannot send Strava ping: USER_TELEGRAM_CHAT_ID or TELEGRAM_BOT_TOKEN unset")
+        logger.warning("Cannot send Telegram text: USER_TELEGRAM_CHAT_ID or TELEGRAM_BOT_TOKEN unset")
         return False
-
-    text = _format_ping(entry)
 
     try:
         from telegram import Bot
     except ImportError:
-        logger.error("python-telegram-bot not installed; cannot send ping")
+        logger.error("python-telegram-bot not installed; cannot send text")
         return False
 
     async def _send():
@@ -91,8 +90,13 @@ def send_activity_ping(entry: dict, chat_id: Optional[str] = None) -> bool:
             finally:
                 loop.close()
         except Exception as e:
-            logger.error(f"Failed to send Strava ping (fallback path): {e}")
+            logger.error(f"Failed to send Telegram text (fallback path): {e}")
             return False
     except Exception as e:
-        logger.error(f"Failed to send Strava ping: {e}")
+        logger.error(f"Failed to send Telegram text: {e}")
         return False
+
+
+def send_activity_ping(entry: dict, chat_id: Optional[str] = None) -> bool:
+    """Send the templated activity ping via Telegram."""
+    return send_telegram_text(_format_ping(entry), chat_id=chat_id)

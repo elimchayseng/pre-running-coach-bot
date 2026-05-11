@@ -9,15 +9,19 @@ import pytest
 
 @pytest.fixture
 def fake_redis():
-    """Provide a fakeredis instance and patch conversation_store to use it."""
+    """Provide a fakeredis instance and patch the Redis-backed stores to use it."""
     r = fakeredis.FakeRedis(decode_responses=True)
 
     import conversation_store
+    import pending_proposal_store
 
-    original = conversation_store._redis_client
+    conv_original = conversation_store._redis_client
+    prop_original = pending_proposal_store._redis_client
     conversation_store._redis_client = r
+    pending_proposal_store._redis_client = r
 
     yield r
 
     r.flushall()
-    conversation_store._redis_client = original
+    conversation_store._redis_client = conv_original
+    pending_proposal_store._redis_client = prop_original
