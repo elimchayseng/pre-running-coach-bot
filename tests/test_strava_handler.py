@@ -137,6 +137,9 @@ class TestHandleEvent:
         monkeypatch.setattr(handler.client, "get_activity", lambda aid: _easy_run_activity())
         ping_mock = MagicMock(return_value=True)
         monkeypatch.setattr(handler.notify, "send_activity_ping", ping_mock)
+        # Force review to return None so we fall back to the templated ping
+        # (covers the path this test was originally written for).
+        monkeypatch.setattr(handler.review, "run_post_activity_review", lambda e, s: None)
 
         handler.handle_event({"aspect_type": "create", "object_type": "activity", "object_id": 12345678902})
 
@@ -144,6 +147,56 @@ class TestHandleEvent:
         sessions = s.get_sessions_in_range(date(2026, 5, 11), date(2026, 5, 11))
         assert len(sessions) == 1
         assert sessions[0]["details"]["strava_id"] == 12345678902
+        ping_mock.assert_called_once()
+
+    def test_run_type_sends_review_text_not_templated_ping(self, monkeypatch, state_dir):
+        """For a run, the LLM review message is delivered via send_telegram_text;
+        the templated send_activity_ping is NOT called."""
+        monkeypatch.setattr(handler.client, "get_activity", lambda aid: _easy_run_activity())
+        review_mock = MagicMock(return_value="Solid easy run vs plan.\nProposed plan change: x")
+        text_mock = MagicMock(return_value=True)
+        ping_mock = MagicMock(return_value=True)
+        monkeypatch.setattr(handler.review, "run_post_activity_review", review_mock)
+        monkeypatch.setattr(handler.notify, "send_telegram_text", text_mock)
+        monkeypatch.setattr(handler.notify, "send_activity_ping", ping_mock)
+
+        handler.handle_event({"aspect_type": "create", "object_type": "activity", "object_id": 12345678902})
+
+        review_mock.assert_called_once()
+        text_mock.assert_called_once()
+        assert "Solid easy run" in text_mock.call_args[0][0]
+        ping_mock.assert_not_called()
+
+    def test_run_type_falls_back_to_template_when_review_fails(self, monkeypatch, state_dir):
+        """When review returns None, the templated ping still fires so the
+        user is never left without a confirmation message."""
+        monkeypatch.setattr(handler.client, "get_activity", lambda aid: _easy_run_activity())
+        monkeypatch.setattr(handler.review, "run_post_activity_review", lambda e, s: None)
+        text_mock = MagicMock(return_value=True)
+        ping_mock = MagicMock(return_value=True)
+        monkeypatch.setattr(handler.notify, "send_telegram_text", text_mock)
+        monkeypatch.setattr(handler.notify, "send_activity_ping", ping_mock)
+
+        handler.handle_event({"aspect_type": "create", "object_type": "activity", "object_id": 12345678902})
+
+        text_mock.assert_not_called()
+        ping_mock.assert_called_once()
+
+    def test_non_run_type_skips_review_and_uses_templated_ping(self, monkeypatch, state_dir):
+        """Cross-trains/rides/etc. should never invoke the LLM review."""
+        # Munge the fixture to look like a cross-train type entry.
+        activity = _easy_run_activity()
+        activity["type"] = "Ride"
+        activity["workout_type"] = 0
+        monkeypatch.setattr(handler.client, "get_activity", lambda aid: activity)
+        review_mock = MagicMock()
+        ping_mock = MagicMock(return_value=True)
+        monkeypatch.setattr(handler.review, "run_post_activity_review", review_mock)
+        monkeypatch.setattr(handler.notify, "send_activity_ping", ping_mock)
+
+        handler.handle_event({"aspect_type": "create", "object_type": "activity", "object_id": 12345678902})
+
+        review_mock.assert_not_called()
         ping_mock.assert_called_once()
 
 

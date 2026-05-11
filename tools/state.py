@@ -174,6 +174,15 @@ def _log_session(args: dict, state) -> dict:
 def _update_plan(args: dict, state) -> dict:
     state.update_plan(args["new_plan_markdown"], args["change_reason"])
     result = {"ok": True, "change_reason": args["change_reason"]}
+    # Any pending post-activity proposal is now consumed (either applied
+    # verbatim or superseded by a manual edit). Clear it so it doesn't
+    # linger in the next system prompt.
+    try:
+        from pending_proposal_store import clear_pending_plan_proposal
+
+        clear_pending_plan_proposal()
+    except Exception:
+        pass
     # After write, verify today's row is parseable. The locked
     # "| Day | Date | Workout | Pace target | Notes |" table format is what
     # /today depends on — if the agent's write broke it, surface a warning

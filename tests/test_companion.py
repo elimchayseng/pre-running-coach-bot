@@ -118,6 +118,29 @@ class TestBuildSystemPrompt:
         assert "Declaratives" in p
         assert "Tables ONLY" in p
 
+    def test_pending_proposal_absent_when_empty(self, state, fake_redis):
+        p = companion.build_system_prompt(state)
+        assert "PENDING PLAN PROPOSAL" not in p
+
+    def test_pending_proposal_surfaced_when_set(self, state, fake_redis):
+        from pending_proposal_store import set_pending_plan_proposal
+
+        set_pending_plan_proposal(
+            {
+                "summary": "Demote Thursday tempo to easy 5",
+                "new_plan_md": "# Plan\n\nrevised body\n",
+                "reason": "HR overreach on Tuesday workout",
+            }
+        )
+        p = companion.build_system_prompt(state)
+        assert "PENDING PLAN PROPOSAL" in p
+        assert "Demote Thursday tempo to easy 5" in p
+        assert "HR overreach on Tuesday workout" in p
+        assert "revised body" in p
+        # Tool norms must instruct the agent how to confirm/decline
+        assert "update_plan" in p
+        assert "yes" in p.lower()
+
 
 # ---------------- agent_turn ----------------
 

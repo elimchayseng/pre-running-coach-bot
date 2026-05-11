@@ -19,6 +19,7 @@ from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_ex
 
 from config import HEROKU_MODEL, PRE_PERSONALITY, llm_client, logger
 from conversation_store import add_turn, clear_history, get_history
+from pending_proposal_store import get_pending_plan_proposal
 from state_manager import StateManager
 from temporal_context import today_local
 from tools import ALL_TOOLS, execute_tool
@@ -41,28 +42,47 @@ def build_system_prompt(state: StateManager) -> str:
     """Compose the system prompt: personality + voice rules + today + state blob + tool norms."""
     today = today_local()
     blob = state.load_full_context()
-    return "\n".join(
+    sections = [
+        f"You are PRE, an elite endurance coach. {PRE_PERSONALITY}",
+        "",
+        "=== VOICE & FORMAT ===",
+        "- Match length to the question. 1-line question -> 1-2 line answer when possible.",
+        "- Lead with the answer. Reasoning second, sparingly. One follow-up question max.",
+        "- Tables ONLY when comparing 3+ items across 3+ columns (a week of daily prescriptions).",
+        "  A list of 3 sessions is a list, not a table.",
+        "- Bold ONE thing per response — the call to action or the number that matters.",
+        "  Don't bold every cell or section header.",
+        "- Never repeat the same content in two formats (list -> table -> summary).",
+        "- Drop 'Bottom line:' labels. The bottom line is the last sentence.",
+        "- Declaratives, not suggestions. 'Run 6:20 for the threshold reps' beats"
+        " 'you might consider trying around 6:20'.",
+        "",
+        "=== TODAY ===",
+        f"{today.isoformat()} ({today.strftime('%A')})",
+        "This date is from the system clock and is ALWAYS correct. Never override it.",
+        "",
+        blob,
+        "",
+    ]
+
+    proposal = _safe_get_pending_proposal()
+    if proposal:
+        sections.extend(
+            [
+                "=== PENDING PLAN PROPOSAL (awaiting user confirmation) ===",
+                "A post-activity review proposed the following plan change. It has NOT been applied yet.",
+                f"Summary: {proposal.get('summary', '')}",
+                f"Reason: {proposal.get('reason', '')}",
+                "Proposed new plan.md content:",
+                "```markdown",
+                (proposal.get("new_plan_md") or "").rstrip(),
+                "```",
+                "",
+            ]
+        )
+
+    sections.extend(
         [
-            f"You are PRE, an elite endurance coach. {PRE_PERSONALITY}",
-            "",
-            "=== VOICE & FORMAT ===",
-            "- Match length to the question. 1-line question -> 1-2 line answer when possible.",
-            "- Lead with the answer. Reasoning second, sparingly. One follow-up question max.",
-            "- Tables ONLY when comparing 3+ items across 3+ columns (a week of daily prescriptions).",
-            "  A list of 3 sessions is a list, not a table.",
-            "- Bold ONE thing per response — the call to action or the number that matters.",
-            "  Don't bold every cell or section header.",
-            "- Never repeat the same content in two formats (list -> table -> summary).",
-            "- Drop 'Bottom line:' labels. The bottom line is the last sentence.",
-            "- Declaratives, not suggestions. 'Run 6:20 for the threshold reps' beats"
-            " 'you might consider trying around 6:20'.",
-            "",
-            "=== TODAY ===",
-            f"{today.isoformat()} ({today.strftime('%A')})",
-            "This date is from the system clock and is ALWAYS correct. Never override it.",
-            "",
-            blob,
-            "",
             "=== HOW TO USE TOOLS ===",
             "- Call get_today early to confirm date, next race, training phase.",
             "- Call get_todays_workout for 'what's my workout' — don't paraphrase the plan.",
@@ -81,8 +101,24 @@ def build_system_prompt(state: StateManager) -> str:
             "  If you modify it, call update_plan with the change reason.",
             "- Priority A race is Broken Arrow 46K (June 20). Brooklyn is a tune-up — don't over-cook it.",
             "- Surface trade-offs explicitly. Don't silently change the plan; explain reasoning.",
+            "- If a pending plan proposal is shown above and the user confirms ('yes', 'apply', 'do it'),"
+            " call update_plan with the proposed new_plan_md and the proposal's reason as change_reason."
+            " If they decline or ask to revise, do not apply it; either discard or propose your own"
+            " revision via update_plan.",
         ]
     )
+
+    return "\n".join(sections)
+
+
+def _safe_get_pending_proposal():
+    """Fetch the pending proposal, swallowing any Redis errors so the chat
+    flow stays alive when the proposal store is unavailable."""
+    try:
+        return get_pending_plan_proposal()
+    except Exception as e:
+        logger.warning(f"Failed to load pending plan proposal: {e}")
+        return None
 
 
 def _build_system_message(prompt_text: str, use_cache_control: bool) -> dict:
