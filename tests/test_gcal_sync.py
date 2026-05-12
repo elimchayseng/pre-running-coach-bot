@@ -402,9 +402,7 @@ class TestSyncPlan:
         assert result["deleted"] == 1
         assert deletes == ["pretrain20260512"]
 
-    def test_detail_only_edit_triggers_patch_on_next_sync(
-        self, monkeypatch, patched_sync_state, fixed_today
-    ):
+    def test_detail_only_edit_triggers_patch_on_next_sync(self, monkeypatch, patched_sync_state, fixed_today):
         """Regression: changing only the #### YYYY-MM-DD body (no table edit)
         must produce patched=1, unchanged=N-1 on the next sync. The user
         verified this manually (Tue 5/12 + Sat 5/16) — pin it."""
