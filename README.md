@@ -17,6 +17,9 @@ which tools to call:
 - `get_sessions` — date-range query on `log.jsonl`
 - `get_fitness_summary` — soft-touch trailing snapshot: weekly volume, pace-vs-zone
   decoration on quality sessions, HR context, English signals (no prescriptions)
+- `sync_plan_to_calendar` / `get_calendar_status` — push the locked weekly
+  table from `plan.md` to a dedicated "PRE Training" Google Calendar (one-way,
+  bot → gcal). Called once per turn after plan edits are final.
 
 Long-term context lives in `state/` files. Short-term in-conversation history
 lives in Redis (~10 turns, 2-hour TTL).
@@ -109,6 +112,47 @@ gunicorn app:app                 # production
 
 Free-text messages route through the agent and may invoke any of the tools above.
 
+## Google Calendar integration
+
+Push the weekly table from `plan.md` into a dedicated "PRE Training" Google
+Calendar so workouts show up on your phone alongside everything else (with
+gcal's native fan-out to Apple Calendar / smartwatches).
+
+Architecture: one-way write only (bot → gcal). The agent calls
+`sync_plan_to_calendar` once at the end of any turn that edited the plan.
+A local sync-state file (`state/.gcal_sync_state.json`) tracks per-event
+hashes so reruns are no-ops when nothing has changed.
+
+One-time GCP setup (manual):
+1. Google Cloud Console → enable the Google Calendar API
+2. OAuth consent screen → External, add yourself as a Test User
+3. Create OAuth client → application type **Desktop app**
+4. Copy `client_id` / `client_secret` into `.env` as `GCAL_CLIENT_ID` /
+   `GCAL_CLIENT_SECRET`
+5. In the Google Calendar UI: create a new "PRE Training" calendar →
+   Settings → "Integrate calendar" → copy the Calendar ID into `.env` as
+   `CALENDAR_ID`
+
+Then:
+
+```bash
+./venv/bin/python scripts/google_calendar_setup.py auth      # OAuth (loopback listener)
+./venv/bin/python scripts/google_calendar_setup.py status    # verify env + tokens + calendar
+./venv/bin/python scripts/google_calendar_setup.py sync --dry-run
+./venv/bin/python scripts/google_calendar_setup.py sync
+```
+
+While the OAuth consent screen is in "testing" mode, refresh tokens for
+unverified apps expire after 7 days. When that happens, just rerun
+`scripts/google_calendar_setup.py auth`. Pursuing production verification is
+overkill for a single-user app.
+
+To back out the integration entirely:
+
+```bash
+./venv/bin/python scripts/google_calendar_setup.py purge --yes
+```
+
 ## Deployment
 
 Deploy to Railway with the included `Procfile`:
@@ -144,7 +188,10 @@ State files are not included in the deploy by default (gitignored). Either:
 │   ├── state.py            log_session, update_plan, append_journal,
 │   │                       update_athlete, get_sessions
 │   ├── plan.py             get_today, get_todays_workout, get_week_plan
-│   └── fitness.py          get_fitness_summary (soft-touch signals)
+│   ├── fitness.py          get_fitness_summary (soft-touch signals)
+│   └── calendar.py         sync_plan_to_calendar, get_calendar_status
+├── strava/                 OAuth, REST client, webhook, translator
+├── google_calendar/        OAuth, REST client, plan→events sync
 ├── scripts/test_agent.py   CLI harness, no Redis required
 └── tests/                  pytest
 ```

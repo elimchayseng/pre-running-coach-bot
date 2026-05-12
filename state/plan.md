@@ -27,6 +27,50 @@
 | Fri | 2026-05-15 | Walk 10-15min + 5min mobility PM | — | Ankle/hip prep |
 | Sat | 2026-05-16 | **BROOKLYN HALF** | 1:21:00 (6:10) | 7am ET start |
 
+### Workout Notes
+
+Per-day coaching detail for quality sessions and races. Each `#### YYYY-MM-DD`
+sub-section's body is synced verbatim into the Google Calendar event for that
+day. Easy/recovery/rest days don't need a sub-section — they fall back to the
+table cells (Pace target / Notes).
+
+#### 2026-05-12
+Sharpening, not testing. 4 days out from race.
+
+**Structure:**
+- 1.5mi WU easy
+- 3x1000m @ 6:00-6:05 pace (slightly faster than goal)
+- 2:30 jog recovery between reps
+- 1mi CD easy
+
+**Cue:** You should finish feeling like you could've done one more. This is nervous-system priming — fast turnover, full recovery. Do NOT race the workout.
+
+#### 2026-05-16
+RBC Brooklyn Half. 7am ET start. Target sub-1:21 (NYC age-group qualifier).
+
+**Hard rules (non-negotiable):**
+- Mile 1 must be 6:15-6:20 (not 6:10, not 6:05)
+- If mile 1 comes in under 6:15, BACK OFF immediately
+- HR cap miles 1-3: 178 bpm
+
+**Pacing:**
+- Miles 1-3: 6:15-6:20 (controlled, sit on the leash) - most of the hills are here 
+- Miles 4-8: 6:10-6:13 (settle in, find rhythm)
+- Miles 9-11: 6:08-6:10 (now push)
+- Miles 12-13.1: 6:00-6:05 (empty tank, earned by patience)
+
+**Checkpoints:**
+- 5K: 19:20 (NOT 18:45 — if early, wrong)
+- 10K: 38:30
+- Finish: 1:21:00
+
+**Fueling:**
+- Pre-race ~16oz fluid, normal breakfast 2.5-3 hrs out
+- Gel at mile 4 and mile 8
+- Caffeine if normally used; nothing new
+
+**Why these rules:** Thu 5/7 test ran 5:57/6:00/6:06 on prescribed 6:10-6:15 with HR hitting 190 on rep 2. Fitness is there for 1:21; pacing discipline is the limiter.
+
 ### Brooklyn Half Race Plan
 
 **Hard rules (non-negotiable):**
@@ -130,6 +174,7 @@ All plan edits append to the change log below with reasoning.
 
 ## Recent Plan Adjustments
 
+- 2026-05-12: Added `### Workout Notes` section under the weekly table with per-day `#### YYYY-MM-DD` sub-sections for quality sessions / races. The body of each block syncs verbatim into the Google Calendar event description. Seeded with Tue 5/12 (3x1000m sharpening) and Sat 5/16 (Brooklyn Half race plan). Older `### Brooklyn Half Race Plan` heading kept for now — duplicates the 5/16 block; can dedupe later.
 - 2026-05-08: Synced full plan from coaching conversation. Phase 1 daily table locked through Brooklyn (5/16). Phase 2 left as skeleton pending fall-goal decision. Pacing-floor and unprescribed-volume rules formalized.
 - 2026-04-26: Created two-race plan (Brooklyn 5/16 → Broken Arrow 6/20). Boston-recovery skeleton + adaptive sharpening.
 

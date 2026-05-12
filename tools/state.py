@@ -78,7 +78,16 @@ SCHEMAS = [
                 "the locked '| Day | Date | Workout | Pace target | Notes |' "
                 "table format for the current week — get_todays_workout depends "
                 "on it. Append a 'Recent Plan Adjustments' line in the new "
-                "content noting the change and reason."
+                "content noting the change and reason. "
+                "For QUALITY sessions and races (workouts, long runs, races) in "
+                "the current week, also include a per-day sub-section anchored "
+                "by '#### YYYY-MM-DD' (the date on its own line as an H4 "
+                "heading) with rationale, structure breakdown (WU / work / CD), "
+                "and execution cues. The Google Calendar sync uses this prose "
+                "verbatim as the event description, so write it the way you "
+                "want the user to read it on their phone the morning of. The "
+                "body extends until the next heading. Easy/recovery/rest days "
+                "don't need a sub-section — they fall back to the table cells."
             ),
             "parameters": {
                 "type": "object",

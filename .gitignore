@@ -1,6 +1,7 @@
 # Secrets
 .env
 .strava_tokens.json
+.gcal_tokens.json
 
 # Python
 __pycache__/
@@ -32,6 +33,7 @@ TODOS.md
 # state/ — kept in-repo for now so deploys see the same plan/log/journal as
 # local. If this becomes sensitive later, move it to a private companion
 # repo or a Railway volume and re-ignore here.
+state/.gcal_sync_state.json
 
 # OS
 .DS_Store
