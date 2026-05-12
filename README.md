@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="pre_coach_updated.jpg" alt="PRE running coach bot" width="240">
+  <img src="pre_coach_updated.png" alt="PRE running coach bot" width="240">
 </p>
 
 <h1 align="center">PRE — AI Running Coach Bot</h1>
