@@ -32,7 +32,7 @@ import logging
 import os
 import re
 import tempfile
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -42,7 +42,10 @@ logger = logging.getLogger("pre_coach.gcal.sync")
 
 # Sync window for prune (centered on today). 60 days each side covers any
 # realistic plan horizon while staying well under the 2500-events page cap.
+# Pad by ±1 day on the API request so USER_TIMEZONE skew (today_local respects
+# the user's TZ but Google's timeMin/timeMax are UTC) can't drop edge events.
 PRUNE_WINDOW_DAYS = 60
+_PRUNE_TZ_BUFFER_DAYS = 1
 
 # Local sync state file: maps event_id -> {hash, last_synced_at}.
 SYNC_STATE_FILE = Path(__file__).resolve().parent.parent / "state" / ".gcal_sync_state.json"
@@ -54,9 +57,12 @@ _ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _DETAIL_ANCHOR_RE = re.compile(r"^####\s+(\d{4}-\d{2}-\d{2})\s*$")
 _HEADING_RE = re.compile(r"^#{1,4}\s+\S")
 
-# Google caps event description at 8 KB. Stay under with a safety margin so the
-# extra "(synced by PRE)" footer + a truncation marker always fit.
-DESCRIPTION_MAX_CHARS = 7000
+# Google caps event description at 8 KB (bytes, not chars). Stay under with a
+# safety margin so the extra "(synced by PRE)" footer + truncation marker fit.
+# Multi-byte unicode (em-dashes, emoji) is common in coaching prose, so we clamp
+# on UTF-8 byte length rather than character count — 7000 chars of em-dashes is
+# 21000 bytes and would 400 from the API.
+DESCRIPTION_MAX_BYTES = 7000
 
 
 def sync_plan(state, dry_run: bool = False) -> dict:
@@ -117,8 +123,8 @@ def sync_plan(state, dry_run: bool = False) -> dict:
 
     # Prune: anything pre_managed in the window that we didn't just sync.
     today = today_local()
-    tmin = _iso_z(today - timedelta(days=PRUNE_WINDOW_DAYS))
-    tmax = _iso_z(today + timedelta(days=PRUNE_WINDOW_DAYS))
+    tmin = _iso_z(today - timedelta(days=PRUNE_WINDOW_DAYS + _PRUNE_TZ_BUFFER_DAYS))
+    tmax = _iso_z(today + timedelta(days=PRUNE_WINDOW_DAYS + _PRUNE_TZ_BUFFER_DAYS))
     try:
         managed = client.list_managed_events(tmin, tmax)
     except Exception as e:
@@ -227,15 +233,19 @@ def _parse_workout_details(plan_text: str) -> dict[str, str]:
 
 
 def _clamp_description(body: str) -> str:
-    """Truncate a description body if it would exceed Google's 8 KB limit."""
-    if len(body) <= DESCRIPTION_MAX_CHARS:
+    """Truncate a description body if it would exceed Google's 8 KB byte cap."""
+    encoded = body.encode("utf-8")
+    if len(encoded) <= DESCRIPTION_MAX_BYTES:
         return body
     logger.warning(
-        "workout detail body %d chars exceeds %d cap; truncating",
-        len(body),
-        DESCRIPTION_MAX_CHARS,
+        "workout detail body %d bytes exceeds %d cap; truncating",
+        len(encoded),
+        DESCRIPTION_MAX_BYTES,
     )
-    return body[:DESCRIPTION_MAX_CHARS].rstrip() + "\n…[truncated]"
+    # Decode with errors='ignore' to drop any partial multi-byte sequence at
+    # the cut point, then strip trailing whitespace before appending the marker.
+    truncated = encoded[:DESCRIPTION_MAX_BYTES].decode("utf-8", errors="ignore").rstrip()
+    return truncated + "\n…[truncated]"
 
 
 # ---------- event payload ----------
@@ -334,7 +344,9 @@ def _write_sync_state(state: dict[str, dict]) -> None:
 
 
 def _now_iso() -> str:
-    return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    # datetime.utcnow() is deprecated in 3.12 and slated for removal; use a
+    # tz-aware UTC datetime and emit the trailing 'Z' shape gcal expects.
+    return datetime.now(timezone.utc).replace(microsecond=0, tzinfo=None).isoformat() + "Z"
 
 
 def _iso_z(d: date) -> str:

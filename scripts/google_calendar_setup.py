@@ -90,6 +90,14 @@ class _OAuthHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):  # noqa: N802 — stdlib name
         parsed = urllib.parse.urlparse(self.path)
         params = dict(urllib.parse.parse_qsl(parsed.query))
+        # Browsers (Chrome especially) sometimes preload /favicon.ico before
+        # following the OAuth redirect. If we accept that as "the" callback,
+        # we'd miss the real ?code=... request. Only treat requests carrying
+        # the OAuth response params as the callback we're waiting for.
+        if "code" not in params and "error" not in params:
+            self.send_response(404)
+            self.end_headers()
+            return
         self.server.received = params  # type: ignore[attr-defined]
         body = (
             b"<html><body style='font-family: sans-serif; padding: 2em;'>"
@@ -153,8 +161,11 @@ def cmd_auth(_: argparse.Namespace) -> int:
         pass
 
     try:
-        # Single request, then we exit the loop.
-        server.handle_request()
+        # Loop until we get the actual OAuth callback (not /favicon.ico etc).
+        # _OAuthHandler.do_GET only sets `received` when the request carries
+        # `code` or `error`; other paths get a 404 and we keep listening.
+        while server.received is None:  # type: ignore[attr-defined]
+            server.handle_request()
     except KeyboardInterrupt:
         print("\nAborted.", file=sys.stderr)
         return 1

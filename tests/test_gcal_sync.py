@@ -232,7 +232,7 @@ class TestRichDescription:
         assert h_v1 != h_v2
 
     def test_long_detail_truncated(self):
-        big = "x" * (sync.DESCRIPTION_MAX_CHARS + 500)
+        big = "x" * (sync.DESCRIPTION_MAX_BYTES + 500)
         row = {
             "day_name": "Sat",
             "date": "2026-05-16",
@@ -243,8 +243,25 @@ class TestRichDescription:
         payload, _ = sync._build_event_payload(row, sync._event_id(row["date"]), big)
         desc = payload["description"]
         assert "…[truncated]" in desc
-        # Total description length is bounded (cap + truncation tag + footer).
-        assert len(desc) < sync.DESCRIPTION_MAX_CHARS + 100
+        # Final description fits within Google's 8 KB byte cap.
+        assert len(desc.encode("utf-8")) < 8192
+
+    def test_multibyte_unicode_truncated_by_bytes_not_chars(self):
+        # Em-dash is 3 bytes in UTF-8. 3000 em-dashes = 9000 bytes > cap (7000).
+        # If the clamp were char-based at 7000, this would NOT truncate but would
+        # still send a 9 KB description and 400 from the API.
+        big = "—" * 3000
+        row = {
+            "day_name": "Sat",
+            "date": "2026-05-16",
+            "workout": "long",
+            "pace_target": "—",
+            "notes": "—",
+        }
+        payload, _ = sync._build_event_payload(row, sync._event_id(row["date"]), big)
+        desc = payload["description"]
+        assert "…[truncated]" in desc
+        assert len(desc.encode("utf-8")) < 8192
 
 
 class TestSyncPlan:
@@ -384,6 +401,54 @@ class TestSyncPlan:
         assert result["inserted"] == 1
         assert result["deleted"] == 1
         assert deletes == ["pretrain20260512"]
+
+    def test_detail_only_edit_triggers_patch_on_next_sync(
+        self, monkeypatch, patched_sync_state, fixed_today
+    ):
+        """Regression: changing only the #### YYYY-MM-DD body (no table edit)
+        must produce patched=1, unchanged=N-1 on the next sync. The user
+        verified this manually (Tue 5/12 + Sat 5/16) — pin it."""
+        from google_calendar import client as gcal_client
+
+        plan_v1 = """\
+| Day | Date | Workout | Pace target | Notes |
+| Mon | 2026-05-11 | Easy 4mi | 8:30 | Race week |
+| Tue | 2026-05-12 | 5mi w/ 3x1000m | 6:00-6:05 | Race week |
+
+#### 2026-05-12
+v1 detail body
+"""
+        plan_v2 = plan_v1.replace("v1 detail body", "v2 detail body — refined")
+
+        monkeypatch.setattr(gcal_client, "insert_event", lambda p: {"id": p["id"]})
+        monkeypatch.setattr(gcal_client, "list_managed_events", lambda *a, **kw: [])
+
+        # First sync: both rows inserted.
+        result1 = sync.sync_plan(_StubState(plan_v1), dry_run=False)
+        assert result1["inserted"] == 2
+        assert result1["patched"] == 0
+
+        # Second sync: only the detail body changed. The hash for Tue differs
+        # from the stored hash → re-attempts insert (matches real flow); the
+        # event already exists in gcal → 409 → falls through to patch. Mon's
+        # hash unchanged → no API call.
+        patches = []
+
+        def _409_on_existing(p):
+            raise gcal_client.GcalEventExistsError(f"dup {p['id']}")
+
+        monkeypatch.setattr(gcal_client, "insert_event", _409_on_existing)
+        monkeypatch.setattr(
+            gcal_client,
+            "patch_event",
+            lambda eid, p: patches.append(eid) or {"id": eid},
+        )
+
+        result2 = sync.sync_plan(_StubState(plan_v2), dry_run=False)
+        assert result2["patched"] == 1
+        assert result2["unchanged"] == 1
+        assert result2["errors"] == []
+        assert patches == ["pretrain20260512"]
 
     def test_detail_block_flows_into_inserted_event(self, monkeypatch, patched_sync_state, fixed_today):
         from google_calendar import client as gcal_client
