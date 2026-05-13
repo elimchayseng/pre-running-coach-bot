@@ -81,8 +81,10 @@ def get_telegram_app():
         telegram_app.add_handler(CommandHandler("health", health_command))
         telegram_app.add_handler(CommandHandler("reconcile", reconcile_command))
         telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-        # Must initialize before process_update can be called
-        _run_async(telegram_app.initialize())
+        # Must initialize before process_update can be called.
+        # Startup paths should fail fast; the 180s default is sized for
+        # in-flight Telegram updates, not boot-time network calls.
+        _run_async(telegram_app.initialize(), timeout=30)
     return telegram_app
 
 
@@ -205,7 +207,10 @@ def setup_webhook():
         await bot.set_webhook(**kwargs)
         logger.info(f"Webhook set to: {webhook_endpoint}")
 
-    _run_async(_set_webhook())
+    # Startup network call — fail fast rather than inherit the 180s default
+    # _run_async ceiling (which is sized for in-flight Telegram update
+    # processing, not boot-time setWebhook).
+    _run_async(_set_webhook(), timeout=30)
 
 
 # Set up webhook on startup
