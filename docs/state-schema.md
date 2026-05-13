@@ -1,23 +1,26 @@
 # State schema reference
 
-Canonical reference for the four files under `state/`. Read this before:
-- Editing state files by hand
+Canonical reference for the bot's persistent state. Read this before:
+- Editing state by hand (via `sqlite3 state/coach.db` or `scripts/apply_state_updates.py`)
 - Modifying tools that write state (`tools/state.py`)
 - Designing new tools that read state
 
-The agent writes these files. Drift in shape breaks parsers silently. Keep this doc in sync with `state_manager.py` and the tool descriptions in `tools/state.py`.
+State lives in a single SQLite database (`$DATABASE_PATH`, default `state/coach.db`). The agent writes via `StateManager`. Schema source of truth: [`state/schema.sql`](../state/schema.sql).
 
 ---
 
-## File index
+## Table index
 
-| File | Format | Writer | Reader(s) |
-|---|---|---|---|
-| `state/athlete.yaml` | YAML (round-trip via ruamel) | `tools.state.update_athlete` | `StateManager.load_athlete`, all tools |
-| `state/plan.md` | Markdown (freeform + locked weekly table) | `tools.state.update_plan` | `StateManager.load_plan`, `get_todays_workout` parser |
-| `state/log.jsonl` | JSON-per-line, append-only | `StateManager.append_session` (via `tools.state.log_session`, `strava.handler`, `strava_backfill`) | `StateManager.get_recent_sessions`, `get_sessions_in_range`, `existing_strava_ids`; `tools.fitness.get_fitness_summary` |
-| `state/journal.md` | Markdown, append-only, timestamped sections | `StateManager.append_journal` (via `tools.state.append_journal`) | `StateManager.load_journal` (last N entries) |
-| `state/plan_changelog.md` | Markdown, append-only, one line per `update_plan` call | `StateManager.update_plan` (automatic) | Read by humans / agent on demand; not parsed |
+| Table | Replaces (legacy file) | Format | Writer | Reader(s) |
+|---|---|---|---|---|
+| `athlete` | `athlete.yaml` | YAML text in `yaml_text` column (round-trip via ruamel) | `tools.state.update_athlete` | `StateManager.load_athlete`, all tools |
+| `plan` | `plan.md` | Markdown text in `content` column (freeform + locked weekly table) | `tools.state.update_plan` | `StateManager.load_plan`, `get_todays_workout` parser |
+| `sessions` | `log.jsonl` | One row per session; full original JSON entry in `data` column. `date` + `type` indexed; partial UNIQUE index on `details.strava_id`. | `StateManager.append_session` (via `tools.state.log_session`, `strava.handler`, `strava_backfill`) | `StateManager.get_recent_sessions`, `get_sessions_in_range`, `existing_strava_ids`; `tools.fitness.get_fitness_summary` |
+| `journal` | `journal.md` | Markdown text in `content` column, timestamped sections separated by `\n---\n` | `StateManager.append_journal` (via `tools.state.append_journal`) | `StateManager.load_journal` (last N entries) |
+| `plan_changelog` | `plan_changelog.md` | Markdown text in `content` column, one line per `update_plan` call | `StateManager.update_plan` (automatic) | Read by humans / agent on demand; not parsed |
+| `gcal_sync_state` | `.gcal_sync_state.json` | Normalized: one row per gcal `event_id` with `hash`, `last_synced_at`, `completed`, `last_completed_at`, `off_plan` | `google_calendar.sync.sync_plan` / `mark_complete` (via `StateManager.save_gcal_sync_state`) | `google_calendar.sync.reconcile_completion`, `get_last_sync_summary` |
+
+Note the legacy `state/*.{md,yaml,jsonl,json}` files are kept committed as **migration seeds only** — `scripts/migrate_state_to_sqlite.py` reads them once to populate `coach.db`. They are not the runtime source of truth.
 
 ---
 
@@ -289,6 +292,7 @@ When the agent (or a human) wants to add fields:
 4. **Lists in `athlete.yaml` REPLACE on merge** (per `update_athlete` semantics). To add to a list, include the full new list in the tool call.
 
 When state shapes drift in production:
-- Run `python -c "import json; [json.loads(l) for l in open('state/log.jsonl')]"` to find malformed JSONL lines.
-- `python -c "from state_manager import StateManager; print(StateManager('state').load_athlete())"` to verify athlete parses.
+- `python scripts/state_dump.py log` to inspect recent sessions (or `--all` for everything).
+- `sqlite3 state/coach.db 'SELECT id, date, type, json_valid(data) FROM sessions WHERE NOT json_valid(data)'` to find any malformed JSON in `sessions.data` (should always be 0 — the writers go through `json.dumps`).
+- `python -c "from state_manager import StateManager; print(StateManager().load_athlete())"` to verify athlete YAML parses.
 - `python scripts/strava_setup.py status` for the live token + API health.

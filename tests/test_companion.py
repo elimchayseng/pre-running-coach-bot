@@ -36,18 +36,23 @@ PLAN_MD = """\
 
 
 @pytest.fixture
-def state_dir(tmp_path: Path) -> Path:
+def state_dir(tmp_path: Path, monkeypatch) -> Path:
+    monkeypatch.delenv("DATABASE_PATH", raising=False)
     d = tmp_path / "state"
     d.mkdir()
-    (d / "athlete.yaml").write_text(ATHLETE_YAML)
-    (d / "plan.md").write_text(PLAN_MD)
     return d
 
 
 @pytest.fixture
 def state(state_dir: Path, monkeypatch) -> StateManager:
-    """Inject a tmp StateManager into companion's module-global cache."""
+    """Inject a tmp StateManager into companion's module-global cache, seeded
+    with athlete YAML + plan via the StateManager API (athlete row needs to
+    exist; plan goes through update_plan)."""
     s = StateManager(state_dir)
+    # Seed athlete directly (singleton row not exposed via a public writer)
+    with s._conn() as c:
+        c.execute("INSERT INTO athlete (id, yaml_text) VALUES (1, ?)", (ATHLETE_YAML,))
+    s.update_plan(PLAN_MD, "seed")
     monkeypatch.setattr(companion, "_state", s)
     return s
 

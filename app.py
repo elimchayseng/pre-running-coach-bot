@@ -19,6 +19,7 @@ from bot import (
     log_command,
     plan_command,
     race_command,
+    reconcile_command,
     reset_command,
     start_command,
     today_command,
@@ -69,6 +70,7 @@ def get_telegram_app():
         telegram_app.add_handler(CommandHandler("race", race_command))
         telegram_app.add_handler(CommandHandler("reset", reset_command))
         telegram_app.add_handler(CommandHandler("health", health_command))
+        telegram_app.add_handler(CommandHandler("reconcile", reconcile_command))
         telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
         # Must initialize before process_update can be called
         _run_async(telegram_app.initialize())

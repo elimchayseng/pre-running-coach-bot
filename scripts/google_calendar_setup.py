@@ -293,9 +293,9 @@ def cmd_status(_: argparse.Namespace) -> int:
     summary = sync.get_last_sync_summary()
     if summary:
         _ok(f"{summary['count']} entries; last synced at {summary['last_synced_at']}")
-        print(f"    file: {summary['file']}")
+        print(f"    source: {summary['source']}")
     else:
-        _warn("No sync state file yet. Run: python scripts/google_calendar_setup.py sync")
+        _warn("No sync state yet. Run: python scripts/google_calendar_setup.py sync")
 
     print()
     return rc
@@ -362,12 +362,13 @@ def cmd_purge(args: argparse.Namespace) -> int:
             errors += 1
             print(f"  delete {ev_id} failed: {e}", file=sys.stderr)
 
-    # Wipe local sync state too — it's now stale.
+    # Wipe sync state too — it's now stale.
     try:
-        if sync.SYNC_STATE_FILE.exists():
-            sync.SYNC_STATE_FILE.unlink()
-    except OSError:
-        pass
+        from state_manager import StateManager
+
+        StateManager().save_gcal_sync_state({})
+    except Exception as e:
+        print(f"  warning: failed to clear sync state: {e}", file=sys.stderr)
 
     print(f"✓ Purged {deleted} events ({errors} errors)")
     return 0 if errors == 0 else 1

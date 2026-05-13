@@ -5,8 +5,9 @@ chat on claude.ai) into the bot's state files.
 
 ## Workflow
 
-1. Copy the current state files into the other conversation (filling in the
-   placeholder blocks below).
+1. Copy the current state into the other conversation (filling in the
+   placeholder blocks below). Dump the live state with
+   `python scripts/state_dump.py --all`.
 2. Paste the prompt.
 3. Save the JSON output it produces as `state_updates.json` in the repo root.
 4. Run:
@@ -15,7 +16,11 @@ chat on claude.ai) into the bot's state files.
    ./venv/bin/python scripts/apply_state_updates.py state_updates.json
    ```
 
-   Inspect `git diff state/` and commit if it looks right.
+   Writes go through `StateManager`, so this updates SQLite (`$DATABASE_PATH`
+   or `state/coach.db` by default). Verify with
+   `python scripts/state_dump.py log` etc. To apply against prod, set
+   `DATABASE_PATH=/app/data/coach.db` via a pulled snapshot or run inside
+   `railway shell --service web`.
 
 ---
 

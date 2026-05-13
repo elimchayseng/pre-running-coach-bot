@@ -47,17 +47,37 @@ PLAN_MD = """\
 
 
 @pytest.fixture
-def state_dir(tmp_path: Path) -> Path:
+def state_dir(tmp_path: Path, monkeypatch) -> Path:
+    monkeypatch.delenv("DATABASE_PATH", raising=False)
     d = tmp_path / "state"
     d.mkdir()
-    (d / "athlete.yaml").write_text(ATHLETE_YAML)
-    (d / "plan.md").write_text(PLAN_MD)
     return d
 
 
 @pytest.fixture
 def state(state_dir: Path) -> StateManager:
-    return StateManager(state_dir)
+    """SQLite-backed StateManager seeded with the ATHLETE_YAML + PLAN_MD fixtures."""
+    s = StateManager(state_dir)
+    with s._conn() as c:
+        c.execute("INSERT INTO athlete (id, yaml_text) VALUES (1, ?)", (ATHLETE_YAML,))
+    s.update_plan(PLAN_MD, "seed")
+    return s
+
+
+def _seed_athlete(state: StateManager, yaml_text: str) -> None:
+    """Replace the athlete row entirely (mirrors the migration script)."""
+    with state._conn() as c:
+        c.execute(
+            "INSERT INTO athlete (id, yaml_text) VALUES (1, ?) "
+            "ON CONFLICT(id) DO UPDATE SET yaml_text = excluded.yaml_text",
+            (yaml_text,),
+        )
+
+
+def _seed_log(state: StateManager, entries) -> None:
+    """Append session rows directly so we can test analysis paths."""
+    for e in entries:
+        state.append_session(e)
 
 
 # ------------- dispatcher -------------
@@ -73,8 +93,9 @@ class TestDispatcher:
         assert "error" in out
 
     def test_handler_exception_returns_error(self, state):
-        # update_athlete with no file -> FileNotFoundError -> error dict
-        state.athlete_path.unlink()
+        # update_athlete with no row -> FileNotFoundError -> error dict
+        with state._conn() as c:
+            c.execute("DELETE FROM athlete")
         out = execute_tool("update_athlete", {"updates": {"name": "X"}}, state)
         assert "error" in out
 
@@ -99,8 +120,8 @@ class TestStateTools:
             {"date": "2026-04-26", "type": "run", "miles": 5, "rpe": None},
             state,
         )
-        line = state.log_path.read_text().strip()
-        assert "rpe" not in json.loads(line)
+        [entry] = state.sessions_on_date(date(2026, 4, 26))
+        assert "rpe" not in entry
 
     def test_update_plan_with_valid_today_row_no_warning(self, state, monkeypatch):
         """Plan contains today's row → tool returns ok with no warning."""
@@ -212,8 +233,8 @@ class TestPlanTools:
         out = execute_tool("get_today", {}, state)
         assert "Past Race" != out["next_race"]["name"]
 
-    def test_get_today_no_races(self, state, state_dir):
-        (state_dir / "athlete.yaml").write_text("name: Test\n")
+    def test_get_today_no_races(self, state):
+        _seed_athlete(state, "name: Test\n")
         out = execute_tool("get_today", {}, state)
         assert out["next_race"] is None
 
@@ -227,13 +248,11 @@ class TestPlanTools:
         assert len(out["days"]) == 7
         assert "week_start" in out
 
-    def test_get_week_status_marks_completed_when_log_matches(self, state, state_dir, monkeypatch):
+    def test_get_week_status_marks_completed_when_log_matches(self, state, monkeypatch):
         # Pin "today" so the week range is deterministic relative to PLAN_MD.
         monkeypatch.setattr("tools.plan.today_local", lambda: date(2026, 4, 28))
         # Log an easy run on Tue 4/28 — matches the "Easy 4mi" prescription.
-        (state_dir / "log.jsonl").write_text(
-            json.dumps({"date": "2026-04-28", "type": "easy", "miles": 4.1, "pace_avg": "8:55"}) + "\n"
-        )
+        _seed_log(state, [{"date": "2026-04-28", "type": "easy", "miles": 4.1, "pace_avg": "8:55"}])
         out = execute_tool("get_week_status", {"week_offset": 0}, state)
         tue = next(d for d in out["days"] if d["date"] == "2026-04-28")
         assert tue["found"] is True
@@ -243,10 +262,10 @@ class TestPlanTools:
         assert tue["actuals"][0]["miles"] == 4.1
         assert tue["off_plan_actuals"] == []
 
-    def test_get_week_status_off_plan_does_not_complete_prescription(self, state, state_dir, monkeypatch):
+    def test_get_week_status_off_plan_does_not_complete_prescription(self, state, monkeypatch):
         monkeypatch.setattr("tools.plan.today_local", lambda: date(2026, 4, 28))
         # Strength only on a "Easy 4mi" day — off-plan; prescription not met.
-        (state_dir / "log.jsonl").write_text(json.dumps({"date": "2026-04-28", "type": "strength"}) + "\n")
+        _seed_log(state, [{"date": "2026-04-28", "type": "strength"}])
         out = execute_tool("get_week_status", {"week_offset": 0}, state)
         tue = next(d for d in out["days"] if d["date"] == "2026-04-28")
         assert tue["completed"] is False

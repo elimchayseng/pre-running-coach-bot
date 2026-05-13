@@ -80,9 +80,15 @@ class TestRaceDateResolution:
 
     def test_state_provides_next_race(self, monkeypatch, tmp_path):
         monkeypatch.delenv("RACE_DATE", raising=False)
-        (tmp_path / "athlete.yaml").write_text(
-            "target_races:\n  - name: Past Race\n    date: 2020-01-01\n  - name: Future Race\n    date: 2099-06-15\n"
-        )
+        monkeypatch.delenv("DATABASE_PATH", raising=False)
+        from state_manager import StateManager
+
+        sm = StateManager(tmp_path)
+        with sm._conn() as c:
+            c.execute(
+                "INSERT INTO athlete (id, yaml_text) VALUES (1, ?)",
+                ("target_races:\n  - name: Past Race\n    date: 2020-01-01\n  - name: Future Race\n    date: 2099-06-15\n",),
+            )
         import temporal_context
 
         monkeypatch.setattr(temporal_context, "_state_dir", lambda: tmp_path)
@@ -124,7 +130,15 @@ class TestBuildTemporalPrompt:
 
     def test_includes_race_name_from_state(self, monkeypatch, tmp_path):
         monkeypatch.delenv("RACE_DATE", raising=False)
-        (tmp_path / "athlete.yaml").write_text("target_races:\n  - name: Tahoe 50K\n    date: 2099-06-15\n")
+        monkeypatch.delenv("DATABASE_PATH", raising=False)
+        from state_manager import StateManager
+
+        sm = StateManager(tmp_path)
+        with sm._conn() as c:
+            c.execute(
+                "INSERT INTO athlete (id, yaml_text) VALUES (1, ?)",
+                ("target_races:\n  - name: Tahoe 50K\n    date: 2099-06-15\n",),
+            )
         import temporal_context
 
         monkeypatch.setattr(temporal_context, "_state_dir", lambda: tmp_path)

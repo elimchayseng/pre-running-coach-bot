@@ -47,6 +47,7 @@ COMMANDS = [
     ("/race", "Show race countdown and training phase"),
     ("/reset", "Clear short-term conversation history"),
     ("/health", "Check system health"),
+    ("/reconcile [days]", "Re-mark calendar completion from recent logs (default 14 days)"),
     ("/help", "Show commands"),
 ]
 

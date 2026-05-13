@@ -47,6 +47,29 @@ SCHEMAS = [
             "parameters": {"type": "object", "properties": {}},
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "reconcile_completion",
+            "description": (
+                "Walk recent logged sessions and re-mark Google Calendar "
+                "events that should be completed but aren't (e.g., webhook "
+                "fired before mark_complete existed, or a transient gcal "
+                "failure). Idempotent. Use when the user asks to fix or "
+                "double-check past workout completion in the calendar."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "days_back": {
+                        "type": "integer",
+                        "description": "How many days of history to walk (default 14).",
+                        "default": 14,
+                    }
+                },
+            },
+        },
+    },
 ]
 
 
@@ -79,7 +102,15 @@ def _status(args: dict, state) -> dict:
     return out
 
 
+def _reconcile(args: dict, state) -> dict:
+    from google_calendar import sync
+
+    days_back = int(args.get("days_back") or 14)
+    return sync.reconcile_completion(state, days_back=days_back)
+
+
 HANDLERS = {
     "sync_plan_to_calendar": _sync,
     "get_calendar_status": _status,
+    "reconcile_completion": _reconcile,
 }
