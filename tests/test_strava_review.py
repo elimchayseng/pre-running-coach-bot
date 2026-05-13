@@ -34,17 +34,20 @@ PLAN_MD = """\
 
 
 @pytest.fixture
-def state_dir(tmp_path: Path) -> Path:
+def state_dir(tmp_path: Path, monkeypatch) -> Path:
+    monkeypatch.delenv("DATABASE_PATH", raising=False)
     d = tmp_path / "state"
     d.mkdir()
-    (d / "athlete.yaml").write_text(ATHLETE_YAML)
-    (d / "plan.md").write_text(PLAN_MD)
     return d
 
 
 @pytest.fixture
 def state(state_dir: Path) -> StateManager:
-    return StateManager(state_dir)
+    s = StateManager(state_dir)
+    with s._conn() as c:
+        c.execute("INSERT INTO athlete (id, yaml_text) VALUES (1, ?)", (ATHLETE_YAML,))
+    s.update_plan(PLAN_MD, "seed")
+    return s
 
 
 @pytest.fixture

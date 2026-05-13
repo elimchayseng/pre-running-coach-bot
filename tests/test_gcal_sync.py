@@ -1,9 +1,9 @@
 """Tests for google_calendar.sync — row parsing, insert/patch/delete
-accounting, dry-run, hash-skip, sync-state roundtrip."""
+accounting, dry-run, hash-skip, sync-state roundtrip, mark_complete, and
+reconcile_completion."""
 
 from __future__ import annotations
 
-import json
 from datetime import date
 
 import pytest
@@ -29,20 +29,40 @@ Some prose. No table rows.
 """
 
 
-class _StubState:
-    def __init__(self, plan_text: str):
+class _StateStub:
+    """StateManager-shaped stub for sync tests — keeps gcal sync state in
+    memory so we don't need a real SQLite DB inside unit tests.
+
+    Supports the four methods sync.py touches: ``load_plan``,
+    ``sessions_on_date``, ``load_gcal_sync_state``, ``save_gcal_sync_state``.
+    """
+
+    def __init__(self, plan_text: str = "", sessions: dict[str, list[dict]] | None = None):
         self._plan = plan_text
+        self._sessions = sessions or {}
+        self.gcal_sync: dict[str, dict] = {}
 
     def load_plan(self) -> str:
         return self._plan
 
+    def sessions_on_date(self, d) -> list[dict]:
+        return list(self._sessions.get(d.isoformat(), []))
+
+    def load_gcal_sync_state(self) -> dict[str, dict]:
+        # Mimic the real load: drop entries with falsy values for parity.
+        import copy
+
+        return copy.deepcopy(self.gcal_sync)
+
+    def save_gcal_sync_state(self, state: dict[str, dict]) -> None:
+        import copy
+
+        self.gcal_sync = copy.deepcopy(state)
+
 
 @pytest.fixture
-def patched_sync_state(monkeypatch, tmp_path):
-    """Redirect SYNC_STATE_FILE to a tmp path so tests don't pollute state/."""
-    p = tmp_path / ".gcal_sync_state.json"
-    monkeypatch.setattr(sync, "SYNC_STATE_FILE", p)
-    yield p
+def state_stub() -> _StateStub:
+    return _StateStub(PLAN_FIXTURE)
 
 
 @pytest.fixture
@@ -55,8 +75,6 @@ def fixed_today(monkeypatch):
 class TestParsePlanRows:
     def test_parses_locked_format_rows_only(self):
         rows = sync._parse_plan_rows(PLAN_FIXTURE)
-        # 4 valid rows: Fri/Sat/Mon/Sat — Sun is skipped (empty workout),
-        # header + separator + phase-2 prose are not table rows.
         assert len(rows) == 4
         dates = [r["date"] for r in rows]
         assert dates == ["2026-05-08", "2026-05-09", "2026-05-11", "2026-05-16"]
@@ -137,7 +155,6 @@ Brooklyn Half. Mile 1 must be 6:15-6:20.
         assert "Sharpening" in details["2026-05-12"]
         assert "Cue:" in details["2026-05-12"]
         assert "Brooklyn Half" in details["2026-05-16"]
-        # Should NOT bleed across anchors.
         assert "Brooklyn" not in details["2026-05-12"]
 
     def test_body_terminates_at_higher_heading(self):
@@ -167,7 +184,6 @@ Has content.
         assert sync._parse_workout_details("# just prose, no detail anchors") == {}
 
     def test_anchor_must_be_level_4_only(self):
-        # H3 with date should not count as an anchor.
         text = """\
 ### 2026-05-12
 Body under H3 — should NOT be parsed as a detail block.
@@ -186,7 +202,6 @@ class TestRichDescription:
         }
         body = "Sharpening, not testing.\n\n**Structure:**\n- WU\n- Reps\n- CD"
         payload, _ = sync._build_event_payload(row, sync._event_id(row["date"]), body)
-        # Rich body present → table cells NOT included as Pace:/Notes:.
         assert payload["description"].startswith("Sharpening, not testing.")
         assert payload["description"].endswith("(synced by PRE)")
         assert "**Structure:**" in payload["description"]
@@ -243,13 +258,9 @@ class TestRichDescription:
         payload, _ = sync._build_event_payload(row, sync._event_id(row["date"]), big)
         desc = payload["description"]
         assert "…[truncated]" in desc
-        # Final description fits within Google's 8 KB byte cap.
         assert len(desc.encode("utf-8")) < 8192
 
     def test_multibyte_unicode_truncated_by_bytes_not_chars(self):
-        # Em-dash is 3 bytes in UTF-8. 3000 em-dashes = 9000 bytes > cap (7000).
-        # If the clamp were char-based at 7000, this would NOT truncate but would
-        # still send a 9 KB description and 400 from the API.
         big = "—" * 3000
         row = {
             "day_name": "Sat",
@@ -265,10 +276,8 @@ class TestRichDescription:
 
 
 class TestSyncPlan:
-    def test_dry_run_makes_no_api_calls(self, monkeypatch, patched_sync_state, fixed_today):
+    def test_dry_run_makes_no_api_calls(self, monkeypatch, state_stub, fixed_today):
         from google_calendar import client as gcal_client
-
-        api_calls = {"insert": 0, "patch": 0, "delete": 0, "list": 0}
 
         def _boom(*a, **kw):  # noqa: ARG001
             raise AssertionError("API should not be called in dry-run")
@@ -276,34 +285,26 @@ class TestSyncPlan:
         monkeypatch.setattr(gcal_client, "insert_event", _boom)
         monkeypatch.setattr(gcal_client, "patch_event", _boom)
         monkeypatch.setattr(gcal_client, "delete_event", _boom)
+        monkeypatch.setattr(gcal_client, "list_managed_events", lambda *a, **kw: [])
 
-        def _list(*a, **kw):  # noqa: ARG001
-            api_calls["list"] += 1
-            return []
-
-        monkeypatch.setattr(gcal_client, "list_managed_events", _list)
-
-        result = sync.sync_plan(_StubState(PLAN_FIXTURE), dry_run=True)
+        result = sync.sync_plan(state_stub, dry_run=True)
         assert result["dry_run"] is True
-        assert result["inserted"] == 4  # all rows look new
+        assert result["inserted"] == 4
         assert result["patched"] == 0
         assert result["deleted"] == 0
-        # Sync state file should NOT be written in dry-run
-        assert not patched_sync_state.exists()
+        # No state written in dry-run
+        assert state_stub.gcal_sync == {}
+        # Reconcile is skipped in dry-run
+        assert result["reconcile"] is None
 
-    def test_inserts_all_when_state_empty(self, monkeypatch, patched_sync_state, fixed_today):
+    def test_inserts_all_when_state_empty(self, monkeypatch, state_stub, fixed_today):
         from google_calendar import client as gcal_client
 
         inserts = []
-
-        def _insert(payload):
-            inserts.append(payload["id"])
-            return {"id": payload["id"]}
-
-        monkeypatch.setattr(gcal_client, "insert_event", _insert)
+        monkeypatch.setattr(gcal_client, "insert_event", lambda p: inserts.append(p["id"]) or {"id": p["id"]})
         monkeypatch.setattr(gcal_client, "list_managed_events", lambda *a, **kw: [])
 
-        result = sync.sync_plan(_StubState(PLAN_FIXTURE), dry_run=False)
+        result = sync.sync_plan(state_stub, dry_run=False)
         assert result["inserted"] == 4
         assert result["patched"] == 0
         assert result["deleted"] == 0
@@ -315,30 +316,25 @@ class TestSyncPlan:
             "pretrain20260511",
             "pretrain20260516",
         ]
-        # Sync state file written
-        assert patched_sync_state.exists()
-        state = json.loads(patched_sync_state.read_text())
-        assert set(state.keys()) == set(inserts)
-        for v in state.values():
+        assert set(state_stub.gcal_sync.keys()) == set(inserts)
+        for v in state_stub.gcal_sync.values():
             assert "hash" in v and "last_synced_at" in v
+        # Reconcile ran (no sessions seeded → all skipped, no errors)
+        assert result["reconcile"]["corrected"] == []
+        assert result["reconcile"]["errors"] == []
 
-    def test_409_on_insert_falls_through_to_patch(self, monkeypatch, patched_sync_state, fixed_today):
+    def test_409_on_insert_falls_through_to_patch(self, monkeypatch, state_stub, fixed_today):
         from google_calendar import client as gcal_client
 
         def _insert(_payload):
             raise gcal_client.GcalEventExistsError("dup")
 
         patches = []
-
-        def _patch(event_id, patch):
-            patches.append(event_id)
-            return {"id": event_id}
-
         monkeypatch.setattr(gcal_client, "insert_event", _insert)
-        monkeypatch.setattr(gcal_client, "patch_event", _patch)
+        monkeypatch.setattr(gcal_client, "patch_event", lambda eid, p: patches.append(eid) or {"id": eid})
         monkeypatch.setattr(gcal_client, "list_managed_events", lambda *a, **kw: [])
 
-        result = sync.sync_plan(_StubState(PLAN_FIXTURE), dry_run=False)
+        result = sync.sync_plan(state_stub, dry_run=False)
         assert result["inserted"] == 0
         assert result["patched"] == 4
         assert sorted(patches) == [
@@ -348,15 +344,13 @@ class TestSyncPlan:
             "pretrain20260516",
         ]
 
-    def test_unchanged_when_hash_matches(self, monkeypatch, patched_sync_state, fixed_today):
+    def test_unchanged_when_hash_matches(self, monkeypatch, state_stub, fixed_today):
         from google_calendar import client as gcal_client
 
-        # First sync: insert all, recording hashes.
         monkeypatch.setattr(gcal_client, "insert_event", lambda p: {"id": p["id"]})
         monkeypatch.setattr(gcal_client, "list_managed_events", lambda *a, **kw: [])
-        sync.sync_plan(_StubState(PLAN_FIXTURE), dry_run=False)
+        sync.sync_plan(state_stub, dry_run=False)
 
-        # Second sync: nothing should be inserted/patched.
         def _boom_insert(_p):
             raise AssertionError("should not insert when hash matches")
 
@@ -366,46 +360,37 @@ class TestSyncPlan:
         monkeypatch.setattr(gcal_client, "insert_event", _boom_insert)
         monkeypatch.setattr(gcal_client, "patch_event", _boom_patch)
 
-        result = sync.sync_plan(_StubState(PLAN_FIXTURE), dry_run=False)
+        result = sync.sync_plan(state_stub, dry_run=False)
         assert result["inserted"] == 0
         assert result["patched"] == 0
         assert result["unchanged"] == 4
 
-    def test_prune_deletes_orphans_in_window(self, monkeypatch, patched_sync_state, fixed_today):
+    def test_prune_deletes_orphans_in_window(self, monkeypatch, fixed_today):
         from google_calendar import client as gcal_client
 
-        # Plan only has Mon-2026-05-11.
         plan_text = """\
 | Day | Date | Workout | Pace target | Notes |
 | Mon | 2026-05-11 | Easy 4mi | x | y |
 """
+        state = _StateStub(plan_text)
         monkeypatch.setattr(gcal_client, "insert_event", lambda p: {"id": p["id"]})
-
-        # Existing managed event for 2026-05-12 (orphan) should be deleted.
-        def _list(*a, **kw):  # noqa: ARG001
-            return [
+        monkeypatch.setattr(
+            gcal_client,
+            "list_managed_events",
+            lambda *a, **kw: [
                 {"id": "pretrain20260511", "start": {"date": "2026-05-11"}},
                 {"id": "pretrain20260512", "start": {"date": "2026-05-12"}},
-            ]
+            ],
+        )
+        deletes: list[str] = []
+        monkeypatch.setattr(gcal_client, "delete_event", lambda eid: deletes.append(eid))
 
-        monkeypatch.setattr(gcal_client, "list_managed_events", _list)
-
-        deletes = []
-
-        def _delete(event_id):
-            deletes.append(event_id)
-
-        monkeypatch.setattr(gcal_client, "delete_event", _delete)
-
-        result = sync.sync_plan(_StubState(plan_text), dry_run=False)
+        result = sync.sync_plan(state, dry_run=False)
         assert result["inserted"] == 1
         assert result["deleted"] == 1
         assert deletes == ["pretrain20260512"]
 
-    def test_detail_only_edit_triggers_patch_on_next_sync(self, monkeypatch, patched_sync_state, fixed_today):
-        """Regression: changing only the #### YYYY-MM-DD body (no table edit)
-        must produce patched=1, unchanged=N-1 on the next sync. The user
-        verified this manually (Tue 5/12 + Sat 5/16) — pin it."""
+    def test_detail_only_edit_triggers_patch_on_next_sync(self, monkeypatch, fixed_today):
         from google_calendar import client as gcal_client
 
         plan_v1 = """\
@@ -418,37 +403,30 @@ v1 detail body
 """
         plan_v2 = plan_v1.replace("v1 detail body", "v2 detail body — refined")
 
+        state = _StateStub(plan_v1)
         monkeypatch.setattr(gcal_client, "insert_event", lambda p: {"id": p["id"]})
         monkeypatch.setattr(gcal_client, "list_managed_events", lambda *a, **kw: [])
 
-        # First sync: both rows inserted.
-        result1 = sync.sync_plan(_StubState(plan_v1), dry_run=False)
+        result1 = sync.sync_plan(state, dry_run=False)
         assert result1["inserted"] == 2
         assert result1["patched"] == 0
 
-        # Second sync: only the detail body changed. The hash for Tue differs
-        # from the stored hash → re-attempts insert (matches real flow); the
-        # event already exists in gcal → 409 → falls through to patch. Mon's
-        # hash unchanged → no API call.
         patches = []
 
-        def _409_on_existing(p):
+        def _409(p):
             raise gcal_client.GcalEventExistsError(f"dup {p['id']}")
 
-        monkeypatch.setattr(gcal_client, "insert_event", _409_on_existing)
-        monkeypatch.setattr(
-            gcal_client,
-            "patch_event",
-            lambda eid, p: patches.append(eid) or {"id": eid},
-        )
+        monkeypatch.setattr(gcal_client, "insert_event", _409)
+        monkeypatch.setattr(gcal_client, "patch_event", lambda eid, p: patches.append(eid) or {"id": eid})
 
-        result2 = sync.sync_plan(_StubState(plan_v2), dry_run=False)
+        state._plan = plan_v2
+        result2 = sync.sync_plan(state, dry_run=False)
         assert result2["patched"] == 1
         assert result2["unchanged"] == 1
         assert result2["errors"] == []
         assert patches == ["pretrain20260512"]
 
-    def test_detail_block_flows_into_inserted_event(self, monkeypatch, patched_sync_state, fixed_today):
+    def test_detail_block_flows_into_inserted_event(self, monkeypatch, fixed_today):
         from google_calendar import client as gcal_client
 
         plan_text = """\
@@ -460,19 +438,20 @@ v1 detail body
 #### 2026-05-12
 Sharpening, not testing. Feel like you could've done one more.
 """
+        state = _StateStub(plan_text)
         captured = []
         monkeypatch.setattr(gcal_client, "insert_event", lambda p: captured.append(p) or {"id": p["id"]})
         monkeypatch.setattr(gcal_client, "list_managed_events", lambda *a, **kw: [])
 
-        result = sync.sync_plan(_StubState(plan_text), dry_run=False)
+        result = sync.sync_plan(state, dry_run=False)
         assert result["inserted"] == 1
         assert len(captured) == 1
         desc = captured[0]["description"]
         assert desc.startswith("Sharpening, not testing.")
-        assert "Pace: 6:00-6:05" not in desc  # rich body replaces table fallback
+        assert "Pace: 6:00-6:05" not in desc
         assert desc.endswith("(synced by PRE)")
 
-    def test_per_row_failure_does_not_abort_batch(self, monkeypatch, patched_sync_state, fixed_today):
+    def test_per_row_failure_does_not_abort_batch(self, monkeypatch, state_stub, fixed_today):
         from google_calendar import client as gcal_client
 
         def _flaky_insert(p):
@@ -483,36 +462,24 @@ Sharpening, not testing. Feel like you could've done one more.
         monkeypatch.setattr(gcal_client, "insert_event", _flaky_insert)
         monkeypatch.setattr(gcal_client, "list_managed_events", lambda *a, **kw: [])
 
-        result = sync.sync_plan(_StubState(PLAN_FIXTURE), dry_run=False)
-        # 4 rows total; 1 fails, 3 succeed.
+        result = sync.sync_plan(state_stub, dry_run=False)
         assert result["inserted"] == 3
-        assert len(result["errors"]) == 1
-        assert result["errors"][0]["date"] == "2026-05-09"
+        # Errors may include the per-row failure and (if any) reconcile noise;
+        # filter for the row error we care about.
+        row_errors = [e for e in result["errors"] if e["date"] == "2026-05-09"]
+        assert len(row_errors) == 1
 
 
 class TestSyncStateRoundtrip:
-    def test_corrupt_state_file_treated_as_empty(self, patched_sync_state):
-        patched_sync_state.write_text("{not json")
-        assert sync._load_sync_state() == {}
+    def test_empty_state_returns_empty_dict(self):
+        state = _StateStub()
+        assert sync._load_sync_state(state) == {}
 
-    def test_write_then_read(self, patched_sync_state):
-        sync._write_sync_state({"pretrain20260511": {"hash": "abc", "last_synced_at": "x"}})
-        loaded = sync._load_sync_state()
+    def test_write_then_read(self):
+        state = _StateStub()
+        sync._write_sync_state(state, {"pretrain20260511": {"hash": "abc", "last_synced_at": "x"}})
+        loaded = sync._load_sync_state(state)
         assert loaded == {"pretrain20260511": {"hash": "abc", "last_synced_at": "x"}}
-
-
-class _CompletionStubState:
-    """StateManager-shaped stub for mark_complete tests."""
-
-    def __init__(self, plan_text: str, sessions: dict[str, list[dict]]):
-        self._plan = plan_text
-        self._sessions = sessions
-
-    def load_plan(self) -> str:
-        return self._plan
-
-    def sessions_on_date(self, d) -> list[dict]:
-        return list(self._sessions.get(d.isoformat(), []))
 
 
 class TestPrescriptionClassifier:
@@ -531,7 +498,6 @@ class TestPrescriptionClassifier:
         assert sync._prescription_kind("Optional 20min spin OR rest") == "cross_train"
 
     def test_run_with_yoga_adjunct_classifies_as_run(self):
-        # "Easy 4mi + restorative yoga" is a run day, not a mobility day.
         assert sync._prescription_kind("Easy 4mi + restorative yoga PM") == "run"
 
 
@@ -551,29 +517,28 @@ class TestLogMatchesPrescription:
         assert not sync._log_matches_prescription("cross_train", "run")
 
 
-class TestMarkComplete:
-    PLAN = """\
+_COMPLETION_PLAN = """\
 | Day | Date | Workout | Pace target | Notes |
 |-----|------|---------|-------------|-------|
 | Sat | 2026-05-09 | Easy 8mi STRICT | 8:30-9:00, HR ≤155 | foo |
 | Mon | 2026-05-11 | Rest + gentle yoga PM | — | Race week |
 """
 
-    def test_matching_run_patches_prescription_event(self, monkeypatch, patched_sync_state):
+
+class TestMarkComplete:
+    def test_matching_run_patches_prescription_event(self, monkeypatch):
         from google_calendar import client as gcal_client
 
-        inserts: list[dict] = []
         patches: list[tuple[str, dict]] = []
-
-        def _insert(p):
-            # First call to insert on this id 409s — gcal already has the event.
-            raise gcal_client.GcalEventExistsError("exists")
-
-        monkeypatch.setattr(gcal_client, "insert_event", _insert)
+        monkeypatch.setattr(
+            gcal_client,
+            "insert_event",
+            lambda p: (_ for _ in ()).throw(gcal_client.GcalEventExistsError("exists")),
+        )
         monkeypatch.setattr(gcal_client, "patch_event", lambda eid, p: patches.append((eid, p)) or {})
 
-        state = _CompletionStubState(
-            self.PLAN,
+        state = _StateStub(
+            _COMPLETION_PLAN,
             {"2026-05-09": [{"date": "2026-05-09", "type": "easy", "miles": 8.1, "pace_avg": "8:42"}]},
         )
         result = sync.mark_complete(state, date(2026, 5, 9))
@@ -590,44 +555,36 @@ class TestMarkComplete:
         assert payload["extendedProperties"]["private"]["pre_completed"] == "1"
         assert "--- Completed ---" in payload["description"]
         assert "8.1mi" in payload["description"]
-        assert inserts == []  # only patch was used (after 409)
 
-    def test_off_plan_strength_on_run_day_does_not_mark_prescription(self, monkeypatch, patched_sync_state):
+    def test_off_plan_strength_on_run_day_does_not_mark_prescription(self, monkeypatch):
         from google_calendar import client as gcal_client
 
         inserts: list[dict] = []
         monkeypatch.setattr(gcal_client, "insert_event", lambda p: inserts.append(p) or {})
         monkeypatch.setattr(gcal_client, "patch_event", lambda eid, p: None)
 
-        state = _CompletionStubState(
-            self.PLAN,
-            {"2026-05-09": [{"date": "2026-05-09", "type": "strength"}]},
-        )
+        state = _StateStub(_COMPLETION_PLAN, {"2026-05-09": [{"date": "2026-05-09", "type": "strength"}]})
         result = sync.mark_complete(state, date(2026, 5, 9))
 
-        # Off-plan event created; prescription event untouched.
         assert "prescribed" not in result
         assert result["off_plan"]["action"] == "inserted"
         assert result["off_plan"]["event_id"] == "precomplete20260509"
         assert len(inserts) == 1
         assert inserts[0]["id"] == "precomplete20260509"
 
-    def test_aggregates_multiple_sessions_on_one_day(self, monkeypatch, patched_sync_state):
+    def test_aggregates_multiple_sessions_on_one_day(self, monkeypatch):
         from google_calendar import client as gcal_client
 
         captured: list[tuple[str, dict]] = []
-
-        def _patch(eid, p):
-            captured.append((eid, p))
-            return {}
-
         monkeypatch.setattr(
-            gcal_client, "insert_event", lambda p: (_ for _ in ()).throw(gcal_client.GcalEventExistsError("x"))
+            gcal_client,
+            "insert_event",
+            lambda p: (_ for _ in ()).throw(gcal_client.GcalEventExistsError("x")),
         )
-        monkeypatch.setattr(gcal_client, "patch_event", _patch)
+        monkeypatch.setattr(gcal_client, "patch_event", lambda eid, p: captured.append((eid, p)) or {})
 
-        state = _CompletionStubState(
-            self.PLAN,
+        state = _StateStub(
+            _COMPLETION_PLAN,
             {
                 "2026-05-11": [
                     {"date": "2026-05-11", "type": "strength"},
@@ -635,34 +592,29 @@ class TestMarkComplete:
                 ]
             },
         )
-        # 2026-05-11 prescription is Rest — both entries are off-plan.
         result = sync.mark_complete(state, date(2026, 5, 11))
         assert "prescribed" not in result
         assert result["off_plan"]["action"] == "patched"
         eid, payload = captured[0]
         assert eid == "precomplete20260511"
         desc = payload["description"]
-        # Both sessions appear in the actuals block.
         assert "strength" in desc
         assert "cross_train" in desc
         assert "12.0mi" in desc
 
-    def test_cleans_up_stale_precomplete_when_log_reclassifies_to_matching(self, monkeypatch, patched_sync_state):
-        """When a prior mark_complete call wrongly classified an activity as
-        off-plan and a later call correctly classifies the same date as
-        matching, the orphan precomplete<YYYYMMDD> event must be deleted —
-        otherwise the user sees a duplicate ✅ event on the same day."""
+    def test_cleans_up_stale_precomplete_when_log_reclassifies_to_matching(self, monkeypatch):
         from google_calendar import client as gcal_client
 
-        # Seed sync state as if an earlier off-plan classification ran.
+        state = _StateStub(_COMPLETION_PLAN)
         sync._write_sync_state(
+            state,
             {
                 "precomplete20260509": {
                     "completed": True,
                     "off_plan": True,
                     "last_completed_at": "2026-05-09T17:00:00Z",
                 }
-            }
+            },
         )
 
         deletes: list[str] = []
@@ -670,54 +622,171 @@ class TestMarkComplete:
         monkeypatch.setattr(gcal_client, "patch_event", lambda eid, p: {"id": eid})
         monkeypatch.setattr(gcal_client, "delete_event", lambda eid: deletes.append(eid))
 
-        state = _CompletionStubState(
-            self.PLAN,
-            {"2026-05-09": [{"date": "2026-05-09", "type": "easy", "miles": 8.0}]},
-        )
+        state._sessions = {"2026-05-09": [{"date": "2026-05-09", "type": "easy", "miles": 8.0}]}
         result = sync.mark_complete(state, date(2026, 5, 9))
 
         assert result["prescribed"]["action"] in ("inserted", "patched")
         assert result.get("off_plan_cleanup") == "deleted"
         assert deletes == ["precomplete20260509"]
-        # And the stale entry is dropped from sync state.
-        state_after = sync._load_sync_state()
+        state_after = sync._load_sync_state(state)
         assert "precomplete20260509" not in state_after
 
-    def test_sync_plan_skips_completed_events(self, monkeypatch, patched_sync_state):
-        """After mark_complete sets `completed: true`, a re-sync of plan.md
-        must NOT patch the prescription event back to its uncompleted form."""
+    def test_sync_plan_skips_completed_events(self, monkeypatch):
         from google_calendar import client as gcal_client
 
-        # Seed sync state as if completion already happened.
+        state = _StateStub(_COMPLETION_PLAN)
         sync._write_sync_state(
+            state,
             {
                 "pretrain20260509": {
                     "hash": "stale-hash",
                     "completed": True,
                     "last_completed_at": "2026-05-09T18:00:00Z",
                 }
-            }
+            },
         )
 
-        completed_ids_touched: list[str] = []
-
-        def _insert(p):
-            if p["id"] == "pretrain20260509":
-                completed_ids_touched.append(p["id"])
-            return {"id": p["id"]}
-
-        def _patch(eid, p):
-            if eid == "pretrain20260509":
-                completed_ids_touched.append(eid)
-            return {"id": eid}
-
-        monkeypatch.setattr(gcal_client, "insert_event", _insert)
-        monkeypatch.setattr(gcal_client, "patch_event", _patch)
+        touched: list[str] = []
+        monkeypatch.setattr(
+            gcal_client,
+            "insert_event",
+            lambda p: (touched.append(p["id"]) if p["id"] == "pretrain20260509" else None) or {"id": p["id"]},
+        )
+        monkeypatch.setattr(
+            gcal_client,
+            "patch_event",
+            lambda eid, p: (touched.append(eid) if eid == "pretrain20260509" else None) or {"id": eid},
+        )
         monkeypatch.setattr(gcal_client, "list_managed_events", lambda *a, **kw: [])
         monkeypatch.setattr(sync, "today_local", lambda: date(2026, 5, 11))
 
-        result = sync.sync_plan(_StubState(self.PLAN), dry_run=False)
-        # The completed row is left alone; the rest day row still syncs.
-        assert completed_ids_touched == []
+        result = sync.sync_plan(state, dry_run=False)
+        assert touched == []
         assert result["unchanged"] == 1  # the completed row
         assert result["inserted"] == 1  # the 05-11 row
+
+
+# ---------------- reconcile_completion ----------------
+
+
+class TestReconcileCompletion:
+    PLAN = """\
+| Day | Date | Workout | Pace target | Notes |
+|-----|------|---------|-------------|-------|
+| Sat | 2026-05-09 | Easy 8mi | 8:30 | a |
+| Mon | 2026-05-11 | Rest + yoga | — | b |
+| Tue | 2026-05-12 | Easy 5mi | 8:30 | c |
+"""
+
+    def test_marks_dates_with_matching_logs(self, monkeypatch, fixed_today):
+        from google_calendar import client as gcal_client
+
+        monkeypatch.setattr(
+            gcal_client,
+            "insert_event",
+            lambda p: (_ for _ in ()).throw(gcal_client.GcalEventExistsError("x")),
+        )
+        patches: list[str] = []
+        monkeypatch.setattr(gcal_client, "patch_event", lambda eid, p: patches.append(eid) or {})
+
+        state = _StateStub(
+            self.PLAN,
+            {"2026-05-09": [{"date": "2026-05-09", "type": "easy", "miles": 8.0}]},
+        )
+        out = sync.reconcile_completion(state, days_back=14)
+
+        assert len(out["corrected"]) == 1
+        assert out["corrected"][0]["date"] == "2026-05-09"
+        assert out["corrected"][0]["prescribed"] is True
+        assert "pretrain20260509" in patches
+
+    def test_skips_dates_without_logs(self, monkeypatch, fixed_today):
+        from google_calendar import client as gcal_client
+
+        monkeypatch.setattr(gcal_client, "insert_event", lambda p: {"id": p["id"]})
+        monkeypatch.setattr(gcal_client, "patch_event", lambda eid, p: {"id": eid})
+
+        state = _StateStub(self.PLAN, {})  # no log entries
+        out = sync.reconcile_completion(state, days_back=14)
+
+        assert out["corrected"] == []
+        # All three plan dates in window have no sessions → all skipped.
+        assert set(out["skipped"]) == {"2026-05-09", "2026-05-11"}  # 05-12 > today
+
+    def test_already_completed_short_circuits_no_api_calls(self, monkeypatch, fixed_today):
+        """When sync_state already says completed, reconcile must NOT re-fire
+        mark_complete — saves a gcal insert+patch round-trip per date per sync."""
+        from google_calendar import client as gcal_client
+
+        state = _StateStub(
+            self.PLAN,
+            {"2026-05-09": [{"date": "2026-05-09", "type": "easy", "miles": 8.0}]},
+        )
+        sync._write_sync_state(
+            state,
+            {
+                "pretrain20260509": {
+                    "hash": "h",
+                    "completed": True,
+                    "last_completed_at": "2026-05-09T18:00:00Z",
+                }
+            },
+        )
+
+        def _boom_insert(_p):
+            raise AssertionError("reconcile must not insert when already completed")
+
+        def _boom_patch(_eid, _p):
+            raise AssertionError("reconcile must not patch when already completed")
+
+        monkeypatch.setattr(gcal_client, "insert_event", _boom_insert)
+        monkeypatch.setattr(gcal_client, "patch_event", _boom_patch)
+
+        out = sync.reconcile_completion(state, days_back=14)
+        assert out["corrected"] == []
+        assert "2026-05-09" in out["already_complete"]
+        # Completed flag preserved
+        assert state.gcal_sync["pretrain20260509"]["completed"] is True
+
+    def test_orphan_surfaced_not_uncompleted(self, monkeypatch, fixed_today):
+        from google_calendar import client as gcal_client
+
+        # gcal sync state claims completed for a date with NO log entries.
+        state = _StateStub(self.PLAN, {})  # no logs at all
+        sync._write_sync_state(
+            state,
+            {
+                "pretrain20260509": {
+                    "hash": "h",
+                    "completed": True,
+                    "last_completed_at": "2026-05-09T18:00:00Z",
+                }
+            },
+        )
+
+        monkeypatch.setattr(gcal_client, "insert_event", lambda p: {"id": p["id"]})
+        monkeypatch.setattr(gcal_client, "patch_event", lambda eid, p: {"id": eid})
+
+        out = sync.reconcile_completion(state, days_back=14)
+        assert any(o["event_id"] == "pretrain20260509" for o in out["orphans"])
+        # Did NOT modify the gcal_sync_state to uncomplete
+        assert state.gcal_sync["pretrain20260509"]["completed"] is True
+
+    def test_rest_day_with_run_log_classified_off_plan(self, monkeypatch, fixed_today):
+        """Logging a run on a Rest day → mark_complete partitions to off_plan,
+        not prescribed. Reconcile inherits that."""
+        from google_calendar import client as gcal_client
+
+        inserts: list[dict] = []
+        monkeypatch.setattr(gcal_client, "insert_event", lambda p: inserts.append(p) or {"id": p["id"]})
+        monkeypatch.setattr(gcal_client, "patch_event", lambda eid, p: {"id": eid})
+
+        state = _StateStub(
+            self.PLAN,
+            {"2026-05-11": [{"date": "2026-05-11", "type": "easy", "miles": 4.0}]},  # logged on a rest day
+        )
+        out = sync.reconcile_completion(state, days_back=14)
+        # Date is corrected, but it's an off_plan completion, not prescribed.
+        [entry] = [c for c in out["corrected"] if c["date"] == "2026-05-11"]
+        assert entry["prescribed"] is False
+        assert entry["off_plan"] is True

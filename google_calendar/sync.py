@@ -29,11 +29,8 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import os
 import re
-import tempfile
 from datetime import date, datetime, timedelta, timezone
-from pathlib import Path
 from typing import Optional
 
 from temporal_context import today_local
@@ -47,8 +44,9 @@ logger = logging.getLogger("pre_coach.gcal.sync")
 PRUNE_WINDOW_DAYS = 60
 _PRUNE_TZ_BUFFER_DAYS = 1
 
-# Local sync state file: maps event_id -> {hash, last_synced_at}.
-SYNC_STATE_FILE = Path(__file__).resolve().parent.parent / "state" / ".gcal_sync_state.json"
+# Sync state now lives in the SQLite gcal_sync_state table — see StateManager.
+# The helpers `_load_sync_state` / `_write_sync_state` below preserve the
+# old dict-shaped API so the rest of this module is unchanged.
 
 _BOLD_RE = re.compile(r"\*\*(.+?)\*\*")
 _ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -73,7 +71,7 @@ def sync_plan(state, dry_run: bool = False) -> dict:
     plan_text = state.load_plan()
     rows = _parse_plan_rows(plan_text)
     details = _parse_workout_details(plan_text)
-    sync_state = _load_sync_state()
+    sync_state = _load_sync_state(state)
     new_sync_state: dict[str, dict] = {}
 
     counts = {"inserted": 0, "patched": 0, "deleted": 0, "unchanged": 0}
@@ -169,14 +167,26 @@ def sync_plan(state, dry_run: bool = False) -> dict:
 
     if not dry_run:
         try:
-            _write_sync_state(new_sync_state)
+            _write_sync_state(state, new_sync_state)
         except Exception as e:
             errors.append({"date": "sync_state", "error": f"write: {type(e).__name__}: {e}"})
+
+    # Self-heal: walk recent plan rows + log entries and re-fire mark_complete
+    # wherever the log shows a session but sync state doesn't yet reflect
+    # completion. Idempotent — mark_complete short-circuits on already-marked
+    # rows. Best-effort: failure here never breaks the sync result.
+    reconcile_summary: Optional[dict] = None
+    if not dry_run:
+        try:
+            reconcile_summary = reconcile_completion(state)
+        except Exception as e:
+            errors.append({"date": "reconcile", "error": f"{type(e).__name__}: {e}"})
 
     return {
         **counts,
         "errors": errors,
         "dry_run": dry_run,
+        "reconcile": reconcile_summary,
     }
 
 
@@ -522,7 +532,7 @@ def mark_complete(state, log_date) -> dict:
 
     from . import client
 
-    sync_state = _load_sync_state()
+    sync_state = _load_sync_state(state)
     prescribed_id = _event_id(log_date.isoformat())
     offplan_id = _completion_event_id(log_date.isoformat())
 
@@ -564,7 +574,7 @@ def mark_complete(state, log_date) -> dict:
                 logger.warning("Failed to delete stale off-plan event %s: %s", offplan_id, e)
 
     try:
-        _write_sync_state(sync_state)
+        _write_sync_state(state, sync_state)
     except Exception as e:
         result["sync_state_error"] = f"{type(e).__name__}: {e}"
 
@@ -596,38 +606,22 @@ def _apply_completed_event(client_mod, event_id: str, payload: dict) -> dict:
 # ---------- sync-state file ----------
 
 
-def _load_sync_state() -> dict[str, dict]:
-    if not SYNC_STATE_FILE.exists():
-        return {}
+def _load_sync_state(state) -> dict[str, dict]:
+    """Load the per-event sync state via StateManager.
+
+    Corruption / DB errors are self-healing: return ``{}`` and let the next
+    sync re-check everything via the 409 path. We log the failure so it's
+    visible without breaking the call.
+    """
     try:
-        data = json.loads(SYNC_STATE_FILE.read_text(encoding="utf-8"))
-        if isinstance(data, dict):
-            return data
-        logger.warning("Sync state file %s is not a dict; ignoring", SYNC_STATE_FILE)
-        return {}
-    except (OSError, json.JSONDecodeError) as e:
-        # Corruption is self-healing — next sync re-checks everything via 409.
-        logger.warning("Could not read sync state %s: %s", SYNC_STATE_FILE, e)
+        return state.load_gcal_sync_state()
+    except Exception as e:  # noqa: BLE001 — never let storage hiccup break sync
+        logger.warning("Could not read gcal sync state: %s", e)
         return {}
 
 
-def _write_sync_state(state: dict[str, dict]) -> None:
-    SYNC_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_path = tempfile.mkstemp(
-        dir=SYNC_STATE_FILE.parent,
-        prefix=f".{SYNC_STATE_FILE.name}.",
-        suffix=".tmp",
-    )
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(json.dumps(state, indent=2, sort_keys=True))
-        os.replace(tmp_path, SYNC_STATE_FILE)
-    except Exception:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
+def _write_sync_state(state, sync_state: dict[str, dict]) -> None:
+    state.save_gcal_sync_state(sync_state)
 
 
 def _now_iso() -> str:
@@ -641,20 +635,130 @@ def _iso_z(d: date) -> str:
     return f"{d.isoformat()}T00:00:00Z"
 
 
-def get_last_sync_summary() -> Optional[dict]:
-    """Return a small summary of the on-disk sync state (for status tooling).
+def get_last_sync_summary(state=None) -> Optional[dict]:
+    """Return a small summary of the gcal sync state (for status tooling).
 
-    {count: N, last_synced_at: <max iso>, file: <path>} or None if absent.
+    {count: N, last_synced_at: <max iso>, source: 'sqlite'} or None if absent.
+    Constructs a default ``StateManager`` if one isn't passed (status endpoints
+    don't always have one wired through).
     """
-    state = _load_sync_state()
-    if not state:
+    if state is None:
+        from state_manager import StateManager
+
+        state = StateManager()
+    sync_state = _load_sync_state(state)
+    if not sync_state:
         return None
     last_at = max(
-        (v.get("last_synced_at") for v in state.values() if isinstance(v, dict)),
+        (v.get("last_synced_at") for v in sync_state.values() if isinstance(v, dict) and v.get("last_synced_at")),
         default=None,
     )
     return {
-        "count": len(state),
+        "count": len(sync_state),
         "last_synced_at": last_at,
-        "file": str(SYNC_STATE_FILE),
+        "source": "sqlite",
     }
+
+
+# ---------- reconcile_completion ----------
+
+
+def reconcile_completion(state, days_back: int = 14) -> dict:
+    """Walk recent plan rows + log entries; ensure gcal completion matches reality.
+
+    For every plan-row date inside the ``days_back`` window that has at least
+    one logged session and isn't already marked complete in sync state, fire
+    ``mark_complete``. Skipping already-completed dates is the API-idempotency
+    win — mark_complete is safe to re-fire (the sentinel preserves state) but
+    each call costs a gcal insert+patch round-trip.
+
+    Orphan detection (gcal says completed but the log has no matching session)
+    is surfaced as a warning. We never uncomplete an event by default — that
+    would erase history if a log entry was accidentally deleted.
+    """
+    today = today_local()
+    cutoff = today - timedelta(days=days_back)
+    rows = _parse_plan_rows(state.load_plan())
+    sync_state = _load_sync_state(state)
+
+    corrected: list[dict] = []
+    skipped: list[str] = []
+    already_complete: list[str] = []
+    errors: list[dict] = []
+
+    for row in rows:
+        try:
+            d = date.fromisoformat(row["date"])
+        except ValueError:
+            continue
+        if not (cutoff <= d <= today):
+            continue
+        if not state.sessions_on_date(d):
+            skipped.append(row["date"])
+            continue
+        prescribed_id = _event_id(row["date"])
+        if sync_state.get(prescribed_id, {}).get("completed"):
+            already_complete.append(row["date"])
+            continue
+        try:
+            outcome = mark_complete(state, d)
+            corrected.append(
+                {
+                    "date": row["date"],
+                    "kind": outcome.get("prescription_kind"),
+                    "prescribed": bool(outcome.get("prescribed")),
+                    "off_plan": bool(outcome.get("off_plan")),
+                }
+            )
+        except Exception as e:  # noqa: BLE001 — individual date failure shouldn't kill reconcile
+            errors.append({"date": row["date"], "error": f"{type(e).__name__}: {e}"})
+
+    orphans = _find_orphan_completions(state, cutoff, today)
+
+    summary = {
+        "days_back": days_back,
+        "corrected": corrected,
+        "skipped": skipped,
+        "already_complete": already_complete,
+        "orphans": orphans,
+        "errors": errors,
+    }
+    logger.info(
+        "reconcile_completion: corrected=%d already=%d skipped=%d orphans=%d errors=%d",
+        len(corrected),
+        len(already_complete),
+        len(skipped),
+        len(orphans),
+        len(errors),
+    )
+    return summary
+
+
+def _find_orphan_completions(state, cutoff: date, today: date) -> list[dict]:
+    """Return events marked ``completed: True`` in sync state whose date has
+    no matching log entry. Caller treats as warnings — no mutation here."""
+    out: list[dict] = []
+    sync_state = _load_sync_state(state)
+    for event_id, entry in sync_state.items():
+        if not isinstance(entry, dict) or not entry.get("completed"):
+            continue
+        d = _date_from_event_id(event_id)
+        if d is None or not (cutoff <= d <= today):
+            continue
+        if state.sessions_on_date(d):
+            continue
+        out.append({"event_id": event_id, "date": d.isoformat()})
+    return out
+
+
+def _date_from_event_id(event_id: str) -> Optional[date]:
+    """Parse YYYYMMDD suffix from pretrain/precomplete event IDs."""
+    for prefix in ("pretrain", "precomplete"):
+        if event_id.startswith(prefix):
+            digits = event_id[len(prefix) :]
+            if len(digits) == 8 and digits.isdigit():
+                try:
+                    return date(int(digits[:4]), int(digits[4:6]), int(digits[6:8]))
+                except ValueError:
+                    return None
+    return None

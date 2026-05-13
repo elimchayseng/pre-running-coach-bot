@@ -68,17 +68,40 @@ Short-term conversation history lives in Redis (~10 turns, 2-hour TTL). Long-ter
 - **External integrations**: Strava (webhook + REST), Google Calendar (REST, write-only)
 - **Deployment**: Railway via gunicorn (`Procfile`)
 
-## State files
+## State
 
-| File | Contents |
-|------|----------|
-| `athlete.yaml` | identity, target races, PRs, pace + HR zones, preferences, injury history, race history, strength + PT routines |
-| `plan.md` | current training block; locked `\| Day \| Date \| Workout \| Pace target \| Notes \|` weekly table (parsed by `/today` and the calendar sync) |
-| `log.jsonl` | one session per line: date, type, miles, pace_avg, hr_avg, rpe, notes, details{splits, laps, strava_id, elevation, best efforts} |
-| `journal.md` | freeform timestamped notes (sleep, stress, travel, decisions) |
-| `plan_changelog.md` | append-only log of plan edits + reasons |
+All bot/agent state lives in a single SQLite database (`state/coach.db` locally, mounted on a Railway persistent volume in prod). Tables map 1:1 to the legacy file layout:
 
-`state/` is gitignored — keep it local or in a separate private repo. Full schema reference: [docs/state-schema.md](docs/state-schema.md).
+| Table | Replaces | Contents |
+|-------|----------|----------|
+| `athlete` | `athlete.yaml` | identity, target races, PRs, pace + HR zones, preferences, injury history. YAML text preserved verbatim for round-trip via ruamel. |
+| `plan` | `plan.md` | current training block; locked `\| Day \| Date \| Workout \| Pace target \| Notes \|` weekly table (parsed by `/today` and the calendar sync) |
+| `plan_changelog` | `plan_changelog.md` | append-only log of plan edits + reasons |
+| `sessions` | `log.jsonl` | one row per session; `data` JSON column preserves the full entry shape. Partial UNIQUE index on `details.strava_id` enforces webhook idempotency. |
+| `journal` | `journal.md` | freeform timestamped notes |
+| `gcal_sync_state` | `.gcal_sync_state.json` | per-event sync metadata for the calendar integration |
+
+Schema: [`state/schema.sql`](state/schema.sql). Full reference: [docs/state-schema.md](docs/state-schema.md).
+
+### Inspecting state
+
+```bash
+# Local
+sqlite3 state/coach.db 'SELECT date, type, miles FROM sessions ORDER BY date DESC LIMIT 20'
+python scripts/state_dump.py log --since 2026-05-01
+python scripts/state_dump.py --all
+
+# Prod (Railway): one-shot query
+railway ssh "sqlite3 /app/data/coach.db 'SELECT date, type FROM sessions ORDER BY date DESC LIMIT 20'"
+
+# Prod: pull the full DB down for offline inspection / TablePlus / diffing
+./scripts/state_pull.sh -o /tmp/prod-coach.db
+sqlite3 /tmp/prod-coach.db
+```
+
+### Backups
+
+A daily Railway scheduled job runs `scripts/backup_db.py`, which uses SQLite's online-backup API to snapshot the DB and pushes it to a `state-snapshot` branch on GitHub. See the "Deploy" section for the env vars and cron setup.
 
 ## Prerequisites
 
@@ -100,7 +123,13 @@ pip install -r requirements.txt
 cp .env.example .env       # fill in your keys
 ```
 
-Then create your `state/athlete.yaml` and `state/plan.md`. See the example shapes in [docs/state-schema.md](docs/state-schema.md) and the schema descriptions in `tools/state.py`.
+Then seed your local DB from the example state files committed in `state/`:
+
+```bash
+python scripts/migrate_state_to_sqlite.py state --db state/coach.db --reset
+```
+
+Singleton blobs (plan, athlete, journal) are upserted on every run so re-running picks up edits to `state/plan.md` / `state/athlete.yaml`. The `--reset` flag wipes the `sessions` table — use it for the first seed only. Without `--reset`, sessions dedupe by strava_id (UNIQUE index) and identical-row content (so weekly_summary entries don't double). See the example shapes in [docs/state-schema.md](docs/state-schema.md) and the schema in `state/schema.sql`.
 
 ## Environment variables
 
@@ -117,6 +146,7 @@ Then create your `state/athlete.yaml` and `state/plan.md`. See the example shape
 
 | Var | Purpose |
 |-----|---------|
+| `DATABASE_PATH` | SQLite file path (default `state/coach.db`). On Railway set to `/app/data/coach.db` with a volume mounted at `/app/data`. |
 | `HEROKU_MODEL` | Override the default model (`claude-sonnet-4-6`) |
 | `WEBHOOK_URL` | Deployed app URL — used to register the Telegram webhook on startup |
 | `TELEGRAM_WEBHOOK_SECRET` | Optional shared secret for verifying Telegram requests |
@@ -213,7 +243,7 @@ Backfill historical activities (idempotent, supports time windows + dry-run):
 
 Push the weekly table from `plan.md` into a dedicated "PRE Training" Google Calendar so workouts show up on your phone alongside everything else (with gcal's native fan-out to Apple Calendar / smartwatches). For quality sessions and races, the per-day `#### YYYY-MM-DD` detail block from `plan.md` gets synced verbatim into the event description — so on race morning you can pull up the event and see your pacing plan, checkpoints, and execution cues without opening a separate app.
 
-Architecture: one-way write only (bot → gcal). The agent calls `sync_plan_to_calendar` once at the end of any turn that edited the plan. A local sync-state file (`state/.gcal_sync_state.json`) tracks per-event hashes so reruns are no-ops when nothing has changed. Stale `pre_managed` events in a ±60d window get pruned automatically.
+Architecture: one-way write only (bot → gcal). The agent calls `sync_plan_to_calendar` once at the end of any turn that edited the plan. The `gcal_sync_state` table tracks per-event hashes so reruns are no-ops when nothing has changed. Stale `pre_managed` events in a ±60d window get pruned automatically. Each sync also runs `reconcile_completion` against the last 14 days of logs so any session that should have been marked complete (but wasn't, e.g. webhook fired before a feature shipped) self-heals.
 
 One-time GCP setup (manual):
 1. Google Cloud Console → enable the Google Calendar API
@@ -252,13 +282,24 @@ Deploy to Railway with the included `Procfile`:
 1. Create a new project on [Railway](https://railway.app)
 2. Connect your GitHub repo
 3. Add environment variables from `.env.example`
-4. Railway will auto-detect the `Procfile` and deploy
+4. **Mount a persistent volume at `/app/data`** (Settings → Volumes → New Volume). 1 GB is plenty. This is where `coach.db` lives — without it, every deploy wipes your logs, plan edits, and athlete profile.
+5. Set `DATABASE_PATH=/app/data/coach.db` in the Railway env.
+6. Set `STRAVA_TOKENS_BACKEND=redis` and `GCAL_TOKENS_BACKEND=redis` (the filesystem outside the volume is ephemeral).
+7. After the first deploy with the volume attached, seed the DB once:
 
-State files are not included in the deploy by default (gitignored). Either:
-- Keep state in a private companion repo and clone on deploy, or
-- Use a Railway volume mounted at `state/`.
+```bash
+railway shell --service web
+python scripts/migrate_state_to_sqlite.py /app/state --db /app/data/coach.db --reset
+```
 
-For Strava / Google Calendar on Railway, set `STRAVA_TOKENS_BACKEND=redis` and `GCAL_TOKENS_BACKEND=redis` — the filesystem is ephemeral.
+   The bundled `/app/state/*` files in the image are read once to seed the DB, then ignored. The volume's `/app/data/coach.db` is the runtime source of truth from that point on.
+
+8. (Recommended) Wire up the daily backup as a Railway scheduled job:
+   - **Schedule**: `0 11 * * *` (UTC; adjust to a low-traffic hour)
+   - **Start command**: `python scripts/backup_db.py`
+   - **Env vars**: `DATABASE_PATH`, `GITHUB_BACKUP_TOKEN` (PAT with repo write), `GITHUB_REPO` (e.g. `you/pre-running-coach-bot`). Optional: `BACKUP_BRANCH` (default `state-snapshot`), `BACKUP_FORMAT` (default `binary`).
+
+**Important — single worker only.** SQLite-on-volume tolerates many threads but only one writer process. `Procfile` ships with `gunicorn app:app` (default 1 worker); leave it alone. If you ever need multiple processes, migrate to Postgres rather than bumping workers.
 
 ## Tests
 

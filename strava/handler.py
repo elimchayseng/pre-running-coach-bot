@@ -7,6 +7,7 @@ HTTP response can return 200 within Strava's 2-second window.
 from __future__ import annotations
 
 import logging
+import sqlite3
 from pathlib import Path
 from typing import Optional
 
@@ -112,7 +113,10 @@ def handle_event(payload: dict) -> None:
 
 
 def _handle_create(state: StateManager, activity_id: int) -> None:
-    # Idempotency: if we already logged this activity, skip.
+    # Optimistic pre-check: avoids a Strava API fetch when we've already logged
+    # this activity. The DB's UNIQUE index on details.strava_id is the
+    # authoritative dedup — even if two webhooks race past this check, only
+    # one append_session will succeed.
     if activity_id in state.existing_strava_ids():
         logger.info(f"Strava activity {activity_id} already logged; skipping")
         return
@@ -124,6 +128,11 @@ def _handle_create(state: StateManager, activity_id: int) -> None:
     try:
         state.append_session(entry)
         logger.info(f"Logged Strava activity {activity_id}: {entry.get('miles')}mi {entry.get('type')}")
+    except sqlite3.IntegrityError:
+        # Lost the race against a concurrent webhook for the same activity.
+        # The other thread won; nothing to do here.
+        logger.info(f"Strava activity {activity_id} raced to insert; skipping")
+        return
     except Exception as e:
         logger.error(f"Failed to append session for activity {activity_id}: {e}")
         return

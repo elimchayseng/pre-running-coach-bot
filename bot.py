@@ -1,8 +1,8 @@
 """PRE Telegram handlers.
 
 Slash commands (no agent round-trip): /start, /help, /today, /plan, /log,
-/race, /reset, /health. Free-text messages route to companion.chat which
-runs the full tool-use loop.
+/race, /reset, /health, /reconcile. Free-text messages route to
+companion.chat which runs the full tool-use loop.
 """
 
 from __future__ import annotations
@@ -121,6 +121,49 @@ async def health_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     results = run_health_checks()
     lines = [f"{component.capitalize()}: {'OK' if ok else 'FAIL'}" for component, ok in results.items()]
     await update.message.reply_text("Health Check:\n" + "\n".join(lines))
+
+
+async def reconcile_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Walk recent logs and re-mark gcal completion. Optional arg: days (default 14)."""
+    days = 14
+    if context.args:
+        try:
+            days = int(context.args[0])
+        except ValueError:
+            pass
+
+    from google_calendar import sync
+
+    try:
+        summary = sync.reconcile_completion(_get_state(), days_back=days)
+    except Exception as e:
+        logger.error(f"reconcile failed: {e}")
+        await update.message.reply_text(f"Reconcile failed: {type(e).__name__}: {e}")
+        return
+
+    corrected = summary["corrected"]
+    orphans = summary["orphans"]
+    errors = summary["errors"]
+    lines = [
+        f"Reconcile (last {days} days):",
+        f"  corrected: {len(corrected)}",
+        f"  skipped (no log): {len(summary['skipped'])}",
+        f"  orphans (completed in gcal, no log): {len(orphans)}",
+        f"  errors: {len(errors)}",
+    ]
+    if corrected:
+        lines.append("\nCorrected:")
+        for c in corrected[:10]:
+            lines.append(f"  {c['date']} ({c['kind']})")
+    if orphans:
+        lines.append("\nOrphans (review manually):")
+        for o in orphans[:10]:
+            lines.append(f"  {o['date']} → {o['event_id']}")
+    if errors:
+        lines.append("\nErrors:")
+        for e in errors[:5]:
+            lines.append(f"  {e['date']}: {e['error']}")
+    await update.message.reply_text("\n".join(lines))
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
