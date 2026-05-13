@@ -592,9 +592,7 @@ class TestMarkComplete:
         assert "8.1mi" in payload["description"]
         assert inserts == []  # only patch was used (after 409)
 
-    def test_off_plan_strength_on_run_day_does_not_mark_prescription(
-        self, monkeypatch, patched_sync_state
-    ):
+    def test_off_plan_strength_on_run_day_does_not_mark_prescription(self, monkeypatch, patched_sync_state):
         from google_calendar import client as gcal_client
 
         inserts: list[dict] = []
@@ -649,9 +647,7 @@ class TestMarkComplete:
         assert "cross_train" in desc
         assert "12.0mi" in desc
 
-    def test_cleans_up_stale_precomplete_when_log_reclassifies_to_matching(
-        self, monkeypatch, patched_sync_state
-    ):
+    def test_cleans_up_stale_precomplete_when_log_reclassifies_to_matching(self, monkeypatch, patched_sync_state):
         """When a prior mark_complete call wrongly classified an activity as
         off-plan and a later call correctly classifies the same date as
         matching, the orphan precomplete<YYYYMMDD> event must be deleted —

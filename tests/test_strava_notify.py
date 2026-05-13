@@ -182,9 +182,7 @@ class TestSendActivityPing:
         mirrored = []
         import conversation_store
 
-        monkeypatch.setattr(
-            conversation_store, "add_turn", lambda role, content: mirrored.append((role, content))
-        )
+        monkeypatch.setattr(conversation_store, "add_turn", lambda role, content: mirrored.append((role, content)))
 
         assert notify.send_activity_ping(entry) is True
         assert len(mirrored) == 1
@@ -207,9 +205,7 @@ class TestSendActivityPing:
         mirrored = []
         import conversation_store
 
-        monkeypatch.setattr(
-            conversation_store, "add_turn", lambda role, content: mirrored.append((role, content))
-        )
+        monkeypatch.setattr(conversation_store, "add_turn", lambda role, content: mirrored.append((role, content)))
 
         assert notify.send_activity_ping(entry) is False
         assert mirrored == []  # nothing actually got sent; nothing to mirror

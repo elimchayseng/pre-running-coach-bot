@@ -446,9 +446,7 @@ def _build_completed_payload(
         actuals_lines.append("✓ " + _format_actual(e))
     actuals_block = "\n".join(actuals_lines)
 
-    full_desc = (
-        prescription_desc + "\n\n" + actuals_block if prescription_desc else actuals_block
-    )
+    full_desc = prescription_desc + "\n\n" + actuals_block if prescription_desc else actuals_block
     full_desc = _clamp_description(full_desc) + "\n\n(marked complete by PRE)"
 
     summary = "✅ " + _strip_bold(workout_text)
