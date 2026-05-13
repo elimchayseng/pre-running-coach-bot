@@ -128,6 +128,8 @@ def _handle_create(state: StateManager, activity_id: int) -> None:
         logger.error(f"Failed to append session for activity {activity_id}: {e}")
         return
 
+    _mark_calendar_complete(state, entry)
+
     # Runs get LLM analysis vs. today's plan; other activity types still get
     # the deterministic templated ping. If the review fails for any reason,
     # fall back to the templated ping so the user always hears something.
@@ -160,10 +162,30 @@ def _handle_update(state: StateManager, activity_id: int) -> None:
 
     if replaced:
         logger.info(f"Updated Strava activity {activity_id}: now {entry.get('type')} {entry.get('miles')}mi")
+        # A retag (e.g., Run → Workout) can flip the day from on-plan to
+        # off-plan or vice versa; re-run completion so the calendar reflects
+        # the new partitioning.
+        _mark_calendar_complete(state, entry)
     else:
         # Race: we saw it in existing_strava_ids() above but missed it on
         # rewrite. Unusual but not fatal.
         logger.warning(f"Update event for activity {activity_id}: entry not found on rewrite")
+
+
+def _mark_calendar_complete(state: StateManager, entry: dict) -> None:
+    """Best-effort: mark the day's Google Calendar event(s) complete after a
+    Strava log write. Never raises — a gcal hiccup must not break the webhook
+    or the log entry that was already persisted.
+    """
+    log_date = entry.get("date")
+    if not log_date:
+        return
+    try:
+        from google_calendar.sync import mark_complete  # late import: optional integration
+
+        mark_complete(state, log_date)
+    except Exception as e:
+        logger.warning(f"mark_complete failed for {log_date}: {type(e).__name__}: {e}")
 
 
 def _fetch_and_translate(state: StateManager, activity_id: int) -> Optional[dict]:

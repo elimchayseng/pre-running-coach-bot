@@ -171,3 +171,41 @@ class TestSendActivityPing:
 
         monkeypatch.setattr("telegram.Bot", _BrokenBot)
         assert notify.send_activity_ping(entry) is False
+
+    def test_successful_send_mirrors_to_conversation_history(self, monkeypatch, entry):
+        """A sent message must be mirrored into Redis history so the next
+        chat turn knows what the bot already said."""
+        monkeypatch.setenv("USER_TELEGRAM_CHAT_ID", "55555")
+        monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "fake_token")
+        self._patch_bot(monkeypatch, MagicMock())
+
+        mirrored = []
+        import conversation_store
+
+        monkeypatch.setattr(conversation_store, "add_turn", lambda role, content: mirrored.append((role, content)))
+
+        assert notify.send_activity_ping(entry) is True
+        assert len(mirrored) == 1
+        role, content = mirrored[0]
+        assert role == "assistant"
+        assert "Logged" in content
+
+    def test_failed_send_does_not_mirror(self, monkeypatch, entry):
+        monkeypatch.setenv("USER_TELEGRAM_CHAT_ID", "55555")
+        monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "fake_token")
+
+        class _BrokenBot:
+            def __init__(self, token):
+                pass
+
+            async def send_message(self, chat_id, text):
+                raise ValueError("nope")
+
+        monkeypatch.setattr("telegram.Bot", _BrokenBot)
+        mirrored = []
+        import conversation_store
+
+        monkeypatch.setattr(conversation_store, "add_turn", lambda role, content: mirrored.append((role, content)))
+
+        assert notify.send_activity_ping(entry) is False
+        assert mirrored == []  # nothing actually got sent; nothing to mirror
