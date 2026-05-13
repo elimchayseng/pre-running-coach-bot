@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -41,10 +42,29 @@ def _required(name: str) -> str:
     return value
 
 
+_TOKEN_PATTERN = re.compile(r"x-access-token:[^@]+@")
+
+
+def _redact(s: str) -> str:
+    """Strip the GitHub PAT out of any string we log (the clone URL embeds it)."""
+    return _TOKEN_PATTERN.sub("x-access-token:[REDACTED]@", s)
+
+
 def _run(cmd: list[str], cwd: Path | None = None, check: bool = True) -> subprocess.CompletedProcess:
-    """Run a subprocess, masking GITHUB_BACKUP_TOKEN in any logged output."""
-    logger.info("run: %s", " ".join(cmd))
-    return subprocess.run(cmd, cwd=str(cwd) if cwd else None, check=check, capture_output=True, text=True)
+    """Run a subprocess. Logs the command with the GitHub PAT scrubbed out."""
+    logger.info("run: %s", _redact(" ".join(cmd)))
+    result = subprocess.run(cmd, cwd=str(cwd) if cwd else None, check=False, capture_output=True, text=True)
+    if check and result.returncode != 0:
+        # Re-raise CalledProcessError but include redacted stderr so the cron
+        # log shows what actually failed without leaking the token.
+        err = _redact(result.stderr or "")
+        out = _redact(result.stdout or "")
+        if err:
+            logger.error("stderr: %s", err.strip())
+        if out:
+            logger.error("stdout: %s", out.strip())
+        raise subprocess.CalledProcessError(result.returncode, [_redact(a) for a in cmd], output=out, stderr=err)
+    return result
 
 
 def _online_backup(src: Path, dst: Path) -> None:
@@ -77,18 +97,24 @@ def main() -> int:
 
     workdir = Path(tempfile.mkdtemp(prefix="coach-backup-"))
     try:
-        # 1. Clone the snapshot branch (shallow). If it doesn't exist yet,
-        #    create an orphan branch.
+        # 1. Clone the snapshot branch (shallow). If the branch doesn't exist
+        #    yet, create an orphan. Only fall through to the orphan path on the
+        #    specific "branch not found" stderr signal — auth/network failures
+        #    should propagate, not get masked.
         clone_url = f"https://x-access-token:{token}@github.com/{repo}.git"
         try:
             _run(["git", "clone", "--depth", "1", "--branch", branch, clone_url, str(workdir)])
             existing = True
-        except subprocess.CalledProcessError:
-            logger.info("branch %s not found; creating orphan", branch)
-            _run(["git", "clone", "--depth", "1", clone_url, str(workdir)])
-            _run(["git", "checkout", "--orphan", branch], cwd=workdir)
-            _run(["git", "rm", "-rf", "."], cwd=workdir, check=False)
-            existing = False
+        except subprocess.CalledProcessError as e:
+            stderr = (e.stderr or "").lower()
+            if "remote branch" in stderr and "not found" in stderr:
+                logger.info("branch %s not found; creating orphan", branch)
+                _run(["git", "clone", "--depth", "1", clone_url, str(workdir)])
+                _run(["git", "checkout", "--orphan", branch], cwd=workdir)
+                _run(["git", "rm", "-rf", "."], cwd=workdir, check=False)
+                existing = False
+            else:
+                raise
 
         # 2. Snapshot.
         ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M-%SZ")

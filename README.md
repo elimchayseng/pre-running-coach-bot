@@ -126,10 +126,10 @@ cp .env.example .env       # fill in your keys
 Then seed your local DB from the example state files committed in `state/`:
 
 ```bash
-python scripts/migrate_state_to_sqlite.py state --db state/coach.db
+python scripts/migrate_state_to_sqlite.py state --db state/coach.db --reset
 ```
 
-The migration script is idempotent — re-run after editing `state/athlete.yaml` / `state/plan.md` to refresh the DB. See the example shapes in [docs/state-schema.md](docs/state-schema.md) and the schema in `state/schema.sql`.
+Singleton blobs (plan, athlete, journal) are upserted on every run so re-running picks up edits to `state/plan.md` / `state/athlete.yaml`. The `--reset` flag wipes the `sessions` table — use it for the first seed only. Without `--reset`, sessions dedupe by strava_id (UNIQUE index) and identical-row content (so weekly_summary entries don't double). See the example shapes in [docs/state-schema.md](docs/state-schema.md) and the schema in `state/schema.sql`.
 
 ## Environment variables
 
@@ -289,7 +289,7 @@ Deploy to Railway with the included `Procfile`:
 
 ```bash
 railway shell --service web
-python scripts/migrate_state_to_sqlite.py /app/state --db /app/data/coach.db
+python scripts/migrate_state_to_sqlite.py /app/state --db /app/data/coach.db --reset
 ```
 
    The bundled `/app/state/*` files in the image are read once to seed the DB, then ignored. The volume's `/app/data/coach.db` is the runtime source of truth from that point on.

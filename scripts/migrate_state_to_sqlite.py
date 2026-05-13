@@ -1,17 +1,28 @@
 """One-time seed of ``state/coach.db`` from the legacy ``state/*`` files.
 
-Idempotent — singleton rows (plan, plan_changelog, journal, athlete) use
-INSERT OR REPLACE; sessions inserts catch ``sqlite3.IntegrityError`` so the
-partial UNIQUE index on ``details.strava_id`` deduplicates re-runs.
+Default behaviour is **non-destructive**:
+  - Singleton rows (plan, plan_changelog, journal, athlete) are upserted —
+    safe to re-run since they replace in place.
+  - Session inserts catch ``sqlite3.IntegrityError`` so the partial UNIQUE
+    index on ``details.strava_id`` dedupes Strava-sourced rows.
+  - Non-Strava sessions (weekly_summary, manual log_session entries with no
+    strava_id) are inserted blindly. Re-running would accumulate duplicates.
+
+Pass ``--reset`` to wipe the ``sessions`` table before seeding. **Use this
+only on the initial seed** — running ``--reset`` against a DB that has
+accepted webhook writes will destroy them.
 
 Usage:
-    ./venv/bin/python scripts/migrate_state_to_sqlite.py [<seed-dir>] [--db <db-path>]
+    # First-time seed (clean DB):
+    ./venv/bin/python scripts/migrate_state_to_sqlite.py --reset
 
-Defaults: seed-dir = ``state/`` under the repo root, db-path = ``state/coach.db``.
+    # Topping up later from new committed seed files (rarely needed once the
+    # bot is writing to the DB directly — the UNIQUE index handles dedup):
+    ./venv/bin/python scripts/migrate_state_to_sqlite.py
 
-On Railway prod (volume mounted at /app/data):
+On Railway prod (volume mounted at /app/data, initial seed):
     railway shell --service web
-    python scripts/migrate_state_to_sqlite.py /app/state --db /app/data/coach.db
+    python scripts/migrate_state_to_sqlite.py /app/state --db /app/data/coach.db --reset
 """
 
 from __future__ import annotations
@@ -29,11 +40,21 @@ if str(ROOT) not in sys.path:
 from state_manager import StateManager  # noqa: E402
 
 
-def migrate(seed_dir: Path, db_path: Path) -> dict:
+def _safe_load(text: str) -> dict:
+    """Parse a JSON blob from the sessions table; return {} on garbage."""
+    try:
+        return json.loads(text)
+    except (TypeError, json.JSONDecodeError):
+        return {}
+
+
+def migrate(seed_dir: Path, db_path: Path, reset_sessions: bool = False) -> dict:
     """Seed ``db_path`` from the legacy files under ``seed_dir``.
 
-    Returns a small summary dict ({sessions_inserted, sessions_skipped,
-    plan, athlete, journal, gcal_sync}) for the caller to print.
+    If ``reset_sessions`` is True, ``DELETE FROM sessions`` runs before the
+    log import — destructive, intended for the initial seed only.
+
+    Returns a small summary dict for the caller to print.
     """
     sm = StateManager()
     # Force the StateManager to use our explicit db_path even if DATABASE_PATH
@@ -45,6 +66,7 @@ def migrate(seed_dir: Path, db_path: Path) -> dict:
     summary = {
         "sessions_inserted": 0,
         "sessions_skipped": 0,
+        "sessions_reset": False,
         "plan": False,
         "plan_changelog": False,
         "athlete": False,
@@ -105,14 +127,16 @@ def migrate(seed_dir: Path, db_path: Path) -> dict:
         summary["journal"] = True
 
     # --- log.jsonl ---
-    # Clear sessions first so re-running the migration is idempotent. The
-    # UNIQUE index on details.strava_id only dedupes Strava-sourced rows;
-    # manual weekly_summary entries have no strava_id and would otherwise
-    # accumulate on every re-run.
+    # Default: non-destructive. Strava-sourced rows dedupe via the UNIQUE
+    # index; non-Strava rows (weekly_summary, manual entries) are skipped if
+    # an identical (date, type, data) row already exists. Only `--reset`
+    # wipes the table — see the module docstring for why this matters.
     log_path = seed_dir / "log.jsonl"
     if log_path.exists():
-        with sm._conn() as c:
-            c.execute("DELETE FROM sessions")
+        if reset_sessions:
+            with sm._conn() as c:
+                c.execute("DELETE FROM sessions")
+            summary["sessions_reset"] = True
         for raw in log_path.read_text(encoding="utf-8").splitlines():
             raw = raw.strip()
             if not raw:
@@ -126,6 +150,21 @@ def migrate(seed_dir: Path, db_path: Path) -> dict:
                 summary["sessions_skipped"] += 1
                 continue
             try:
+                # Non-strava entries: skip if an identical row already exists.
+                # The UNIQUE index catches strava_id dupes; this catches the
+                # weekly_summary case the index can't see. Compare via parsed
+                # dict equality so JSON-formatting differences (key order,
+                # whitespace) don't cause false misses.
+                if not (entry.get("details") or {}).get("strava_id"):
+                    with sm._conn() as c:
+                        candidates = c.execute(
+                            "SELECT data FROM sessions WHERE date = ? AND type = ?",
+                            (entry["date"], entry.get("type", "")),
+                        ).fetchall()
+                    duplicate = any(_safe_load(row["data"]) == entry for row in candidates)
+                    if duplicate:
+                        summary["sessions_skipped"] += 1
+                        continue
                 sm.append_session(entry)
                 summary["sessions_inserted"] += 1
             except sqlite3.IntegrityError:
@@ -159,6 +198,15 @@ def main() -> int:
         default=None,
         help="Destination SQLite path (default: <seed_dir>/coach.db or $DATABASE_PATH)",
     )
+    parser.add_argument(
+        "--reset",
+        action="store_true",
+        help=(
+            "Wipe the sessions table before seeding. DESTRUCTIVE — only use "
+            "this on the initial seed. Running --reset against a DB that has "
+            "accepted webhook writes will destroy them."
+        ),
+    )
     args = parser.parse_args()
 
     seed_dir = Path(args.seed_dir)
@@ -169,7 +217,9 @@ def main() -> int:
 
     print(f"seeding from: {seed_dir}")
     print(f"writing to:   {db_path}")
-    summary = migrate(seed_dir, db_path)
+    if args.reset:
+        print("mode:         --reset (sessions table will be cleared)")
+    summary = migrate(seed_dir, db_path, reset_sessions=args.reset)
     print("done:")
     for k, v in summary.items():
         print(f"  {k}: {v}")

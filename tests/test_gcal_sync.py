@@ -713,10 +713,11 @@ class TestReconcileCompletion:
         # All three plan dates in window have no sessions → all skipped.
         assert set(out["skipped"]) == {"2026-05-09", "2026-05-11"}  # 05-12 > today
 
-    def test_idempotent_when_already_completed(self, monkeypatch, fixed_today):
+    def test_already_completed_short_circuits_no_api_calls(self, monkeypatch, fixed_today):
+        """When sync_state already says completed, reconcile must NOT re-fire
+        mark_complete — saves a gcal insert+patch round-trip per date per sync."""
         from google_calendar import client as gcal_client
 
-        # Seed sync state with completed=True for the matching date.
         state = _StateStub(
             self.PLAN,
             {"2026-05-09": [{"date": "2026-05-09", "type": "easy", "miles": 8.0}]},
@@ -732,17 +733,18 @@ class TestReconcileCompletion:
             },
         )
 
-        # mark_complete still patches when reconcile re-fires, but the sync
-        # state stays marked completed (no flip-flop).
-        monkeypatch.setattr(
-            gcal_client,
-            "insert_event",
-            lambda p: (_ for _ in ()).throw(gcal_client.GcalEventExistsError("x")),
-        )
-        monkeypatch.setattr(gcal_client, "patch_event", lambda eid, p: {"id": eid})
+        def _boom_insert(_p):
+            raise AssertionError("reconcile must not insert when already completed")
+
+        def _boom_patch(_eid, _p):
+            raise AssertionError("reconcile must not patch when already completed")
+
+        monkeypatch.setattr(gcal_client, "insert_event", _boom_insert)
+        monkeypatch.setattr(gcal_client, "patch_event", _boom_patch)
 
         out = sync.reconcile_completion(state, days_back=14)
-        assert len(out["corrected"]) == 1
+        assert out["corrected"] == []
+        assert "2026-05-09" in out["already_complete"]
         # Completed flag preserved
         assert state.gcal_sync["pretrain20260509"]["completed"] is True
 

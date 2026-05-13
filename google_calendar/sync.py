@@ -667,9 +667,10 @@ def reconcile_completion(state, days_back: int = 14) -> dict:
     """Walk recent plan rows + log entries; ensure gcal completion matches reality.
 
     For every plan-row date inside the ``days_back`` window that has at least
-    one logged session, re-fire ``mark_complete``. Idempotent — mark_complete
-    short-circuits on rows whose sync_state already carries ``completed: True``
-    so re-runs are cheap.
+    one logged session and isn't already marked complete in sync state, fire
+    ``mark_complete``. Skipping already-completed dates is the API-idempotency
+    win — mark_complete is safe to re-fire (the sentinel preserves state) but
+    each call costs a gcal insert+patch round-trip.
 
     Orphan detection (gcal says completed but the log has no matching session)
     is surfaced as a warning. We never uncomplete an event by default — that
@@ -678,9 +679,11 @@ def reconcile_completion(state, days_back: int = 14) -> dict:
     today = today_local()
     cutoff = today - timedelta(days=days_back)
     rows = _parse_plan_rows(state.load_plan())
+    sync_state = _load_sync_state(state)
 
     corrected: list[dict] = []
     skipped: list[str] = []
+    already_complete: list[str] = []
     errors: list[dict] = []
 
     for row in rows:
@@ -692,6 +695,10 @@ def reconcile_completion(state, days_back: int = 14) -> dict:
             continue
         if not state.sessions_on_date(d):
             skipped.append(row["date"])
+            continue
+        prescribed_id = _event_id(row["date"])
+        if sync_state.get(prescribed_id, {}).get("completed"):
+            already_complete.append(row["date"])
             continue
         try:
             outcome = mark_complete(state, d)
@@ -712,12 +719,14 @@ def reconcile_completion(state, days_back: int = 14) -> dict:
         "days_back": days_back,
         "corrected": corrected,
         "skipped": skipped,
+        "already_complete": already_complete,
         "orphans": orphans,
         "errors": errors,
     }
     logger.info(
-        "reconcile_completion: corrected=%d skipped=%d orphans=%d errors=%d",
+        "reconcile_completion: corrected=%d already=%d skipped=%d orphans=%d errors=%d",
         len(corrected),
+        len(already_complete),
         len(skipped),
         len(orphans),
         len(errors),
