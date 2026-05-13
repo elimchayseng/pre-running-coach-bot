@@ -164,11 +164,31 @@ def _call_llm(messages: list[dict]):
         messages=messages,
         tools=ALL_TOOLS,
         tool_choice="auto",
-        max_tokens=2000,
+        max_tokens=4096,
     )
     if not response.choices:
+        # Heroku Inference has been observed returning 200 + empty choices on
+        # heavy plan-edit turns (issue #17). Capture the safe diagnostic
+        # fields — id and token counts only. We deliberately do NOT log the
+        # raw response object: some providers echo prompt fragments in error
+        # bodies, which would leak athlete content into Railway logs.
+        logger.error(
+            "LLM returned no response choices. id=%s usage=%s",
+            getattr(response, "id", None),
+            getattr(response, "usage", None),
+        )
         raise ValueError("LLM returned no response choices")
-    return response.choices[0].message
+    choice = response.choices[0]
+    if getattr(choice, "finish_reason", None) == "length":
+        # Output cap hit — surface it so we can tell apart "model decided to
+        # stop" from "we truncated it." Plan edits emit long tool-call args
+        # and were the original max_tokens=2000 trigger for issue #17.
+        logger.warning(
+            "LLM hit max_tokens cap (finish_reason=length). id=%s usage=%s",
+            getattr(response, "id", None),
+            getattr(response, "usage", None),
+        )
+    return choice.message
 
 
 def agent_turn(messages: list[dict], state: StateManager) -> str:
@@ -210,22 +230,38 @@ def agent_turn(messages: list[dict], state: StateManager) -> str:
 
 
 def chat(user_message: str) -> str:
-    """Process a single user message via the tool-use loop. Persists short-term
-    history in Redis. Returns the final assistant text."""
+    """Process a single user message via the tool-use loop.
+
+    Short-term Redis history is persisted ONLY after a successful LLM
+    response, so a failure (or, rarely, a Telegram-driven retry of the
+    same update_id) doesn't pollute the conversation with duplicate user
+    turns. See issue #15.
+
+    NOTE: this only covers conversational history. If the LLM succeeds on
+    early tool-use iterations and fails later, any tools that mutated
+    state/* or the calendar have already landed. A retry of the same
+    update would therefore re-execute those tools. With the webhook now
+    ack'ing 200 immediately, Telegram retries should be rare; full
+    tool-side idempotency is tracked as a separate follow-up.
+    """
     global _cache_control_supported
     try:
         state = _get_state()
         prompt_text = build_system_prompt(state)
 
-        add_turn("user", user_message)
         history = get_history()
+        # The new user turn rides along in the prompt but isn't written to
+        # Redis until agent_turn succeeds. If the LLM raises, history stays
+        # at its pre-call shape and the next attempt sees a clean prefix.
+        new_user_turn = {"role": "user", "content": user_message}
 
         # Probe cache_control on first call; fall back to plain string if Heroku rejects.
         if _cache_control_supported is None or _cache_control_supported:
             try:
-                messages = [_build_system_message(prompt_text, True), *history]
+                messages = [_build_system_message(prompt_text, True), *history, new_user_turn]
                 assistant = agent_turn(messages, state)
                 _cache_control_supported = True
+                add_turn("user", user_message)
                 add_turn("assistant", assistant)
                 return assistant
             except BadRequestError as e:
@@ -235,8 +271,9 @@ def chat(user_message: str) -> str:
                 else:
                     raise
 
-        messages = [_build_system_message(prompt_text, False), *history]
+        messages = [_build_system_message(prompt_text, False), *history, new_user_turn]
         assistant = agent_turn(messages, state)
+        add_turn("user", user_message)
         add_turn("assistant", assistant)
         return assistant
 

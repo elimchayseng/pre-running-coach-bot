@@ -57,6 +57,64 @@ class TestWebhook:
             resp = client.post("/webhook", json={"update_id": 1})
             assert resp.status_code == 200
 
+    @patch("app.threading.Thread")
+    @patch("app.get_telegram_app")
+    def test_webhook_dispatches_to_background_thread(self, mock_get_app, mock_thread, client):
+        """Regression for issue #15: /webhook must ack 200 fast and process
+        the update in a background thread, mirroring /strava/webhook. This
+        prevents Telegram retries from queuing on slow LLM calls."""
+        mock_app = MagicMock()
+        mock_get_app.return_value = mock_app
+        mock_app.bot = MagicMock()
+        instance = MagicMock()
+        mock_thread.return_value = instance
+
+        resp = client.post("/webhook", json={"update_id": 42})
+        assert resp.status_code == 200
+        assert resp.get_json() == {"status": "ok"}
+
+        mock_thread.assert_called_once()
+        kwargs = mock_thread.call_args.kwargs
+        assert kwargs.get("daemon") is True
+        instance.start.assert_called_once()
+
+    @patch("app.threading.Thread")
+    @patch("app.get_telegram_app")
+    def test_webhook_returns_200_even_when_processing_fails(self, mock_get_app, mock_thread, client):
+        """Regression for issue #15: even if Telegram processing raises in
+        the background thread, the webhook must still return 200 so Telegram
+        doesn't retry. The thread target must also log via logger.exception
+        with the update_id, so failures are diagnosable from Railway logs."""
+        mock_app = MagicMock()
+        mock_get_app.return_value = mock_app
+        mock_app.bot = MagicMock()
+
+        # Capture the thread target instead of actually starting a thread,
+        # so we can drive it synchronously and assert on what it does.
+        captured_target = {}
+
+        def fake_thread(target=None, daemon=None, **_):
+            captured_target["fn"] = target
+            return MagicMock()
+
+        mock_thread.side_effect = fake_thread
+
+        with patch("app._run_async", side_effect=RuntimeError("simulated failure")), patch("app.logger") as mock_logger:
+            resp = client.post("/webhook", json={"update_id": 7})
+            assert resp.status_code == 200
+
+            # The captured thread target must not propagate exceptions...
+            captured_target["fn"]()
+
+            # ...and must log via logger.exception so the entry-point log
+            # captures a real traceback (the empty `Webhook error: ` lines
+            # from before the fix had no diagnostic value). The update_id
+            # must be in the log so we can correlate retries.
+            mock_logger.exception.assert_called_once()
+            call_args = mock_logger.exception.call_args
+            assert "update_id" in call_args.args[0]
+            assert 7 in call_args.args[1:]
+
 
 class TestStravaWebhook:
     """The challenge-verify GET and the event-dispatch POST on /strava/webhook."""

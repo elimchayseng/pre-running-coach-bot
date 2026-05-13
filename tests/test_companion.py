@@ -235,3 +235,38 @@ class TestChat:
 
         out = companion.chat("hi")
         assert "apologize" in out.lower() or "trouble" in out.lower()
+
+    def test_history_not_polluted_on_llm_failure(self, state, monkeypatch, fake_redis):
+        """Regression for issue #15: a failed LLM call must not leave the user
+        message stranded in Redis history. Otherwise Telegram-driven retries
+        of the same update accumulate duplicate user turns each pass."""
+        fake = MagicMock()
+        fake.chat.completions.create.side_effect = RuntimeError("boom")
+        monkeypatch.setattr(companion, "llm_client", fake)
+        monkeypatch.setattr(companion, "_cache_control_supported", False)
+
+        companion.chat("hello")
+
+        from conversation_store import get_history
+
+        assert get_history() == []
+
+    def test_history_after_failure_then_success(self, state, monkeypatch, fake_redis):
+        """A failed turn followed by a successful turn should yield exactly
+        the success pair in history — no ghost user message from the failed
+        attempt."""
+        from conversation_store import get_history
+
+        fake = MagicMock()
+        fake.chat.completions.create.side_effect = RuntimeError("boom")
+        monkeypatch.setattr(companion, "llm_client", fake)
+        monkeypatch.setattr(companion, "_cache_control_supported", False)
+        companion.chat("first attempt fails")
+        assert get_history() == []
+
+        _mock_llm(monkeypatch, _llm_message(content="here"))
+        companion.chat("second attempt works")
+        history = get_history()
+        assert len(history) == 2
+        assert history[0] == {"role": "user", "content": "second attempt works"}
+        assert history[1] == {"role": "assistant", "content": "here"}

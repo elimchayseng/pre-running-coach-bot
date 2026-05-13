@@ -51,10 +51,19 @@ _loop_thread = threading.Thread(target=_start_loop, args=(_loop,), daemon=True)
 _loop_thread.start()
 
 
-def _run_async(coro):
-    """Run a coroutine on the persistent event loop and return its result."""
+def _run_async(coro, timeout: float = 180):
+    """Run a coroutine on the persistent event loop and return its result.
+
+    The default 180s ceiling is sized for the slowest path that goes through
+    here: a plan-edit Telegram update where the tool-use loop re-emits the
+    full plan.md as a tool-call argument. Now that the webhook acks 200 and
+    delegates `process_update` to a background thread, no caller of this
+    helper is on a gunicorn worker — so a longer wait does not block other
+    requests. Startup callers (`setup_webhook`, `initialize`) make short
+    network calls and finish well under this ceiling.
+    """
     future = asyncio.run_coroutine_threadsafe(coro, _loop)
-    return future.result(timeout=30)
+    return future.result(timeout=timeout)
 
 
 def get_telegram_app():
@@ -139,7 +148,16 @@ def strava_webhook_event():
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    """Handle incoming Telegram webhook updates."""
+    """Handle incoming Telegram webhook updates.
+
+    Telegram requires a fast 2xx ack or it retries the same update_id on
+    backoff. The companion agent's tool-use loop can take >30s on plan-edit
+    turns, which previously blew gunicorn's worker timeout and caused
+    Telegram retry storms (issues #15, #17). We now mirror the /strava/webhook
+    pattern: parse, ack 200 immediately, and process the update in a daemon
+    thread. The Telegram handlers themselves reply to the user via the bot
+    API, so the response body here is just an HTTP ack.
+    """
     # T8: Verify the request comes from Telegram via secret_token
     webhook_secret = os.getenv("TELEGRAM_WEBHOOK_SECRET")
     if webhook_secret:
@@ -151,15 +169,23 @@ def webhook():
     try:
         telegram_application = get_telegram_app()
         update = Update.de_json(request.get_json(force=True), telegram_application.bot)
+    except Exception:
+        # Parse / init failure. Ack so Telegram doesn't retry forever, but
+        # log the real traceback (the previous `f"Webhook error: {e}"` form
+        # silently produced empty log lines for several exception types).
+        logger.exception("Webhook parse/init error")
+        return jsonify({"status": "ok"}), 200
 
-        # Process update on the persistent event loop
-        _run_async(telegram_application.process_update(update))
+    update_id = getattr(update, "update_id", None)
 
-        return jsonify({"status": "ok"})
-    except Exception as e:
-        logger.error(f"Webhook error: {e}")
-        # T9: Don't leak internal error details in response
-        return jsonify({"status": "error", "message": "Internal processing error"}), 500
+    def _process_in_background() -> None:
+        try:
+            _run_async(telegram_application.process_update(update))
+        except Exception:
+            logger.exception("Telegram update processing failed update_id=%s", update_id)
+
+    threading.Thread(target=_process_in_background, daemon=True).start()
+    return jsonify({"status": "ok"}), 200
 
 
 def setup_webhook():
