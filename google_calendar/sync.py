@@ -31,7 +31,6 @@ import json
 import logging
 import re
 from datetime import date, datetime, timedelta, timezone
-from pathlib import Path
 from typing import Optional
 
 from temporal_context import today_local
@@ -651,11 +650,7 @@ def get_last_sync_summary(state=None) -> Optional[dict]:
     if not sync_state:
         return None
     last_at = max(
-        (
-            v.get("last_synced_at")
-            for v in sync_state.values()
-            if isinstance(v, dict) and v.get("last_synced_at")
-        ),
+        (v.get("last_synced_at") for v in sync_state.values() if isinstance(v, dict) and v.get("last_synced_at")),
         default=None,
     )
     return {

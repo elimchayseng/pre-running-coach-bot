@@ -95,7 +95,7 @@ python scripts/state_dump.py --all
 railway ssh "sqlite3 /app/data/coach.db 'SELECT date, type FROM sessions ORDER BY date DESC LIMIT 20'"
 
 # Prod: pull the full DB down for offline inspection / TablePlus / diffing
-./scripts/state_pull.py -o /tmp/prod-coach.db
+./scripts/state_pull.sh -o /tmp/prod-coach.db
 sqlite3 /tmp/prod-coach.db
 ```
 

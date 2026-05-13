@@ -108,8 +108,19 @@ def main() -> int:
         if diff.returncode == 0 and existing:
             logger.info("no changes since last snapshot; skipping commit")
             return 0
-        _run(["git", "-c", "user.email=backup@pre.coach", "-c", "user.name=PRE backup",
-              "commit", "-m", f"snapshot {ts}"], cwd=workdir)
+        _run(
+            [
+                "git",
+                "-c",
+                "user.email=backup@pre.coach",
+                "-c",
+                "user.name=PRE backup",
+                "commit",
+                "-m",
+                f"snapshot {ts}",
+            ],
+            cwd=workdir,
+        )
         _run(["git", "push", "origin", f"HEAD:{branch}"], cwd=workdir)
         logger.info("snapshot %s pushed to %s on branch %s", ts, repo, branch)
         return 0

@@ -98,15 +98,11 @@ class StateManager:
         with _schema_lock:
             if self._schema_applied:
                 return
-            row = conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name='schema_version'"
-            ).fetchone()
+            row = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='schema_version'").fetchone()
             if row is None:
                 conn.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
             # Always record version 1 (idempotent via PRIMARY KEY).
-            conn.execute(
-                "INSERT OR IGNORE INTO schema_version (version) VALUES (1)"
-            )
+            conn.execute("INSERT OR IGNORE INTO schema_version (version) VALUES (1)")
             conn.commit()
             self._schema_applied = True
 
@@ -196,8 +192,7 @@ class StateManager:
         """
         with self._conn() as conn:
             rows = conn.execute(
-                "SELECT event_id, hash, last_synced_at, completed, last_completed_at, off_plan "
-                "FROM gcal_sync_state"
+                "SELECT event_id, hash, last_synced_at, completed, last_completed_at, off_plan FROM gcal_sync_state"
             ).fetchall()
         out: dict[str, dict] = {}
         for r in rows:
@@ -354,9 +349,7 @@ class StateManager:
         with self._conn() as conn:
             row = conn.execute("SELECT yaml_text FROM athlete WHERE id = 1").fetchone()
             if row is None:
-                raise FileNotFoundError(
-                    "athlete row not found; run scripts/migrate_state_to_sqlite.py first"
-                )
+                raise FileNotFoundError("athlete row not found; run scripts/migrate_state_to_sqlite.py first")
             data = _yaml.load(row["yaml_text"])
             if data is None:
                 data = {}

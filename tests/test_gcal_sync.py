@@ -331,9 +331,7 @@ class TestSyncPlan:
 
         patches = []
         monkeypatch.setattr(gcal_client, "insert_event", _insert)
-        monkeypatch.setattr(
-            gcal_client, "patch_event", lambda eid, p: patches.append(eid) or {"id": eid}
-        )
+        monkeypatch.setattr(gcal_client, "patch_event", lambda eid, p: patches.append(eid) or {"id": eid})
         monkeypatch.setattr(gcal_client, "list_managed_events", lambda *a, **kw: [])
 
         result = sync.sync_plan(state_stub, dry_run=False)
@@ -419,9 +417,7 @@ v1 detail body
             raise gcal_client.GcalEventExistsError(f"dup {p['id']}")
 
         monkeypatch.setattr(gcal_client, "insert_event", _409)
-        monkeypatch.setattr(
-            gcal_client, "patch_event", lambda eid, p: patches.append(eid) or {"id": eid}
-        )
+        monkeypatch.setattr(gcal_client, "patch_event", lambda eid, p: patches.append(eid) or {"id": eid})
 
         state._plan = plan_v2
         result2 = sync.sync_plan(state, dry_run=False)
@@ -444,9 +440,7 @@ Sharpening, not testing. Feel like you could've done one more.
 """
         state = _StateStub(plan_text)
         captured = []
-        monkeypatch.setattr(
-            gcal_client, "insert_event", lambda p: captured.append(p) or {"id": p["id"]}
-        )
+        monkeypatch.setattr(gcal_client, "insert_event", lambda p: captured.append(p) or {"id": p["id"]})
         monkeypatch.setattr(gcal_client, "list_managed_events", lambda *a, **kw: [])
 
         result = sync.sync_plan(state, dry_run=False)

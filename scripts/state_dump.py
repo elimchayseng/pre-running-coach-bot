@@ -56,9 +56,7 @@ def _connect(db_path: Path) -> sqlite3.Connection:
 
 def dump_log(conn: sqlite3.Connection, since: str | None) -> None:
     if since:
-        rows = conn.execute(
-            "SELECT data FROM sessions WHERE date >= ? ORDER BY date, id", (since,)
-        ).fetchall()
+        rows = conn.execute("SELECT data FROM sessions WHERE date >= ? ORDER BY date, id", (since,)).fetchall()
     else:
         rows = conn.execute("SELECT data FROM sessions ORDER BY date, id").fetchall()
     for r in rows:

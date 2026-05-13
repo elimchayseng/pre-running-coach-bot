@@ -84,11 +84,11 @@ class TestRaceDateResolution:
         from state_manager import StateManager
 
         sm = StateManager(tmp_path)
+        yaml_text = (
+            "target_races:\n  - name: Past Race\n    date: 2020-01-01\n  - name: Future Race\n    date: 2099-06-15\n"
+        )
         with sm._conn() as c:
-            c.execute(
-                "INSERT INTO athlete (id, yaml_text) VALUES (1, ?)",
-                ("target_races:\n  - name: Past Race\n    date: 2020-01-01\n  - name: Future Race\n    date: 2099-06-15\n",),
-            )
+            c.execute("INSERT INTO athlete (id, yaml_text) VALUES (1, ?)", (yaml_text,))
         import temporal_context
 
         monkeypatch.setattr(temporal_context, "_state_dir", lambda: tmp_path)

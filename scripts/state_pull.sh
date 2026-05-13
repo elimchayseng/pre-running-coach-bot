@@ -5,8 +5,8 @@
 # The volume is mounted at /app/data/ in prod.
 #
 # Usage:
-#   ./scripts/state_pull.py                       # writes ./prod-coach.db
-#   ./scripts/state_pull.py -o /tmp/coach.db      # custom output
+#   ./scripts/state_pull.sh                       # writes ./prod-coach.db
+#   ./scripts/state_pull.sh -o /tmp/coach.db      # custom output
 #
 # After pulling, inspect with:
 #   sqlite3 prod-coach.db 'SELECT date, type FROM sessions ORDER BY date DESC LIMIT 20'
