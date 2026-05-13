@@ -73,9 +73,10 @@ def send_telegram_text(text: str, chat_id: Optional[str] = None) -> bool:
         bot = Bot(token=token)
         await bot.send_message(chat_id=chat_id, text=text)
 
+    sent = False
     try:
         asyncio.run(_send())
-        return True
+        sent = True
     except RuntimeError:
         # asyncio.run() typically only raises RuntimeError for "cannot be
         # called from a running event loop" or "event loop is closed".
@@ -86,7 +87,7 @@ def send_telegram_text(text: str, chat_id: Optional[str] = None) -> bool:
             loop = asyncio.new_event_loop()
             try:
                 loop.run_until_complete(_send())
-                return True
+                sent = True
             finally:
                 loop.close()
         except Exception as e:
@@ -95,6 +96,20 @@ def send_telegram_text(text: str, chat_id: Optional[str] = None) -> bool:
     except Exception as e:
         logger.error(f"Failed to send Telegram text: {e}")
         return False
+
+    if sent:
+        # Mirror outbound Strava-side messages (templated pings + LLM
+        # post-activity reviews) into the chat agent's conversation history.
+        # Without this, the next user turn doesn't know we already acknowledged
+        # the activity — the bot ends up asking "did you do the run?" even
+        # though it already replied about it on Telegram.
+        try:
+            from conversation_store import add_turn
+
+            add_turn("assistant", text)
+        except Exception as e:
+            logger.warning(f"Failed to mirror Strava message into chat history: {e}")
+    return sent
 
 
 def send_activity_ping(entry: dict, chat_id: Optional[str] = None) -> bool:

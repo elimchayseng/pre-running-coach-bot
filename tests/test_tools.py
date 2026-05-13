@@ -227,6 +227,36 @@ class TestPlanTools:
         assert len(out["days"]) == 7
         assert "week_start" in out
 
+    def test_get_week_status_marks_completed_when_log_matches(self, state, state_dir, monkeypatch):
+        # Pin "today" so the week range is deterministic relative to PLAN_MD.
+        monkeypatch.setattr("tools.plan.today_local", lambda: date(2026, 4, 28))
+        # Log an easy run on Tue 4/28 — matches the "Easy 4mi" prescription.
+        (state_dir / "log.jsonl").write_text(
+            json.dumps({"date": "2026-04-28", "type": "easy", "miles": 4.1, "pace_avg": "8:55"})
+            + "\n"
+        )
+        out = execute_tool("get_week_status", {"week_offset": 0}, state)
+        tue = next(d for d in out["days"] if d["date"] == "2026-04-28")
+        assert tue["found"] is True
+        assert tue["completed"] is True
+        assert tue["prescription_kind"] == "run"
+        assert len(tue["actuals"]) == 1
+        assert tue["actuals"][0]["miles"] == 4.1
+        assert tue["off_plan_actuals"] == []
+
+    def test_get_week_status_off_plan_does_not_complete_prescription(self, state, state_dir, monkeypatch):
+        monkeypatch.setattr("tools.plan.today_local", lambda: date(2026, 4, 28))
+        # Strength only on a "Easy 4mi" day — off-plan; prescription not met.
+        (state_dir / "log.jsonl").write_text(
+            json.dumps({"date": "2026-04-28", "type": "strength"}) + "\n"
+        )
+        out = execute_tool("get_week_status", {"week_offset": 0}, state)
+        tue = next(d for d in out["days"] if d["date"] == "2026-04-28")
+        assert tue["completed"] is False
+        assert tue["actuals"] == []
+        assert len(tue["off_plan_actuals"]) == 1
+        assert tue["off_plan_actuals"][0]["type"] == "strength"
+
 
 # ------------- fitness helpers -------------
 

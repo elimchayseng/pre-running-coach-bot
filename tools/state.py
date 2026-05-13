@@ -177,7 +177,27 @@ SCHEMAS = [
 def _log_session(args: dict, state) -> dict:
     session = {k: v for k, v in args.items() if v is not None}
     state.append_session(session)
+    _mark_calendar_complete(state, session)
     return {"ok": True, "logged": session}
+
+
+def _mark_calendar_complete(state, entry: dict) -> None:
+    """Best-effort: reflect the day's logged sessions onto Google Calendar.
+    Never raises — gcal is an optional integration and a hiccup here must not
+    break the log_session tool call (the log entry was already persisted)."""
+    import logging
+
+    log_date = entry.get("date")
+    if not log_date:
+        return
+    try:
+        from google_calendar.sync import mark_complete
+
+        mark_complete(state, log_date)
+    except Exception as e:
+        logging.getLogger("pre_coach.tools.state").warning(
+            f"mark_complete failed for {log_date}: {type(e).__name__}: {e}"
+        )
 
 
 def _update_plan(args: dict, state) -> dict:

@@ -82,6 +82,9 @@ class StateManager:
     def get_sessions_in_range(self, start: date, end: date) -> list[dict]:
         return self._load_log_entries(lambda d: start <= d <= end)
 
+    def sessions_on_date(self, target: date) -> list[dict]:
+        return self._load_log_entries(lambda d: d == target)
+
     def existing_strava_ids(self) -> set[int]:
         """Return all `details.strava_id` values from log.jsonl. Used by
         Strava backfill + webhook handler for idempotency."""

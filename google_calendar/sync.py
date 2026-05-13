@@ -92,6 +92,15 @@ def sync_plan(state, dry_run: bool = False) -> dict:
             continue
 
         prior = sync_state.get(event_id)
+        # Completed events are owned by mark_complete from here on — the local
+        # sync_state carries `completed: true` so we don't roll back the ✅
+        # prefix, graphite color, or actuals block. The hash may differ if the
+        # plan row was edited after completion; we still skip (the event has
+        # already happened).
+        if prior and prior.get("completed"):
+            counts["unchanged"] += 1
+            new_sync_state[event_id] = prior
+            continue
         if prior and prior.get("hash") == payload_hash:
             counts["unchanged"] += 1
             new_sync_state[event_id] = prior
@@ -136,6 +145,13 @@ def sync_plan(state, dry_run: bool = False) -> dict:
         if not ev_date:
             continue  # not an all-day event we manage
         if ev_date in synced_dates:
+            continue
+        # Preserve completed events even when their date is no longer in the
+        # plan (off-plan precomplete events live on dates that have no plan
+        # row, and past prescription events the user later removed from the
+        # plan still represent history).
+        ev_private = (ev.get("extendedProperties") or {}).get("private") or {}
+        if ev_private.get("pre_completed") == "1":
             continue
         ev_id = ev.get("id")
         if not ev_id:
@@ -304,6 +320,279 @@ def _build_event_payload(
     payload_hash = hashlib.sha1(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
     payload["extendedProperties"]["private"]["pre_plan_hash"] = payload_hash
     return payload, payload_hash
+
+
+# ---------- completion (mark_complete) ----------
+
+# Log-entry types that satisfy a "run" prescription. Mirrors strava/review.RUN_TYPES
+# but kept local so sync doesn't depend on the strava package.
+_RUN_LOG_TYPES = {"run", "easy", "long_run", "workout", "race", "strides", "return_test"}
+
+# Gcal "graphite" — neutral gray that visually fades completed events without
+# clashing with any user-assigned color. ColorIds 1-11 are the event palette.
+_COMPLETED_COLOR_ID = "8"
+
+
+def _completion_event_id(iso_date: str) -> str:
+    """Off-plan completion event id (separate from the prescription event).
+
+    Used when the user logs activity that doesn't satisfy the day's
+    prescription — the prescription event stays untouched, the off-plan
+    activity gets its own marked-complete event on the same day.
+    """
+    return "precomplete" + iso_date.replace("-", "")
+
+
+def _prescription_kind(workout_cell: str) -> Optional[str]:
+    """Classify a plan row's Workout cell into a coarse prescription kind.
+
+    Returns one of: "run" | "cross_train" | "strength" | "mobility" | "rest",
+    or None if the cell is empty. The rule order matters — "rest" wins over
+    everything else so "Rest + gentle yoga" doesn't classify as mobility.
+    """
+    if not workout_cell:
+        return None
+    w = workout_cell.lower().strip()
+    if w in {"-", "—"}:
+        return "rest"
+    if w.startswith(("off", "rest", "no run", "no running")):
+        return "rest"
+    if any(k in w for k in ("cycl", "bike", "spin", "ride", "swim")):
+        return "cross_train"
+    if any(k in w for k in ("strength", "lift ", "gym ", "lifting")):
+        return "strength"
+    # Mobility-only days have no mileage / no run keyword. A row like
+    # "Easy 4mi + restorative yoga" has a run prescription that yoga is
+    # adjunct to — not a mobility-only day.
+    if any(k in w for k in ("yoga", "mobility", "stretch", "walk")) and not any(
+        k in w for k in ("mi ", "mi,", "mi.", "mi)", "run", "shakeout", "easy", "strides")
+    ):
+        return "mobility"
+    return "run"
+
+
+def _log_matches_prescription(kind: Optional[str], log_type: str) -> bool:
+    """Whether a logged session type satisfies a prescription kind.
+
+    Rest days never auto-mark — they have nothing to "complete." Mobility-only
+    days don't auto-mark either (there's no yoga/mobility log type, and using
+    strength would be misleading)."""
+    if kind == "run":
+        return log_type in _RUN_LOG_TYPES
+    if kind == "cross_train":
+        return log_type == "cross_train"
+    if kind == "strength":
+        return log_type == "strength"
+    return False  # rest / mobility / None never auto-match
+
+
+def _format_actual(entry: dict) -> str:
+    """One-line summary of a log entry for the calendar event description."""
+    parts: list[str] = [str(entry.get("type") or "session")]
+    if entry.get("miles"):
+        parts.append(f"{entry['miles']}mi")
+    if entry.get("pace_avg"):
+        parts.append(f"@ {entry['pace_avg']}")
+    if entry.get("hr_avg"):
+        parts.append(f"HR {entry['hr_avg']}")
+    if entry.get("rpe"):
+        parts.append(f"RPE {entry['rpe']}")
+    details = entry.get("details") or {}
+    elev = details.get("elevation_gain_ft") or details.get("elevation_ft")
+    if elev:
+        parts.append(f"{elev}ft")
+    duration = details.get("moving_time") or details.get("duration")
+    if duration:
+        parts.append(str(duration))
+    line = " ".join(parts)
+    notes = entry.get("notes")
+    if notes:
+        line += f" — {notes}"
+    return line
+
+
+def _build_completed_payload(
+    event_id: str,
+    plan_row: Optional[dict],
+    plan_detail_body: Optional[str],
+    entries: list[dict],
+    log_date: date,
+) -> dict:
+    """Build an insert/patch payload representing a completed event.
+
+    Layout: optional prescription text on top (preserved when patching a
+    prescribed event), then `--- Completed ---`, then one bullet per logged
+    session. The full block is rebuilt from `entries` each call — idempotent
+    under repeated mark_complete invocations.
+    """
+    if plan_row:
+        workout_text = plan_row["workout"]
+        body = (plan_detail_body or "").strip()
+        if body:
+            prescription_desc = body
+        else:
+            parts = []
+            if plan_row.get("pace_target") and plan_row["pace_target"] not in {"-", "—"}:
+                parts.append(f"Pace: {plan_row['pace_target']}")
+            if plan_row.get("notes") and plan_row["notes"] not in {"-", "—"}:
+                parts.append(f"Notes: {plan_row['notes']}")
+            prescription_desc = "\n".join(parts)
+    else:
+        workout_text = "Off-plan activity"
+        prescription_desc = ""
+
+    actuals_lines = ["--- Completed ---"]
+    for e in entries:
+        actuals_lines.append("✓ " + _format_actual(e))
+    actuals_block = "\n".join(actuals_lines)
+
+    full_desc = (
+        prescription_desc + "\n\n" + actuals_block if prescription_desc else actuals_block
+    )
+    full_desc = _clamp_description(full_desc) + "\n\n(marked complete by PRE)"
+
+    summary = "✅ " + _strip_bold(workout_text)
+    end = log_date + timedelta(days=1)
+    return {
+        "id": event_id,
+        "summary": summary,
+        "description": full_desc,
+        "start": {"date": log_date.isoformat()},
+        "end": {"date": end.isoformat()},
+        "colorId": _COMPLETED_COLOR_ID,
+        "extendedProperties": {
+            "private": {
+                "pre_managed": "1",
+                "pre_completed": "1",
+            },
+        },
+    }
+
+
+def mark_complete(state, log_date) -> dict:
+    """Reflect the day's logged sessions onto the calendar.
+
+    Idempotent. Called from the log-write paths (Strava webhook +
+    log_session tool) after each session is appended to log.jsonl.
+
+    - Entries whose type satisfies the day's prescription patch the prescribed
+      event (`pretrain<YYYYMMDD>`) with a ✅ summary, graphite color, and an
+      aggregated actuals block.
+    - Entries that don't satisfy the prescription (or any entries when no plan
+      row exists for the date) are aggregated into a separate
+      `precomplete<YYYYMMDD>` event so the prescribed row's completion state
+      is never falsified.
+
+    Returns a small dict summarizing what was updated. Errors are captured
+    inline rather than raised — callers run this best-effort from background
+    threads where a gcal hiccup shouldn't break the log-write path.
+    """
+    if isinstance(log_date, str):
+        log_date = date.fromisoformat(log_date)
+
+    entries = state.sessions_on_date(log_date)
+    result: dict = {"ok": True, "log_date": log_date.isoformat()}
+    if not entries:
+        result["noop"] = True
+        result["reason"] = "no log entries for date"
+        return result
+
+    plan_text = state.load_plan()
+    rows = _parse_plan_rows(plan_text)
+    details = _parse_workout_details(plan_text)
+    plan_row = next((r for r in rows if r["date"] == log_date.isoformat()), None)
+    plan_detail = details.get(log_date.isoformat()) if plan_row else None
+    kind = _prescription_kind(plan_row["workout"]) if plan_row else None
+    result["prescription_kind"] = kind
+
+    matching: list[dict] = []
+    off_plan: list[dict] = []
+    for e in entries:
+        log_type = str(e.get("type", ""))
+        if plan_row and _log_matches_prescription(kind, log_type):
+            matching.append(e)
+        else:
+            off_plan.append(e)
+
+    logger.info(
+        "mark_complete %s: %d matching, %d off_plan (prescription_kind=%s)",
+        log_date.isoformat(),
+        len(matching),
+        len(off_plan),
+        kind,
+    )
+
+    from . import client
+
+    sync_state = _load_sync_state()
+    prescribed_id = _event_id(log_date.isoformat())
+    offplan_id = _completion_event_id(log_date.isoformat())
+
+    if matching and plan_row:
+        payload = _build_completed_payload(prescribed_id, plan_row, plan_detail, matching, log_date)
+        outcome = _apply_completed_event(client, prescribed_id, payload)
+        result["prescribed"] = outcome
+        sync_state[prescribed_id] = {
+            **(sync_state.get(prescribed_id) or {}),
+            "completed": True,
+            "last_completed_at": _now_iso(),
+        }
+
+    if off_plan:
+        payload = _build_completed_payload(offplan_id, None, None, off_plan, log_date)
+        outcome = _apply_completed_event(client, offplan_id, payload)
+        result["off_plan"] = outcome
+        sync_state[offplan_id] = {
+            **(sync_state.get(offplan_id) or {}),
+            "completed": True,
+            "off_plan": True,
+            "last_completed_at": _now_iso(),
+        }
+    else:
+        # No off-plan entries this call. If a precomplete event lingers from a
+        # previous call that mis-classified the same activity (Strava commonly
+        # fires create with a generic sport then update with the proper type
+        # — the first call partitions to off_plan, the second flips matching),
+        # clean it up so the user doesn't end up with a duplicate ✅ event on
+        # the same day.
+        if offplan_id in sync_state:
+            try:
+                client.delete_event(offplan_id)
+                sync_state.pop(offplan_id, None)
+                result["off_plan_cleanup"] = "deleted"
+                logger.info("Deleted stale off-plan event %s", offplan_id)
+            except Exception as e:
+                result["off_plan_cleanup_error"] = f"{type(e).__name__}: {e}"
+                logger.warning("Failed to delete stale off-plan event %s: %s", offplan_id, e)
+
+    try:
+        _write_sync_state(sync_state)
+    except Exception as e:
+        result["sync_state_error"] = f"{type(e).__name__}: {e}"
+
+    return result
+
+
+def _apply_completed_event(client_mod, event_id: str, payload: dict) -> dict:
+    """Insert if missing, otherwise patch. Returns a small action summary.
+
+    Tries insert first because the typical case for a prescribed-event update
+    is "event exists, we're toggling completion fields" — `insert` 409s, we
+    patch. For off-plan, the first call inserts cleanly; subsequent calls on
+    the same day 409 and patch (aggregation).
+    """
+    try:
+        client_mod.insert_event(payload)
+        return {"action": "inserted", "event_id": event_id}
+    except client_mod.GcalEventExistsError:
+        patch_payload = {k: v for k, v in payload.items() if k != "id"}
+        try:
+            client_mod.patch_event(event_id, patch_payload)
+            return {"action": "patched", "event_id": event_id}
+        except Exception as e:
+            return {"action": "error", "event_id": event_id, "error": f"{type(e).__name__}: {e}"}
+    except Exception as e:
+        return {"action": "error", "event_id": event_id, "error": f"{type(e).__name__}: {e}"}
 
 
 # ---------- sync-state file ----------
