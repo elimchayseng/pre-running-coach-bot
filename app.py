@@ -51,10 +51,19 @@ _loop_thread = threading.Thread(target=_start_loop, args=(_loop,), daemon=True)
 _loop_thread.start()
 
 
-def _run_async(coro):
-    """Run a coroutine on the persistent event loop and return its result."""
+def _run_async(coro, timeout: float = 180):
+    """Run a coroutine on the persistent event loop and return its result.
+
+    The default 180s ceiling is sized for the slowest path that goes through
+    here: a plan-edit Telegram update where the tool-use loop re-emits the
+    full plan.md as a tool-call argument. Now that the webhook acks 200 and
+    delegates `process_update` to a background thread, no caller of this
+    helper is on a gunicorn worker — so a longer wait does not block other
+    requests. Startup callers (`setup_webhook`, `initialize`) make short
+    network calls and finish well under this ceiling.
+    """
     future = asyncio.run_coroutine_threadsafe(coro, _loop)
-    return future.result(timeout=30)
+    return future.result(timeout=timeout)
 
 
 def get_telegram_app():
@@ -173,7 +182,7 @@ def webhook():
         try:
             _run_async(telegram_application.process_update(update))
         except Exception:
-            logger.exception(f"Telegram update processing failed (update_id={update_id})")
+            logger.exception("Telegram update processing failed update_id=%s", update_id)
 
     threading.Thread(target=_process_in_background, daemon=True).start()
     return jsonify({"status": "ok"}), 200

@@ -168,14 +168,14 @@ def _call_llm(messages: list[dict]):
     )
     if not response.choices:
         # Heroku Inference has been observed returning 200 + empty choices on
-        # heavy plan-edit turns (issue #17). Capture everything we can so the
-        # next occurrence is diagnosable: id, token usage, and a repr of the
-        # raw response.
+        # heavy plan-edit turns (issue #17). Capture the safe diagnostic
+        # fields — id and token counts only. We deliberately do NOT log the
+        # raw response object: some providers echo prompt fragments in error
+        # bodies, which would leak athlete content into Railway logs.
         logger.error(
-            "LLM returned no response choices. id=%s usage=%s raw=%r",
+            "LLM returned no response choices. id=%s usage=%s",
             getattr(response, "id", None),
             getattr(response, "usage", None),
-            response,
         )
         raise ValueError("LLM returned no response choices")
     choice = response.choices[0]
@@ -233,8 +233,16 @@ def chat(user_message: str) -> str:
     """Process a single user message via the tool-use loop.
 
     Short-term Redis history is persisted ONLY after a successful LLM
-    response, so a failure (or a Telegram-driven retry) doesn't permanently
-    corrupt the conversation with duplicate user turns. See issue #15.
+    response, so a failure (or, rarely, a Telegram-driven retry of the
+    same update_id) doesn't pollute the conversation with duplicate user
+    turns. See issue #15.
+
+    NOTE: this only covers conversational history. If the LLM succeeds on
+    early tool-use iterations and fails later, any tools that mutated
+    state/* or the calendar have already landed. A retry of the same
+    update would therefore re-execute those tools. With the webhook now
+    ack'ing 200 immediately, Telegram retries should be rare; full
+    tool-side idempotency is tracked as a separate follow-up.
     """
     global _cache_control_supported
     try:
