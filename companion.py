@@ -102,13 +102,21 @@ def build_system_prompt(state: StateManager) -> str:
             "  NOT treat them as completing the prescription.",
             "- Call log_session IMMEDIATELY when the user reports a run/workout/race — don't ask first.",
             "- Call get_fitness_summary BEFORE adjusting zones or making non-trivial plan changes.",
-            "- Call update_plan to modify a workout/week/block. Preserve the locked",
-            "  '| Day | Date | Workout | Pace target | Notes |' table format for the current week.",
-            "  For QUALITY sessions and races (workouts, long runs, races) in the current week,",
-            "  also write a '#### YYYY-MM-DD' sub-section in plan.md with rationale, structure",
-            "  breakdown (WU/work/CD), and execution cues. The Google Calendar event for that day",
-            "  uses this prose verbatim — it's what the user reads on their phone the morning of.",
-            "  Easy/recovery/rest days don't need a sub-section; they fall back to the table cells.",
+            "- Plan edits — pick the smallest tool that does the job:",
+            "  - update_workout(date, ...): default for single-day edits. Patch only the cells",
+            "    you want to change (workout, pace_target, notes), and pass detail_body for the",
+            "    per-day '#### YYYY-MM-DD' prose if it's a quality session, long run, or race.",
+            "    Easy/recovery/rest days don't need detail_body. The Google Calendar event for",
+            "    that day uses detail_body verbatim — it's what the user reads on their phone",
+            "    the morning of.",
+            "  - replace_week_table(rows, ...): use for block / phase transitions when most rows",
+            "    in the week change together. Detail sections are preserved; call update_workout",
+            "    afterwards for any NEW quality sessions that need detail prose.",
+            "  - update_plan(new_plan_markdown, ...): ESCAPE HATCH only. Use when applying a",
+            "    pending plan proposal verbatim, restructuring non-table sections, or creating",
+            "    a plan from scratch. Preserve the locked",
+            "    '| Day | Date | Workout | Pace target | Notes |' table format — get_todays_workout",
+            "    depends on it.",
             "- Call update_athlete to record new PRs, resolved injuries, zone updates.",
             "- Call append_journal IN THE SAME TURN whenever the user reports sleep, stress, travel,",
             "  illness, or other life context that should persist beyond this conversation.",
@@ -117,13 +125,14 @@ def build_system_prompt(state: StateManager) -> str:
             "=== ADAPTATION NORMS ===",
             "- One quality session does not justify a zone change. Adjust on trends only.",
             "- When the user reports anything affecting readiness today, reassess today's prescription.",
-            "  If you modify it, call update_plan with the change reason.",
+            "  If you modify it, call update_workout with the change reason (single-day edit).",
             "- Priority A race is Broken Arrow 46K (June 20). Brooklyn is a tune-up — don't over-cook it.",
             "- Surface trade-offs explicitly. Don't silently change the plan; explain reasoning.",
             "- If a pending plan proposal is shown above and the user confirms ('yes', 'apply', 'do it'),"
-            " call update_plan with the proposed new_plan_md and the proposal's reason as change_reason."
-            " If they decline or ask to revise, do not apply it; either discard or propose your own"
-            " revision via update_plan.",
+            " call update_plan with the proposed new_plan_md and the proposal's reason as change_reason"
+            " (proposal-apply is the escape-hatch case for full-plan writes). If they decline or ask"
+            " to revise, do not apply it; either discard or propose your own revision via update_workout"
+            " or update_plan as appropriate.",
         ]
     )
 

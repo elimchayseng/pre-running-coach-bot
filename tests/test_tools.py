@@ -217,6 +217,137 @@ class TestStateTools:
         assert out["sessions"][0]["miles"] == 6
 
 
+# ------------- patch tools (PR B / issue #19) -------------
+
+
+class TestPatchTools:
+    """update_workout and replace_week_table — the small-args plan-edit
+    tools that replace the whole-plan update_plan path for common cases."""
+
+    def _pin_today(self, monkeypatch, target):
+        from datetime import date as _date
+
+        import temporal_context
+
+        if isinstance(target, str):
+            target = _date.fromisoformat(target)
+        monkeypatch.setattr(temporal_context, "today_local", lambda: target)
+
+    def test_update_workout_dispatch(self, state, monkeypatch):
+        """End-to-end: tool call -> handler -> state.update_workout -> plan
+        contains the new cell, no warning emitted."""
+        self._pin_today(monkeypatch, "2026-04-28")
+        out = execute_tool(
+            "update_workout",
+            {
+                "date": "2026-04-28",
+                "workout": "Easy 5mi + 6 strides",
+                "change_reason": "more strides",
+            },
+            state,
+        )
+        assert out["ok"] is True
+        assert out["date"] == "2026-04-28"
+        assert "warning" not in out
+        assert "Easy 5mi + 6 strides" in state.load_plan()
+
+    def test_update_workout_with_detail_body(self, state, monkeypatch):
+        """detail_body in the same call creates the per-day section."""
+        self._pin_today(monkeypatch, "2026-04-28")
+        out = execute_tool(
+            "update_workout",
+            {
+                "date": "2026-04-28",
+                "workout": "Workout 5x800",
+                "detail_body": "WU 1mi. Work 5x800. CD 1mi.",
+                "change_reason": "tuesday quality",
+            },
+            state,
+        )
+        assert out["ok"] is True
+        plan = state.load_plan()
+        assert "Workout 5x800" in plan
+        assert "#### 2026-04-28" in plan
+        assert "WU 1mi. Work 5x800. CD 1mi." in plan
+
+    def test_update_workout_unknown_date_returns_error_dict(self, state, monkeypatch):
+        """Errors come back as {"error": ...} (the dispatcher contract), not
+        raised — so the agent can read the message and recover."""
+        self._pin_today(monkeypatch, "2026-04-28")
+        out = execute_tool(
+            "update_workout",
+            {
+                "date": "2030-12-31",
+                "workout": "Anything",
+                "change_reason": "x",
+            },
+            state,
+        )
+        assert "error" in out
+        assert "no row found" in out["error"]
+
+    def test_update_workout_does_not_clear_pending_proposal(self, state, monkeypatch, fake_redis):
+        """Patch-style edits are surgical, not proposal-apply. A pending
+        proposal must survive an update_workout call (only update_plan
+        consumes it)."""
+        self._pin_today(monkeypatch, "2026-04-28")
+        from pending_proposal_store import (
+            get_pending_plan_proposal,
+            set_pending_plan_proposal,
+        )
+
+        set_pending_plan_proposal({"summary": "x", "new_plan_md": "...", "reason": "..."})
+        execute_tool(
+            "update_workout",
+            {"date": "2026-04-28", "workout": "Easy 5mi", "change_reason": "x"},
+            state,
+        )
+        assert get_pending_plan_proposal() is not None
+
+    def test_replace_week_table_dispatch(self, state, monkeypatch):
+        """End-to-end bulk replacement via the dispatcher."""
+        self._pin_today(monkeypatch, "2026-04-28")
+        new_rows = [
+            {"day": "Mon", "date": "2026-05-04", "workout": "Off", "pace_target": "—", "notes": ""},
+            {
+                "day": "Tue",
+                "date": "2026-05-05",
+                "workout": "Easy 5mi",
+                "pace_target": "8:45-9:15",
+                "notes": "",
+            },
+        ]
+        out = execute_tool(
+            "replace_week_table",
+            {"rows": new_rows, "change_reason": "next week"},
+            state,
+        )
+        assert out["ok"] is True
+        assert out["rows_written"] == 2
+        plan = state.load_plan()
+        assert "2026-05-05" in plan
+        # Original Tuesday row is gone.
+        assert "Easy 4mi" not in plan
+
+    def test_replace_week_table_breaks_today_returns_warning(self, state, monkeypatch):
+        """If the new week table doesn't include today, the post-write check
+        should surface a warning so the agent can self-correct (same contract
+        as update_plan)."""
+        self._pin_today(monkeypatch, "2026-04-28")
+        # New week starts after today — today's row no longer exists.
+        new_rows = [
+            {"day": "Mon", "date": "2026-05-04", "workout": "Off", "pace_target": "—", "notes": ""},
+        ]
+        out = execute_tool(
+            "replace_week_table",
+            {"rows": new_rows, "change_reason": "next week"},
+            state,
+        )
+        assert out["ok"] is True
+        assert "warning" in out
+        assert "not parseable" in out["warning"]
+
+
 # ------------- plan tools -------------
 
 

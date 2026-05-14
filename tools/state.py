@@ -71,23 +71,119 @@ SCHEMAS = [
     {
         "type": "function",
         "function": {
+            "name": "update_workout",
+            "description": (
+                "PREFERRED tool for single-day plan edits — adjusting today's "
+                "or any specific day's workout, pace target, notes, and/or "
+                "per-day detail prose. Patches the locked weekly table row "
+                "for `date` in place; only the fields you pass change (others "
+                "stay as-is). If `detail_body` is supplied, the corresponding "
+                "'#### YYYY-MM-DD' section is created or its body replaced — "
+                "this is the prose Google Calendar uses verbatim as the event "
+                "description on the morning of the workout, so write it for "
+                "the user. Quality sessions and races in the current week "
+                "should always include a detail_body with rationale, "
+                "structure (WU / work / CD), and execution cues; "
+                "easy/recovery/rest days don't need one and fall back to the "
+                "table cells. Both the row patch and the detail body land in "
+                "a single atomic write with one changelog entry."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "date": {
+                        "type": "string",
+                        "description": "ISO date YYYY-MM-DD identifying the row to patch",
+                    },
+                    "workout": {
+                        "type": "string",
+                        "description": "New workout cell (e.g. 'Easy 5mi + 4 strides'). Omit to leave unchanged.",
+                    },
+                    "pace_target": {
+                        "type": "string",
+                        "description": "New pace target cell (e.g. '8:30-9:00'). Omit to leave unchanged.",
+                    },
+                    "notes": {
+                        "type": "string",
+                        "description": "New notes cell. Omit to leave unchanged.",
+                    },
+                    "detail_body": {
+                        "type": "string",
+                        "description": (
+                            "Per-day prose for the '#### YYYY-MM-DD' section "
+                            "(no heading — just the body). Creates the section "
+                            "if missing or replaces its body if present. Omit "
+                            "for easy/recovery/rest days."
+                        ),
+                    },
+                    "change_reason": {
+                        "type": "string",
+                        "description": "Short reason logged to plan_changelog.md",
+                    },
+                },
+                "required": ["date", "change_reason"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "replace_week_table",
+            "description": (
+                "Replace the entire locked weekly table at once. Use this for "
+                "block / phase transitions when most rows in the week change "
+                "together (e.g. taper week, recovery week, new training "
+                "block). Header and separator lines are preserved; only the "
+                "data rows change. Per-day '#### YYYY-MM-DD' detail sections "
+                "elsewhere in the plan are NOT touched — call update_workout "
+                "afterwards for any new quality sessions that need detail "
+                "prose. Prefer update_workout for single-day edits."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "rows": {
+                        "type": "array",
+                        "description": ("Ordered list of weekly rows. One per day to appear in the table."),
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "day": {"type": "string", "description": "Mon / Tue / ..."},
+                                "date": {"type": "string", "description": "ISO YYYY-MM-DD"},
+                                "workout": {"type": "string"},
+                                "pace_target": {"type": "string"},
+                                "notes": {"type": "string"},
+                            },
+                            "required": ["day", "date", "workout", "pace_target", "notes"],
+                        },
+                    },
+                    "change_reason": {
+                        "type": "string",
+                        "description": "Short reason logged to plan_changelog.md",
+                    },
+                },
+                "required": ["rows", "change_reason"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "update_plan",
             "description": (
-                "Replace plan.md with new content. Use when adjusting today's "
-                "workout, the week, or the broader block. CRITICAL: preserve "
-                "the locked '| Day | Date | Workout | Pace target | Notes |' "
-                "table format for the current week — get_todays_workout depends "
-                "on it. Append a 'Recent Plan Adjustments' line in the new "
-                "content noting the change and reason. "
-                "For QUALITY sessions and races (workouts, long runs, races) in "
-                "the current week, also include a per-day sub-section anchored "
-                "by '#### YYYY-MM-DD' (the date on its own line as an H4 "
-                "heading) with rationale, structure breakdown (WU / work / CD), "
-                "and execution cues. The Google Calendar sync uses this prose "
-                "verbatim as the event description, so write it the way you "
-                "want the user to read it on their phone the morning of. The "
-                "body extends until the next heading. Easy/recovery/rest days "
-                "don't need a sub-section — they fall back to the table cells."
+                "ESCAPE HATCH for full-plan rewrites. Prefer update_workout "
+                "(single-day edits) or replace_week_table (block transitions) "
+                "— they pass tiny tool-call args instead of the whole plan. "
+                "Reserve update_plan for: applying a pending plan proposal "
+                "verbatim, mid-block restructuring that touches many "
+                "non-table sections, or initial plan creation. "
+                "CRITICAL: preserve the locked "
+                "'| Day | Date | Workout | Pace target | Notes |' "
+                "table format for the current week — get_todays_workout "
+                "depends on it. For QUALITY sessions and races, include "
+                "per-day '#### YYYY-MM-DD' sub-sections with rationale, "
+                "structure (WU / work / CD), and execution cues. The body "
+                "extends until the next heading."
             ),
             "parameters": {
                 "type": "object",
@@ -203,32 +299,73 @@ def _mark_calendar_complete(state, entry: dict) -> None:
 def _update_plan(args: dict, state) -> dict:
     state.update_plan(args["new_plan_markdown"], args["change_reason"])
     result = {"ok": True, "change_reason": args["change_reason"]}
-    # Any pending post-activity proposal is now consumed (either applied
-    # verbatim or superseded by a manual edit). Clear it so it doesn't
-    # linger in the next system prompt.
+    _consume_pending_proposal()
+    _attach_today_warning_if_broken(state, result)
+    return result
+
+
+def _update_workout(args: dict, state) -> dict:
+    """Patch a single row + optional detail body. Issue #19 root-cause fix
+    for plan-edit empty-choices: this tool's args stay small (no whole-plan
+    re-emit) so the model produces output tokens before any upstream
+    deadline fires."""
+    target = date.fromisoformat(args["date"])
+    state.update_workout(
+        target_date=target,
+        change_note=args["change_reason"],
+        workout=args.get("workout"),
+        pace_target=args.get("pace_target"),
+        notes=args.get("notes"),
+        detail_body=args.get("detail_body"),
+    )
+    result = {"ok": True, "date": args["date"], "change_reason": args["change_reason"]}
+    _attach_today_warning_if_broken(state, result)
+    return result
+
+
+def _replace_week_table(args: dict, state) -> dict:
+    """Bulk replacement of the weekly table. For block / phase transitions
+    when most rows change together. Detail sections are preserved."""
+    state.replace_week_table(args["rows"], args["change_reason"])
+    result = {
+        "ok": True,
+        "rows_written": len(args["rows"]),
+        "change_reason": args["change_reason"],
+    }
+    _attach_today_warning_if_broken(state, result)
+    return result
+
+
+def _consume_pending_proposal() -> None:
+    """Any pending post-activity proposal is consumed when the plan is
+    rewritten wholesale. Clear it so it doesn't linger in the next system
+    prompt. Patch tools (update_workout / replace_week_table) intentionally
+    do NOT clear — they're targeted edits, not proposal-apply."""
     try:
         from pending_proposal_store import clear_pending_plan_proposal
 
         clear_pending_plan_proposal()
     except Exception:
         pass
-    # After write, verify today's row is parseable. The locked
-    # "| Day | Date | Workout | Pace target | Notes |" table format is what
-    # /today depends on — if the agent's write broke it, surface a warning
-    # the agent can act on (vs. silent failure when /today returns "no
-    # workout prescribed").
+
+
+def _attach_today_warning_if_broken(state, result: dict) -> None:
+    """After any plan write, verify today's row is still parseable. The
+    locked '| Day | Date | Workout | Pace target | Notes |' table format
+    is what get_todays_workout depends on — if a write broke it, surface
+    a warning the agent can act on (vs. silent failure when /today returns
+    'no workout prescribed')."""
     from temporal_context import today_local
 
     today_check = state.get_todays_workout(today_local())
     if not today_check["found"]:
         result["warning"] = (
-            "Today's row not parseable from the new plan. The locked "
+            "Today's row not parseable from the updated plan. The locked "
             "'| Day | Date | Workout | Pace target | Notes |' table format "
             "must be preserved for the current week — /today depends on it. "
-            "Re-check the plan and call update_plan again if the table is "
-            "missing or misformatted."
+            "Re-check the plan and call the appropriate tool again if the "
+            "table is missing or misformatted."
         )
-    return result
 
 
 def _append_journal(args: dict, state) -> dict:
@@ -251,6 +388,8 @@ def _get_sessions(args: dict, state) -> dict:
 HANDLERS = {
     "log_session": _log_session,
     "update_plan": _update_plan,
+    "update_workout": _update_workout,
+    "replace_week_table": _replace_week_table,
     "append_journal": _append_journal,
     "update_athlete": _update_athlete,
     "get_sessions": _get_sessions,

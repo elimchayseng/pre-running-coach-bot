@@ -125,6 +125,211 @@ class TestPlan:
         assert state.load_plan() == "# v2"
 
 
+# ---------------- surgical plan edits (PR B / issue #19) ----------------
+
+
+PLAN_WITH_DETAIL = """\
+# Plan
+
+## This Week (2026-04-27 → 2026-05-03)
+
+| Day | Date | Workout | Pace target | Notes |
+|-----|------|---------|-------------|-------|
+| Mon | 2026-04-27 | Off / strength upper | — | |
+| Tue | 2026-04-28 | Easy 4mi + 4 strides | 8:45-9:15 | Strides 20s |
+| Wed | 2026-04-29 | Cross-train 30-45min | — | |
+| Sat | 2026-05-02 | Easy 6mi rolling | 8:45-9:15 | Some climb |
+
+#### 2026-04-28
+
+Original detail prose for Tuesday strides session.
+WU: 1mi easy
+Work: 4 x 20s strides
+CD: 1mi easy
+"""
+
+
+class TestUpdateWorkout:
+    """Single-row patches via state.update_workout — surgical edits that
+    avoid round-tripping the entire plan through the LLM."""
+
+    def test_patch_single_cell_preserves_others(self, state):
+        state.update_plan(PLAN_WITH_DETAIL, "seed")
+        state.update_workout(
+            target_date=date(2026, 4, 28),
+            change_note="bump strides count",
+            workout="Easy 4mi + 6 strides",
+        )
+        plan = state.load_plan()
+        # The new cell landed.
+        assert "Easy 4mi + 6 strides" in plan
+        # Pace and notes for that row stayed.
+        assert "8:45-9:15" in plan
+        assert "Strides 20s" in plan
+        # Other rows untouched.
+        assert "Off / strength upper" in plan
+        assert "Easy 6mi rolling" in plan
+
+    def test_patch_multiple_fields_in_one_call(self, state):
+        state.update_plan(PLAN_WITH_DETAIL, "seed")
+        state.update_workout(
+            target_date=date(2026, 4, 28),
+            change_note="bump everything",
+            workout="Tempo 6mi",
+            pace_target="6:30-6:40",
+            notes="focus on relaxed shoulders",
+        )
+        plan = state.load_plan()
+        assert "Tempo 6mi" in plan
+        assert "6:30-6:40" in plan
+        assert "focus on relaxed shoulders" in plan
+        # Original Tue cells should be gone.
+        assert "Easy 4mi + 4 strides" not in plan
+        assert "Strides 20s" not in plan
+
+    def test_no_matching_row_raises(self, state):
+        state.update_plan(PLAN_WITH_DETAIL, "seed")
+        with pytest.raises(ValueError, match="no row found"):
+            state.update_workout(
+                target_date=date(2030, 1, 1),
+                change_note="nope",
+                workout="Anything",
+            )
+
+    def test_no_fields_raises(self, state):
+        state.update_plan(PLAN_WITH_DETAIL, "seed")
+        with pytest.raises(ValueError, match="must pass at least one"):
+            state.update_workout(target_date=date(2026, 4, 28), change_note="x")
+
+    def test_empty_plan_raises(self, state):
+        with pytest.raises(ValueError, match="plan is empty"):
+            state.update_workout(
+                target_date=date(2026, 4, 28),
+                change_note="x",
+                workout="anything",
+            )
+
+    def test_detail_body_only_no_row_edit(self, state):
+        """detail_body should work without any row-cell change. Useful when
+        the LLM only wants to enrich the per-day prose."""
+        state.update_plan(PLAN_WITH_DETAIL, "seed")
+        state.update_workout(
+            target_date=date(2026, 4, 28),
+            change_note="enrich detail",
+            detail_body="Updated prose for Tuesday.\nFocus on cadence.",
+        )
+        plan = state.load_plan()
+        # New body landed.
+        assert "Updated prose for Tuesday." in plan
+        assert "Focus on cadence." in plan
+        # Old body gone.
+        assert "Original detail prose for Tuesday strides session." not in plan
+        # Locked table row unchanged.
+        assert "Easy 4mi + 4 strides" in plan
+
+    def test_detail_body_creates_section_when_missing(self, state):
+        state.update_plan(PLAN_WITH_DETAIL, "seed")
+        state.update_workout(
+            target_date=date(2026, 5, 2),
+            change_note="add Saturday detail",
+            detail_body="Long-run cues for Saturday.",
+        )
+        plan = state.load_plan()
+        assert "#### 2026-05-02" in plan
+        assert "Long-run cues for Saturday." in plan
+        # Existing Tuesday detail untouched.
+        assert "Original detail prose for Tuesday strides session." in plan
+
+    def test_combined_row_and_detail_in_one_transaction(self, state):
+        state.update_plan(PLAN_WITH_DETAIL, "seed")
+        state.update_workout(
+            target_date=date(2026, 4, 28),
+            change_note="combined",
+            workout="Workout 5x800",
+            pace_target="6:00",
+            detail_body="WU 1mi easy. Work 5x800 @ 6:00 / 400 jog. CD 1mi.",
+        )
+        plan = state.load_plan()
+        assert "Workout 5x800" in plan
+        assert "WU 1mi easy. Work 5x800 @ 6:00 / 400 jog. CD 1mi." in plan
+        assert "Original detail prose for Tuesday strides session." not in plan
+        # Single combined edit produces a single changelog entry.
+        with state._conn() as c:
+            row = c.execute("SELECT content FROM plan_changelog WHERE id=1").fetchone()
+        assert row["content"].count("combined") == 1
+
+    def test_detail_body_replace_does_not_disturb_other_sections(self, state):
+        """The replacement should stop at the next heading. Trailing content
+        below an unrelated heading must be preserved."""
+        plan_with_trailing = (
+            PLAN_WITH_DETAIL
+            + "\n## Notes\n\nAccessory mobility 10min daily.\n"
+            + "\n#### 2026-05-02\n\nLong-run plan A.\n"
+        )
+        state.update_plan(plan_with_trailing, "seed")
+        state.update_workout(
+            target_date=date(2026, 4, 28),
+            change_note="replace tue detail only",
+            detail_body="NEW Tuesday body.",
+        )
+        plan = state.load_plan()
+        assert "NEW Tuesday body." in plan
+        # The unrelated trailing sections must survive untouched.
+        assert "Accessory mobility 10min daily." in plan
+        assert "Long-run plan A." in plan
+
+
+class TestReplaceWeekTable:
+    """Bulk weekly-table replacement for block / phase transitions."""
+
+    def test_replaces_all_rows(self, state):
+        state.update_plan(PLAN_WITH_DETAIL, "seed")
+        new_rows = [
+            {"day": "Mon", "date": "2026-05-04", "workout": "Off", "pace_target": "—", "notes": ""},
+            {"day": "Tue", "date": "2026-05-05", "workout": "Easy 5mi", "pace_target": "8:45-9:15", "notes": ""},
+            {"day": "Wed", "date": "2026-05-06", "workout": "Tempo 6mi", "pace_target": "6:30", "notes": "track"},
+        ]
+        state.replace_week_table(new_rows, "next week")
+        plan = state.load_plan()
+        # Old data rows gone.
+        assert "Easy 4mi + 4 strides" not in plan
+        assert "Easy 6mi rolling" not in plan
+        # New data rows present.
+        assert "2026-05-05" in plan
+        assert "Tempo 6mi" in plan
+        # Header + separator preserved.
+        assert "| Day | Date | Workout | Pace target | Notes |" in plan
+        assert "|-----|------|---------|-------------|-------|" in plan
+
+    def test_preserves_per_day_detail_sections(self, state):
+        state.update_plan(PLAN_WITH_DETAIL, "seed")
+        state.replace_week_table(
+            [{"day": "Mon", "date": "2026-05-04", "workout": "Off", "pace_target": "—", "notes": ""}],
+            "trim",
+        )
+        plan = state.load_plan()
+        # The Tuesday detail section is outside the table — it must survive.
+        assert "#### 2026-04-28" in plan
+        assert "Original detail prose for Tuesday strides session." in plan
+
+    def test_missing_key_raises(self, state):
+        state.update_plan(PLAN_WITH_DETAIL, "seed")
+        bad = [{"day": "Mon", "date": "2026-05-04", "workout": "Off"}]  # missing pace_target, notes
+        with pytest.raises(ValueError, match="missing required keys"):
+            state.replace_week_table(bad, "x")
+
+    def test_no_locked_table_raises(self, state):
+        state.update_plan("# Plan\n\nNo table here.", "seed")
+        new_rows = [{"day": "Mon", "date": "2026-05-04", "workout": "Off", "pace_target": "—", "notes": ""}]
+        with pytest.raises(ValueError, match="no locked-format table"):
+            state.replace_week_table(new_rows, "x")
+
+    def test_empty_rows_raises(self, state):
+        state.update_plan(PLAN_WITH_DETAIL, "seed")
+        with pytest.raises(ValueError, match="rows must be non-empty"):
+            state.replace_week_table([], "x")
+
+
 # ---------------- sessions / log ----------------
 
 

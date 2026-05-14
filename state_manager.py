@@ -23,6 +23,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import re
 import sqlite3
 import threading
 from contextlib import contextmanager
@@ -322,6 +323,83 @@ class StateManager:
                 (changelog_entry,),
             )
 
+    # ---------- Surgical plan edits (PR B / issue #19) ----------
+    #
+    # The full update_plan path requires the LLM to re-emit the entire plan
+    # markdown as a tool argument. These helpers take a small patch, apply
+    # it server-side, and route the result through update_plan so the
+    # SQLite transaction + changelog guarantees are reused.
+
+    def update_workout(
+        self,
+        target_date: date,
+        change_note: str,
+        workout: Optional[str] = None,
+        pace_target: Optional[str] = None,
+        notes: Optional[str] = None,
+        detail_body: Optional[str] = None,
+    ) -> None:
+        """Patch the locked-table row for ``target_date`` and/or its per-day
+        ``#### YYYY-MM-DD`` detail section. Both edits compose into one
+        update_plan transaction (one changelog entry, atomic write).
+
+        Only non-None row fields (workout, pace_target, notes) are touched;
+        the day and date cells stay as-is. ``detail_body``, if passed, is
+        normalized (trimmed) and either replaces the existing section's
+        body or appends a new section at the end of the plan.
+
+        Raises ValueError when no fields are passed, when the plan is
+        empty, or when ``target_date`` has no row in the locked table
+        (only checked when a row field was passed — detail-only edits
+        don't require an existing table row).
+        """
+        has_row_edit = any(v is not None for v in (workout, pace_target, notes))
+        body_clean = (detail_body or "").strip()
+        has_detail_edit = bool(body_clean)
+        if not has_row_edit and not has_detail_edit:
+            raise ValueError("must pass at least one of workout, pace_target, notes, detail_body")
+        plan_text = self.load_plan()
+        if not plan_text:
+            raise ValueError("plan is empty; nothing to patch")
+
+        if has_row_edit:
+            patched = _replace_workout_row(plan_text, target_date, workout, pace_target, notes)
+            if patched is None:
+                raise ValueError(f"no row found in locked table for date {target_date.isoformat()}")
+            plan_text = patched
+
+        if has_detail_edit:
+            plan_text = _set_workout_detail(plan_text, target_date.isoformat(), body_clean)
+
+        self.update_plan(plan_text, change_note)
+
+    def replace_week_table(
+        self,
+        rows: list[dict],
+        change_note: str,
+    ) -> None:
+        """Replace the (first) locked-format weekly table with ``rows``.
+
+        Each row dict must have keys: day, date, workout, pace_target, notes.
+        The header and separator lines are preserved; only data rows change.
+        Per-day ``#### YYYY-MM-DD`` sections elsewhere in the plan are NOT
+        touched. Raises ValueError if no locked-format table is found or
+        rows are malformed."""
+        if not rows:
+            raise ValueError("rows must be non-empty")
+        required = ("day", "date", "workout", "pace_target", "notes")
+        for r in rows:
+            missing = [k for k in required if k not in r]
+            if missing:
+                raise ValueError(f"row missing required keys {missing}: {r}")
+        plan_text = self.load_plan()
+        if not plan_text:
+            raise ValueError("plan is empty; nothing to replace")
+        new_text = _replace_locked_table(plan_text, rows)
+        if new_text is None:
+            raise ValueError("no locked-format table found in plan")
+        self.update_plan(new_text, change_note)
+
     def append_journal(self, entry: str, when: Optional[datetime] = None) -> None:
         """Append a timestamped entry to the journal."""
         ts = (when or datetime.now()).strftime("%Y-%m-%d %H:%M")
@@ -450,3 +528,135 @@ def _find_workout_row(plan_text: str, target_date: date) -> Optional[dict]:
                 "notes": parts[4],
             }
     return None
+
+
+# ---------- Surgical plan-edit helpers (PR B / issue #19) ----------
+
+# Locked weekly-table contract (also enforced by the system prompt + the
+# update_plan post-write check). Header text comparison is case-sensitive
+# and exact — the LLM is instructed to emit this header verbatim.
+_LOCKED_HEADER_TOKENS = ("Day", "Date", "Workout", "Pace target", "Notes")
+
+# Per-day detail sections are H4 headings whose only content is an ISO date.
+# Tolerant of trailing whitespace; insensitive to leading whitespace on the
+# heading line itself.
+_DETAIL_HEADING_RE = re.compile(r"^####\s+(\d{4}-\d{2}-\d{2})\s*$")
+
+
+def _matches_date_cell(cell: str, iso: str, md: str) -> bool:
+    """Same matching rule used by _find_workout_row, factored out so the
+    edit path and the read path can't drift."""
+    return cell == iso or cell == md or iso in cell or md in cell
+
+
+def _replace_workout_row(
+    plan_text: str,
+    target_date: date,
+    workout: Optional[str],
+    pace_target: Optional[str],
+    notes: Optional[str],
+) -> Optional[str]:
+    """Return plan_text with the locked-table row for target_date patched.
+    Returns None if no row matches. Preserves the trailing newline status
+    of the original plan_text so byte-equivalence in tests stays clean."""
+    iso = target_date.isoformat()
+    md = f"{target_date.month}/{target_date.day}"
+    lines = plan_text.splitlines()
+    for i, line in enumerate(lines):
+        if "|" not in line:
+            continue
+        parts = [p.strip() for p in line.strip().strip("|").split("|")]
+        if len(parts) < 5:
+            continue
+        if not _matches_date_cell(parts[1], iso, md):
+            continue
+        # Replace only non-None fields. Day name + date stay.
+        if workout is not None:
+            parts[2] = workout
+        if pace_target is not None:
+            parts[3] = pace_target
+        if notes is not None:
+            parts[4] = notes
+        lines[i] = "| " + " | ".join(parts) + " |"
+        return "\n".join(lines) + ("\n" if plan_text.endswith("\n") else "")
+    return None
+
+
+def _set_workout_detail(plan_text: str, iso: str, body: str) -> str:
+    """Create or replace the '#### {iso}' section's body. The heading line
+    itself is rewritten to a canonical form ('#### YYYY-MM-DD') even when
+    replacing — minor normalization, no semantic change."""
+    lines = plan_text.splitlines() if plan_text else []
+    canonical_heading = f"#### {iso}"
+
+    start = None
+    for i, line in enumerate(lines):
+        m = _DETAIL_HEADING_RE.match(line.strip())
+        if m and m.group(1) == iso:
+            start = i
+            break
+
+    body_lines = body.splitlines()
+
+    if start is None:
+        # Append at end. Strip any trailing blank lines on the existing
+        # plan first so we don't end up with three blank lines in a row.
+        result = lines[:]
+        while result and not result[-1].strip():
+            result.pop()
+        if result:
+            result.append("")
+        result.append(canonical_heading)
+        result.append("")
+        result.extend(body_lines)
+        # Always end the new plan with a trailing newline.
+        return "\n".join(result) + "\n"
+
+    # Replace existing section's body. End is the next heading or EOF.
+    end = len(lines)
+    for j in range(start + 1, len(lines)):
+        if lines[j].lstrip().startswith("#"):
+            end = j
+            break
+
+    replacement = [canonical_heading, "", *body_lines, ""]
+    new_lines = lines[:start] + replacement + lines[end:]
+    return "\n".join(new_lines) + ("\n" if plan_text.endswith("\n") else "")
+
+
+def _replace_locked_table(plan_text: str, rows: list[dict]) -> Optional[str]:
+    """Replace the first locked-format table found. Returns None if no
+    locked header is present."""
+    lines = plan_text.splitlines() if plan_text else []
+    header_idx = None
+    for i, line in enumerate(lines):
+        if "|" not in line:
+            continue
+        parts = [p.strip() for p in line.strip().strip("|").split("|")]
+        if len(parts) >= 5 and tuple(parts[:5]) == _LOCKED_HEADER_TOKENS:
+            header_idx = i
+            break
+    if header_idx is None:
+        return None
+
+    # The separator line is conventionally header_idx + 1. Don't validate
+    # its exact shape — the locked format is enforced upstream by the
+    # system prompt. We keep whatever's there.
+    sep_idx = header_idx + 1
+
+    # Find the end of the table: the first non-pipe line, or any pipe-line
+    # with fewer than 5 cells (a malformed row likely means we've fallen
+    # off the table).
+    table_end = sep_idx + 1
+    while table_end < len(lines):
+        line = lines[table_end]
+        if "|" not in line or not line.strip():
+            break
+        parts = [p.strip() for p in line.strip().strip("|").split("|")]
+        if len(parts) < 5:
+            break
+        table_end += 1
+
+    new_row_lines = [f"| {r['day']} | {r['date']} | {r['workout']} | {r['pace_target']} | {r['notes']} |" for r in rows]
+    new_lines = lines[: sep_idx + 1] + new_row_lines + lines[table_end:]
+    return "\n".join(new_lines) + ("\n" if plan_text.endswith("\n") else "")
