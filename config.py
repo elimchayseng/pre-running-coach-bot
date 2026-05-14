@@ -37,11 +37,14 @@ if not TESTING:
 
     from openai import OpenAI
 
-    # Heroku LLM client (OpenAI-compatible)
+    # Heroku LLM client (OpenAI-compatible).
+    # 60s SDK timeout (was 30s) so we don't race the upstream provider's own
+    # ~29s deadline. The previous 30s coincidence meant we were a hair from
+    # raising APITimeoutError on top of the existing empty-choices failures.
     llm_client = OpenAI(
         base_url=os.getenv("HEROKU_INFERENCE_URL"),
         api_key=os.getenv("HEROKU_INFERENCE_KEY"),
-        timeout=30.0,
+        timeout=60.0,
     )
 else:
     llm_client = None

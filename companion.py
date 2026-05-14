@@ -195,6 +195,7 @@ def _is_cache_control_rejection(exc: BadRequestError) -> bool:
 )
 def _call_llm(messages: list[dict]):
     """Single LLM call with tools; retry wraps just this call."""
+    t_start = time.perf_counter()
     response = llm_client.chat.completions.create(
         model=HEROKU_MODEL,
         messages=messages,
@@ -205,11 +206,16 @@ def _call_llm(messages: list[dict]):
     if not response.choices:
         # Heroku Inference has been observed returning 200 + empty choices on
         # heavy plan-edit turns (issue #17). Capture the safe diagnostic
-        # fields — id and token counts only. We deliberately do NOT log the
-        # raw response object: some providers echo prompt fragments in error
-        # bodies, which would leak athlete content into Railway logs.
+        # fields — elapsed time, id, and token counts only. elapsed_ms is
+        # the load-bearing field: it tells us whether the failure clusters
+        # at a fixed deadline (Heroku/upstream cap) or varies (transient).
+        # We deliberately do NOT log the raw response object: some providers
+        # echo prompt fragments in error bodies, which would leak athlete
+        # content into Railway logs.
+        elapsed_ms = int((time.perf_counter() - t_start) * 1000)
         logger.error(
-            "LLM returned no response choices. id=%s usage=%s",
+            "LLM returned no response choices. elapsed_ms=%d id=%s usage=%s",
+            elapsed_ms,
             getattr(response, "id", None),
             getattr(response, "usage", None),
         )
