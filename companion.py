@@ -11,6 +11,8 @@ in-conversation history lives in Redis (see conversation_store).
 from __future__ import annotations
 
 import json
+import threading
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -29,6 +31,14 @@ MAX_TOOL_LOOPS = 8
 
 _state: Optional[StateManager] = None
 _cache_control_supported: Optional[bool] = None  # learned at runtime
+
+# Serializes companion.chat across background threads. /webhook now dispatches
+# each Telegram update to a daemon thread (see app.webhook); without this lock,
+# two concurrent updates would race on the Redis session:history key (a
+# read-modify-write pair) and on SQLite plan writes performed by tools. The
+# original single-worker gunicorn config relied on the worker timeout as the
+# implicit serialization governor; this lock restores that guarantee.
+_chat_lock = threading.Lock()
 
 
 def _get_state() -> StateManager:
@@ -152,6 +162,32 @@ def _build_system_message(prompt_text: str, use_cache_control: bool) -> dict:
     return {"role": "system", "content": prompt_text}
 
 
+def _is_cache_control_rejection(exc: BadRequestError) -> bool:
+    """True iff the BadRequestError is the specific provider rejection of the
+    cache_control field on system messages — distinct from other 400s.
+
+    The previous form (`"content" in str(e).lower()`) over-matched: any
+    BadRequestError mentioning "content" (e.g. message-shape validation
+    errors) would silently flip _cache_control_supported and disable caching
+    permanently. Match on the literal `cache_control` token instead, in
+    whichever of body/response carries the structured error.
+    """
+    body = getattr(exc, "body", None) or {}
+    if isinstance(body, dict):
+        msg = (body.get("error") or {}).get("message") or ""
+        if "cache_control" in msg.lower():
+            return True
+    resp = getattr(exc, "response", None)
+    if resp is not None:
+        try:
+            text = resp.text or ""
+        except Exception:
+            text = ""
+        if "cache_control" in text.lower():
+            return True
+    return False
+
+
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=2, max=15),
@@ -196,10 +232,19 @@ def agent_turn(messages: list[dict], state: StateManager) -> str:
 
     Mutates `messages` in place (appends assistant + tool messages).
     Returns the final assistant text content.
+
+    Per-iteration timing is logged at INFO so production logs answer issue
+    #17's open question — whether a slow plan-edit turn is one slow LLM
+    call or many short ones. That data informs whether the patch-style
+    update_plan refactor (PR B) actually targets the bottleneck.
     """
     msg = None
-    for _ in range(MAX_TOOL_LOOPS):
+    for i in range(MAX_TOOL_LOOPS):
+        t_llm = time.perf_counter()
         msg = _call_llm(messages)
+        llm_ms = int((time.perf_counter() - t_llm) * 1000)
+        n_tool_calls = len(msg.tool_calls) if msg.tool_calls else 0
+        logger.info("agent_turn iter=%d llm_ms=%d tool_calls=%d", i, llm_ms, n_tool_calls)
 
         msg_dict = msg.model_dump(exclude_none=True)
         # Heroku rejects null/empty content on assistant messages that carry
@@ -212,11 +257,14 @@ def agent_turn(messages: list[dict], state: StateManager) -> str:
             return msg.content or ""
 
         for tc in msg.tool_calls:
+            t_tool = time.perf_counter()
             try:
                 args = json.loads(tc.function.arguments) if tc.function.arguments else {}
                 result = execute_tool(tc.function.name, args, state)
             except json.JSONDecodeError as e:
                 result = {"error": f"invalid JSON args: {e}"}
+            tool_ms = int((time.perf_counter() - t_tool) * 1000)
+            logger.info("agent_turn iter=%d tool=%s tool_ms=%d", i, tc.function.name, tool_ms)
             messages.append(
                 {
                     "role": "tool",
@@ -243,43 +291,49 @@ def chat(user_message: str) -> str:
     update would therefore re-execute those tools. With the webhook now
     ack'ing 200 immediately, Telegram retries should be rare; full
     tool-side idempotency is tracked as a separate follow-up.
+
+    The body runs under _chat_lock so concurrent webhook updates can't
+    race on Redis history or SQLite plan writes. The lock spans the whole
+    function — including the Redis read-modify-write pair — because the
+    history hazard is in get_history()/add_turn(), not just agent_turn().
     """
     global _cache_control_supported
-    try:
-        state = _get_state()
-        prompt_text = build_system_prompt(state)
+    with _chat_lock:
+        try:
+            state = _get_state()
+            prompt_text = build_system_prompt(state)
 
-        history = get_history()
-        # The new user turn rides along in the prompt but isn't written to
-        # Redis until agent_turn succeeds. If the LLM raises, history stays
-        # at its pre-call shape and the next attempt sees a clean prefix.
-        new_user_turn = {"role": "user", "content": user_message}
+            history = get_history()
+            # The new user turn rides along in the prompt but isn't written to
+            # Redis until agent_turn succeeds. If the LLM raises, history stays
+            # at its pre-call shape and the next attempt sees a clean prefix.
+            new_user_turn = {"role": "user", "content": user_message}
 
-        # Probe cache_control on first call; fall back to plain string if Heroku rejects.
-        if _cache_control_supported is None or _cache_control_supported:
-            try:
-                messages = [_build_system_message(prompt_text, True), *history, new_user_turn]
-                assistant = agent_turn(messages, state)
-                _cache_control_supported = True
-                add_turn("user", user_message)
-                add_turn("assistant", assistant)
-                return assistant
-            except BadRequestError as e:
-                if _cache_control_supported is None and "content" in str(e).lower():
-                    logger.warning("cache_control rejected by Heroku; falling back to plain string content")
-                    _cache_control_supported = False
-                else:
-                    raise
+            # Probe cache_control on first call; fall back to plain string if Heroku rejects.
+            if _cache_control_supported is None or _cache_control_supported:
+                try:
+                    messages = [_build_system_message(prompt_text, True), *history, new_user_turn]
+                    assistant = agent_turn(messages, state)
+                    _cache_control_supported = True
+                    add_turn("user", user_message)
+                    add_turn("assistant", assistant)
+                    return assistant
+                except BadRequestError as e:
+                    if _cache_control_supported is None and _is_cache_control_rejection(e):
+                        logger.warning("cache_control rejected by provider; falling back to plain string content")
+                        _cache_control_supported = False
+                    else:
+                        raise
 
-        messages = [_build_system_message(prompt_text, False), *history, new_user_turn]
-        assistant = agent_turn(messages, state)
-        add_turn("user", user_message)
-        add_turn("assistant", assistant)
-        return assistant
+            messages = [_build_system_message(prompt_text, False), *history, new_user_turn]
+            assistant = agent_turn(messages, state)
+            add_turn("user", user_message)
+            add_turn("assistant", assistant)
+            return assistant
 
-    except Exception as e:
-        logger.error(f"companion.chat failed: {e}", exc_info=True)
-        return "I apologize, but I'm having trouble processing your request. Please try again."
+        except Exception as e:
+            logger.error(f"companion.chat failed: {e}", exc_info=True)
+            return "I apologize, but I'm having trouble processing your request. Please try again."
 
 
 def reset_session() -> None:
