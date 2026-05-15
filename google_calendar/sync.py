@@ -49,11 +49,6 @@ _PRUNE_TZ_BUFFER_DAYS = 1
 # old dict-shaped API so the rest of this module is unchanged.
 
 _BOLD_RE = re.compile(r"\*\*(.+?)\*\*")
-_ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-# Per-day workout-detail anchor: a `#### YYYY-MM-DD` heading on its own line.
-# The body extends until the next heading at level <= 4 (####, ###, ##, #) or EOF.
-_DETAIL_ANCHOR_RE = re.compile(r"^####\s+(\d{4}-\d{2}-\d{2})\s*$")
-_HEADING_RE = re.compile(r"^#{1,4}\s+\S")
 
 # Google caps event description at 8 KB (bytes, not chars). Stay under with a
 # safety margin so the extra "(synced by PRE)" footer + truncation marker fit.
@@ -64,13 +59,15 @@ DESCRIPTION_MAX_BYTES = 7000
 
 
 def sync_plan(state, dry_run: bool = False) -> dict:
-    """Sync plan.md table rows to the PRE Training calendar.
+    """Sync prescription rows from `sessions` to the PRE Training calendar.
 
     Returns {inserted, patched, deleted, unchanged, errors, dry_run}.
     """
-    plan_text = state.load_plan()
-    rows = _parse_plan_rows(plan_text)
-    details = _parse_workout_details(plan_text)
+    today = today_local()
+    rows = state.get_prescription_rows(
+        today - timedelta(days=PRUNE_WINDOW_DAYS),
+        today + timedelta(days=PRUNE_WINDOW_DAYS),
+    )
     sync_state = _load_sync_state(state)
     new_sync_state: dict[str, dict] = {}
 
@@ -80,11 +77,12 @@ def sync_plan(state, dry_run: bool = False) -> dict:
 
     from . import client
 
-    for row in rows:
+    for srow in rows:
+        row = _plan_dict(srow)
         event_id = _event_id(row["date"])
         synced_dates.add(row["date"])
         try:
-            payload, payload_hash = _build_event_payload(row, event_id, details.get(row["date"]))
+            payload, payload_hash = _build_event_payload(row, event_id, srow.get("detail_md"))
         except Exception as e:
             errors.append({"date": row["date"], "error": f"payload_build: {e}"})
             continue
@@ -190,72 +188,18 @@ def sync_plan(state, dry_run: bool = False) -> dict:
     }
 
 
-# ---------- plan parsing ----------
+# ---------- plan rows ----------
 
 
-def _parse_plan_rows(plan_text: str) -> list[dict]:
-    """Return all locked-format rows in the plan as dicts.
-
-    Locked format: | Day | Date | Workout | Pace target | Notes |
-    where Date is an ISO YYYY-MM-DD. Header / separator / phase-2 prose
-    rows are silently skipped.
-    """
-    out: list[dict] = []
-    for line in plan_text.splitlines():
-        if "|" not in line:
-            continue
-        parts = [p.strip() for p in line.strip().strip("|").split("|")]
-        if len(parts) < 5:
-            continue
-        date_cell = parts[1]
-        if not _ISO_DATE_RE.match(date_cell):
-            continue
-        try:
-            date.fromisoformat(date_cell)
-        except ValueError:
-            continue
-        workout = parts[2].strip()
-        if workout in {"", "-", "—"}:
-            continue
-        out.append(
-            {
-                "day_name": parts[0],
-                "date": date_cell,
-                "workout": workout,
-                "pace_target": parts[3],
-                "notes": parts[4],
-            }
-        )
-    return out
-
-
-def _parse_workout_details(plan_text: str) -> dict[str, str]:
-    """Return per-day rich-detail bodies keyed by ISO date.
-
-    Looks for `#### YYYY-MM-DD` anchor lines anywhere in the plan. The body
-    extends until the next heading (level 1-4) or EOF. Empty / whitespace
-    bodies are dropped from the map so the caller falls back to the table
-    cells.
-    """
-    out: dict[str, str] = {}
-    lines = plan_text.splitlines()
-    i = 0
-    n = len(lines)
-    while i < n:
-        m = _DETAIL_ANCHOR_RE.match(lines[i])
-        if not m:
-            i += 1
-            continue
-        date_iso = m.group(1)
-        i += 1
-        body_lines: list[str] = []
-        while i < n and not _HEADING_RE.match(lines[i]):
-            body_lines.append(lines[i])
-            i += 1
-        body = "\n".join(body_lines).strip()
-        if body:
-            out[date_iso] = body
-    return out
+def _plan_dict(session_row: dict) -> dict:
+    """Adapt a `sessions` row into the plan-row shape the event-payload
+    builders expect (date / workout / pace_target / notes)."""
+    return {
+        "date": session_row["date"],
+        "workout": session_row.get("prescribed_workout") or "",
+        "pace_target": session_row.get("prescribed_pace") or "",
+        "notes": session_row.get("prescribed_notes") or "",
+    }
 
 
 def _clamp_description(body: str) -> str:
@@ -505,11 +449,9 @@ def mark_complete(state, log_date) -> dict:
         result["reason"] = "no log entries for date"
         return result
 
-    plan_text = state.load_plan()
-    rows = _parse_plan_rows(plan_text)
-    details = _parse_workout_details(plan_text)
-    plan_row = next((r for r in rows if r["date"] == log_date.isoformat()), None)
-    plan_detail = details.get(log_date.isoformat()) if plan_row else None
+    srow = state.get_workout_row(log_date)
+    plan_row = _plan_dict(srow) if srow else None
+    plan_detail = srow.get("detail_md") if srow else None
     kind = _prescription_kind(plan_row["workout"]) if plan_row else None
     result["prescription_kind"] = kind
 
@@ -678,7 +620,7 @@ def reconcile_completion(state, days_back: int = 14) -> dict:
     """
     today = today_local()
     cutoff = today - timedelta(days=days_back)
-    rows = _parse_plan_rows(state.load_plan())
+    rows = state.get_prescription_rows(cutoff, today)
     sync_state = _load_sync_state(state)
 
     corrected: list[dict] = []

@@ -82,7 +82,7 @@ def handle_command(cmd: str) -> bool:
                 print_system(f"  Notes: {w['notes']}")
 
     elif command == "/plan":
-        plan = _get_state().load_plan()
+        plan = _get_state().render_plan()
         if not plan.strip():
             print_system("No plan set.")
         else:

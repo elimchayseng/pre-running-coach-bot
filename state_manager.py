@@ -6,16 +6,18 @@ attached volume keeps writes durable across deploys and restarts).
 
 Tables (see ``state/schema.sql``):
   athlete         — singleton row holding ``yaml_text`` (ruamel-preserved YAML)
-  plan            — singleton row holding the current plan markdown
+  sessions        — unified plan-as-rows: one row per workout in a lifecycle
+                    state (planned → completed/missed/off-plan). ``prescribed_*``
+                    hold the prescription; ``data`` JSON holds the actuals once
+                    logged. Partial UNIQUE index on ``details.strava_id``
+                    enforces webhook idempotency.
+  plan_meta       — singleton row holding plan prose (phases, goals, pace
+                    zones, adjustment triggers)
   plan_changelog  — singleton row holding the append-only changelog
   journal         — singleton row holding append-only timestamped notes
-  sessions        — one row per logged session; ``data`` JSON preserves the
-                    full original entry, partial UNIQUE index on
-                    ``details.strava_id`` enforces webhook idempotency
   gcal_sync_state — per-event sync metadata (replaces .gcal_sync_state.json)
 
-Every coach turn calls ``load_full_context()``; the output is byte-equivalent
-to the file-backed format so the system prompt is unchanged.
+Every coach turn calls ``load_full_context()``.
 """
 
 from __future__ import annotations
@@ -23,7 +25,6 @@ from __future__ import annotations
 import io
 import json
 import os
-import re
 import sqlite3
 import threading
 from contextlib import contextmanager
@@ -33,27 +34,32 @@ from typing import Any, Iterator, Optional
 
 from ruamel.yaml import YAML
 
+import plan_markdown
+
 # Round-trip YAML — preserves comments, key order, quotes. update_athlete()
 # depends on this; PyYAML would silently drop them.
 _yaml = YAML()
 _yaml.preserve_quotes = True
 _yaml.indent(mapping=2, sequence=4, offset=2)
 
-# Schema lives next to this file so it ships with the deployed image and is
-# not shadowed by the Railway volume (which mounts at /app/data, not /app/state
-# — but the schema directory is in the repo root regardless).
 SCHEMA_PATH = Path(__file__).resolve().parent / "state" / "schema.sql"
 
-# Current schema version. Bumped to 3 for the Phase 1A plan-as-rows tables
-# (sessions_v2, plan_meta). schema.sql is fully idempotent (every statement is
-# IF NOT EXISTS), so an older DB is upgraded by simply re-running the file.
-CURRENT_SCHEMA_VERSION = 3
+# Current schema version. v4 is the Phase 1A cutover (unified `sessions`
+# table, `plan_meta`). An older DB is migrated by
+# scripts/cutover_to_unified_sessions.py — _ensure_schema never force-applies
+# the unified schema onto a pre-cutover DB.
+CURRENT_SCHEMA_VERSION = 4
 
 _JOURNAL_HEADER = "# Journal\n\nAppend-only freeform notes. Newest entries at the bottom.\n"
 
 # Double-checked locking so two threads can't try to apply the schema
 # simultaneously on the very first connect.
 _schema_lock = threading.Lock()
+
+# Run-shaped workout types — used to match a logged activity to a planned row.
+# Covers both planned-row vocab ("long") and logged-session vocab ("long_run").
+_RUN_LIKE = {"run", "easy", "workout", "long", "long_run", "race", "strides", "return_test", "tempo"}
+_REST_PATTERNS = ("off", "rest", "no run", "no running")
 
 
 class StateManager:
@@ -74,8 +80,6 @@ class StateManager:
             self.db_path = Path(state_dir) / "coach.db"
         else:
             self.db_path = Path("state") / "coach.db"
-        # Retained for callers that still want to reference the directory
-        # (e.g., scripts writing snapshots alongside the DB).
         self.state_dir = self.db_path.parent
         self._schema_applied = False
 
@@ -87,8 +91,6 @@ class StateManager:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(str(self.db_path))
         conn.row_factory = sqlite3.Row
-        # busy_timeout is connection-scoped (unlike journal_mode, which is
-        # persisted in the DB header by schema.sql). Re-apply on each connect.
         conn.execute("PRAGMA busy_timeout = 5000")
         conn.execute("PRAGMA foreign_keys = ON")
         self._ensure_schema(conn)
@@ -104,25 +106,34 @@ class StateManager:
         with _schema_lock:
             if self._schema_applied:
                 return
-            row = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='schema_version'").fetchone()
-            schema_sql = SCHEMA_PATH.read_text(encoding="utf-8")
-            if row is None:
-                # Fresh DB: apply the whole schema, record the baseline.
-                conn.executescript(schema_sql)
-                conn.execute("INSERT OR IGNORE INTO schema_version (version) VALUES (1)")
-            current = conn.execute("SELECT COALESCE(MAX(version), 0) FROM schema_version").fetchone()[0]
-            if current < CURRENT_SCHEMA_VERSION:
-                # DB predates the current schema. Re-running schema.sql is safe
-                # (every statement is IF NOT EXISTS) and adds any new tables.
-                conn.executescript(schema_sql)
-                conn.execute(
-                    "INSERT OR IGNORE INTO schema_version (version) VALUES (?)",
-                    (CURRENT_SCHEMA_VERSION,),
-                )
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS schema_version "
+                "(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT (datetime('now')))"
+            )
+            sessions_exists = (
+                conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='sessions'").fetchone()
+                is not None
+            )
+            unified = sessions_exists and any(r[1] == "status" for r in conn.execute("PRAGMA table_info(sessions)"))
+            if not sessions_exists:
+                # Fresh DB — apply the full v4 schema.
+                conn.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
+                unified = True
+            elif unified:
+                # Already unified; re-running schema.sql is idempotent.
+                conn.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
+            # else: pre-cutover DB — `sessions` is the old completed-only
+            # table. schema.sql's unified-shape DDL (the date+status index)
+            # would fail, so we don't apply it. scripts/cutover_to_unified_
+            # sessions.py owns that migration.
+            conn.execute(
+                "INSERT OR IGNORE INTO schema_version (version) VALUES (?)",
+                (CURRENT_SCHEMA_VERSION if unified else 3,),
+            )
             conn.commit()
             self._schema_applied = True
 
-    # ---------- Readers ----------
+    # ---------- Athlete ----------
 
     def load_athlete(self) -> dict:
         """Parse athlete YAML into a dict. Returns {} if no athlete row."""
@@ -133,22 +144,390 @@ class StateManager:
         return data or {}
 
     def _load_athlete_yaml(self) -> str:
-        """Return the raw YAML text for the athlete row (or empty string)."""
         with self._conn() as conn:
             row = conn.execute("SELECT yaml_text FROM athlete WHERE id = 1").fetchone()
         return row["yaml_text"] if row else ""
 
-    def load_plan(self) -> str:
+    def update_athlete(self, updates: dict) -> None:
+        """Patch fields in athlete YAML. Preserves comments, key order, quotes."""
         with self._conn() as conn:
-            row = conn.execute("SELECT content FROM plan WHERE id = 1").fetchone()
+            row = conn.execute("SELECT yaml_text FROM athlete WHERE id = 1").fetchone()
+            if row is None:
+                raise FileNotFoundError("athlete row not found; run scripts/migrate_state_to_sqlite.py first")
+            data = _yaml.load(row["yaml_text"])
+            if data is None:
+                data = {}
+            _deep_merge(data, updates)
+            buf = io.StringIO()
+            _yaml.dump(data, buf)
+            conn.execute(
+                "UPDATE athlete SET yaml_text = ?, updated_at = datetime('now') WHERE id = 1",
+                (buf.getvalue(),),
+            )
+
+    # ---------- Plan: meta + rows ----------
+
+    def get_plan_meta(self) -> str:
+        """Return the plan prose (phases, goals, pace zones, triggers)."""
+        with self._conn() as conn:
+            row = conn.execute("SELECT content FROM plan_meta WHERE id = 1").fetchone()
         return row["content"] if row else ""
 
-    def load_journal(self, max_entries: Optional[int] = None) -> str:
-        """Return the journal text, optionally truncated to the last N entries.
+    def render_current_week_markdown(self, today: Optional[date] = None) -> str:
+        """Render the current week's prescriptions as the locked markdown table."""
+        ref = today or date.today()
+        monday = ref - timedelta(days=ref.weekday())
+        sunday = monday + timedelta(days=6)
+        rows = self.get_prescription_rows(monday, sunday)
+        if not rows:
+            return "_No workouts prescribed for this week yet._"
+        return plan_markdown.render_week_table(rows)
 
-        Entries are separated by horizontal-rule blocks (``\\n---\\n``); the
-        preamble (everything before the first separator) is preserved.
+    def render_plan(self, today: Optional[date] = None) -> str:
+        """Compose the plan view: prose + this week's locked table.
+
+        Used by the ``/plan`` command, the post-activity review prompt, and
+        the system-prompt training-plan block.
         """
+        meta = self.get_plan_meta().rstrip()
+        week = self.render_current_week_markdown(today)
+        parts = [meta] if meta else []
+        parts.extend(["", "## This week", "", week])
+        return "\n".join(parts).strip() + "\n"
+
+    def update_plan_meta(self, content: str, change_note: str) -> None:
+        """Replace plan_meta and log to the changelog."""
+        with self._conn() as conn:
+            conn.execute(
+                "INSERT INTO plan_meta (id, content, updated_at) VALUES (1, ?, datetime('now')) "
+                "ON CONFLICT(id) DO UPDATE SET content = excluded.content, updated_at = excluded.updated_at",
+                (content,),
+            )
+            self._append_changelog(conn, change_note)
+
+    def update_plan(self, new_plan_md: str, change_note: str) -> None:
+        """Escape hatch: replace the whole plan from a full markdown document.
+
+        Parses the locked weekly table into ``planned`` rows, the per-day
+        ``#### YYYY-MM-DD`` blocks into ``detail_md``, and the remaining prose
+        into ``plan_meta``. Planned rows are replaced wholesale; completed /
+        missed / off-plan rows are never touched. Used to apply a post-activity
+        review proposal verbatim.
+        """
+        rows = plan_markdown.parse_plan_rows(new_plan_md)
+        details = plan_markdown.parse_workout_details(new_plan_md)
+        meta = plan_markdown.build_plan_meta(new_plan_md)
+        with self._conn() as conn:
+            conn.execute("DELETE FROM sessions WHERE status = 'planned'")
+            for r in rows:
+                conn.execute(
+                    "INSERT INTO sessions "
+                    "(date, slot, status, type, prescribed_workout, prescribed_pace, "
+                    " prescribed_notes, detail_md) "
+                    "VALUES (?, NULL, 'planned', ?, ?, ?, ?, ?)",
+                    (
+                        r["date"],
+                        plan_markdown.infer_workout_type(r["workout"]),
+                        r["workout"],
+                        r["pace_target"],
+                        r["notes"],
+                        details.get(r["date"]),
+                    ),
+                )
+            conn.execute(
+                "INSERT INTO plan_meta (id, content, updated_at) VALUES (1, ?, datetime('now')) "
+                "ON CONFLICT(id) DO UPDATE SET content = excluded.content, updated_at = excluded.updated_at",
+                (meta,),
+            )
+            self._append_changelog(conn, change_note)
+
+    def update_workout(
+        self,
+        target_date: date,
+        change_note: str,
+        workout: Optional[str] = None,
+        pace_target: Optional[str] = None,
+        notes: Optional[str] = None,
+        detail_body: Optional[str] = None,
+    ) -> None:
+        """Patch a single day's prescription row.
+
+        Updates the planned row for ``target_date`` (only the fields passed
+        are touched). If the day has no planned row, a new one is inserted.
+        """
+        has_edit = any(v is not None for v in (workout, pace_target, notes, detail_body))
+        if not has_edit:
+            raise ValueError("must pass at least one of workout, pace_target, notes, detail_body")
+        iso = target_date.isoformat()
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT id, status FROM sessions WHERE date = ? AND status = 'planned' ORDER BY slot LIMIT 1",
+                (iso,),
+            ).fetchone()
+            if row is None:
+                # No planned row — fall back to any prescription row on the
+                # date, else insert a fresh planned row.
+                row = conn.execute(
+                    "SELECT id, status FROM sessions WHERE date = ? ORDER BY slot LIMIT 1", (iso,)
+                ).fetchone()
+            if row is None:
+                conn.execute(
+                    "INSERT INTO sessions "
+                    "(date, slot, status, type, prescribed_workout, prescribed_pace, "
+                    " prescribed_notes, detail_md) "
+                    "VALUES (?, NULL, 'planned', ?, ?, ?, ?, ?)",
+                    (
+                        iso,
+                        plan_markdown.infer_workout_type(workout or ""),
+                        workout,
+                        pace_target,
+                        notes,
+                        (detail_body or "").strip() or None,
+                    ),
+                )
+            else:
+                sets, params = [], []
+                if workout is not None:
+                    sets.append("prescribed_workout = ?")
+                    params.append(workout)
+                    sets.append("type = ?")
+                    params.append(plan_markdown.infer_workout_type(workout))
+                if pace_target is not None:
+                    sets.append("prescribed_pace = ?")
+                    params.append(pace_target)
+                if notes is not None:
+                    sets.append("prescribed_notes = ?")
+                    params.append(notes)
+                if detail_body is not None:
+                    sets.append("detail_md = ?")
+                    params.append(detail_body.strip() or None)
+                sets.append("updated_at = datetime('now')")
+                params.append(row["id"])
+                conn.execute(f"UPDATE sessions SET {', '.join(sets)} WHERE id = ?", params)
+            self._append_changelog(conn, change_note)
+
+    def replace_week_table(self, rows: list[dict], change_note: str) -> None:
+        """Replace a week's planned rows.
+
+        Each row dict needs keys: day, date, workout, pace_target, notes.
+        Planned rows inside the [min, max] date span that aren't in ``rows``
+        are dropped; days that already have a completed/off-plan row are left
+        alone (history is never overwritten with a fresh prescription).
+        """
+        if not rows:
+            raise ValueError("rows must be non-empty")
+        required = ("day", "date", "workout", "pace_target", "notes")
+        for r in rows:
+            missing = [k for k in required if k not in r]
+            if missing:
+                raise ValueError(f"row missing required keys {missing}: {r}")
+        dates = sorted(r["date"] for r in rows)
+        with self._conn() as conn:
+            conn.execute(
+                "DELETE FROM sessions WHERE status = 'planned' AND date BETWEEN ? AND ?",
+                (dates[0], dates[-1]),
+            )
+            for r in rows:
+                done = conn.execute(
+                    "SELECT 1 FROM sessions WHERE date = ? AND status IN ('completed','off-plan') LIMIT 1",
+                    (r["date"],),
+                ).fetchone()
+                if done:
+                    continue  # don't shadow a logged day with a fresh prescription
+                conn.execute(
+                    "INSERT INTO sessions "
+                    "(date, slot, status, type, prescribed_workout, prescribed_pace, prescribed_notes) "
+                    "VALUES (?, NULL, 'planned', ?, ?, ?, ?)",
+                    (
+                        r["date"],
+                        plan_markdown.infer_workout_type(r["workout"]),
+                        r["workout"],
+                        r["pace_target"],
+                        r["notes"],
+                    ),
+                )
+            self._append_changelog(conn, change_note)
+
+    def _append_changelog(self, conn: sqlite3.Connection, note: str) -> None:
+        ts = datetime.now().isoformat(timespec="seconds")
+        entry = f"- {ts}: {note}\n"
+        conn.execute(
+            "INSERT INTO plan_changelog (id, content, updated_at) VALUES (1, ?, datetime('now')) "
+            "ON CONFLICT(id) DO UPDATE SET "
+            "content = plan_changelog.content || excluded.content, updated_at = excluded.updated_at",
+            (entry,),
+        )
+
+    # ---------- Plan-row reads ----------
+
+    def get_prescription_rows(self, start: date, end: date) -> list[dict]:
+        """Return rows carrying a prescription in [start, end], ordered by date."""
+        return self._rows(
+            "date BETWEEN ? AND ? AND prescribed_workout IS NOT NULL",
+            (start.isoformat(), end.isoformat()),
+        )
+
+    def get_rows_in_range(self, start: date, end: date) -> list[dict]:
+        """Return all session rows in [start, end], ordered by date, slot, id."""
+        return self._rows("date BETWEEN ? AND ?", (start.isoformat(), end.isoformat()))
+
+    def get_workout_row(self, target: date) -> Optional[dict]:
+        """Return the prescription row for a date (planned preferred), or None."""
+        rows = self._rows(
+            "date = ? AND prescribed_workout IS NOT NULL",
+            (target.isoformat(),),
+        )
+        if not rows:
+            return None
+        planned = [r for r in rows if r["status"] == "planned"]
+        return planned[0] if planned else rows[0]
+
+    def get_todays_workout(self, target_date: Optional[date] = None) -> dict:
+        """Return the prescribed workout for a date.
+
+        Keys: date, day_name, workout, pace_target, notes, detail_md, status,
+        is_rest_day, found. ``found`` is False when no prescription row exists.
+        """
+        if target_date is None:
+            target_date = date.today()
+        result = {
+            "date": target_date.isoformat(),
+            "day_name": target_date.strftime("%A"),
+            "workout": "",
+            "pace_target": "",
+            "notes": "",
+            "detail_md": "",
+            "status": None,
+            "is_rest_day": False,
+            "found": False,
+        }
+        row = self.get_workout_row(target_date)
+        if row is None:
+            return result
+        result.update(
+            {
+                "workout": row["prescribed_workout"] or "",
+                "pace_target": row["prescribed_pace"] or "",
+                "notes": row["prescribed_notes"] or "",
+                "detail_md": row["detail_md"] or "",
+                "status": row["status"],
+                "found": True,
+                "is_rest_day": _is_rest_day(row["prescribed_workout"] or ""),
+            }
+        )
+        return result
+
+    def _rows(self, where: str, params: tuple) -> list[dict]:
+        with self._conn() as conn:
+            rows = conn.execute(f"SELECT * FROM sessions WHERE {where} ORDER BY date, slot, id", params).fetchall()
+        return [dict(r) for r in rows]
+
+    # ---------- Session (actuals) reads ----------
+
+    def get_recent_sessions(self, days: int = 14, today: Optional[date] = None) -> list[dict]:
+        ref = today or date.today()
+        cutoff = ref - timedelta(days=days)
+        return self._session_data("date >= ? AND date <= ?", (cutoff.isoformat(), ref.isoformat()))
+
+    def get_sessions_in_range(self, start: date, end: date) -> list[dict]:
+        return self._session_data("date >= ? AND date <= ?", (start.isoformat(), end.isoformat()))
+
+    def sessions_on_date(self, target: date) -> list[dict]:
+        return self._session_data("date = ?", (target.isoformat(),))
+
+    def _session_data(self, where: str, params: tuple) -> list[dict]:
+        """Return the ``data`` JSON of logged (completed/off-plan) sessions."""
+        with self._conn() as conn:
+            rows = conn.execute(
+                f"SELECT data FROM sessions WHERE {where} AND data IS NOT NULL ORDER BY date, slot, id",
+                params,
+            ).fetchall()
+        out: list[dict] = []
+        for r in rows:
+            try:
+                out.append(json.loads(r["data"]))
+            except (json.JSONDecodeError, TypeError):
+                continue
+        return out
+
+    def existing_strava_ids(self) -> set[int]:
+        """Return all ``details.strava_id`` values from logged sessions."""
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT CAST(json_extract(data, '$.details.strava_id') AS INTEGER) AS sid "
+                "FROM sessions WHERE json_extract(data, '$.details.strava_id') IS NOT NULL"
+            ).fetchall()
+        return {r["sid"] for r in rows if r["sid"] is not None}
+
+    # ---------- Session writes (reconciliation) ----------
+
+    def append_session(self, session: dict) -> dict:
+        """Log a completed session, reconciling it against the plan.
+
+        Delegates to :meth:`reconcile_strava_activity` — a logged activity
+        either completes a matching planned row or lands as an off-plan row.
+        """
+        return self.reconcile_strava_activity(session)
+
+    def reconcile_strava_activity(self, session: dict) -> dict:
+        """Match a logged activity to the plan and record it.
+
+        - A planned row on the activity's date whose type matches (or the
+          single planned row if there's only one) flips to ``completed`` with
+          the actuals filled in; a changelog row is written.
+        - Otherwise a new ``off-plan`` row is inserted (no changelog entry).
+
+        Raises ``sqlite3.IntegrityError`` if ``details.strava_id`` is set and a
+        row already carries it — webhook callers treat that as already-logged.
+        Returns a small dict: {matched, status, row_id}.
+        """
+        if "date" not in session:
+            raise ValueError("session entry must include a 'date' field")
+        sdate = str(session["date"])[:10]
+        stype = session.get("type") or ""
+        payload = json.dumps(session, ensure_ascii=False)
+        with self._conn() as conn:
+            planned = conn.execute(
+                "SELECT id, type FROM sessions WHERE date = ? AND status = 'planned' ORDER BY slot, id",
+                (sdate,),
+            ).fetchall()
+            match = _pick_planned_match(stype, planned)
+            if match is not None:
+                conn.execute(
+                    "UPDATE sessions SET status = 'completed', data = ?, type = ?, "
+                    "completed_at = datetime('now'), updated_at = datetime('now') WHERE id = ?",
+                    (payload, stype or None, match["id"]),
+                )
+                self._append_changelog(conn, f"{sdate} completed: {stype or 'session'}")
+                return {"matched": True, "status": "completed", "row_id": match["id"]}
+            cur = conn.execute(
+                "INSERT INTO sessions (date, slot, status, type, data, completed_at) "
+                "VALUES (?, NULL, 'off-plan', ?, ?, datetime('now'))",
+                (sdate, stype or None, payload),
+            )
+            return {"matched": False, "status": "off-plan", "row_id": cur.lastrowid}
+
+    def update_session_by_strava_id(self, activity_id: int, new_entry: dict) -> bool:
+        """Replace the actuals of the row carrying ``details.strava_id``.
+
+        Returns True if a row was updated. Used by the Strava webhook on an
+        ``aspect_type=update`` event (e.g. a Run retagged as a Workout).
+        """
+        if "date" not in new_entry:
+            raise ValueError("new_entry must include a 'date' field")
+        payload = json.dumps(new_entry, ensure_ascii=False)
+        with self._conn() as conn:
+            cur = conn.execute(
+                "UPDATE sessions SET data = ?, date = ?, type = ?, updated_at = datetime('now') "
+                "WHERE json_extract(data, '$.details.strava_id') = ?",
+                (payload, str(new_entry["date"])[:10], new_entry.get("type") or None, activity_id),
+            )
+            return cur.rowcount > 0
+
+    # ---------- Journal ----------
+
+    def load_journal(self, max_entries: Optional[int] = None) -> str:
+        """Return the journal text, optionally truncated to the last N entries."""
         with self._conn() as conn:
             row = conn.execute("SELECT content FROM journal WHERE id = 1").fetchone()
         text = row["content"] if row else ""
@@ -161,51 +540,29 @@ class StateManager:
         kept = entries[-max_entries:] if max_entries > 0 else []
         return "\n---\n".join([head, *kept])
 
-    def get_recent_sessions(self, days: int = 14, today: Optional[date] = None) -> list[dict]:
-        ref = today or date.today()
-        cutoff = ref - timedelta(days=days)
-        return self._query_sessions("date >= ? AND date <= ?", (cutoff.isoformat(), ref.isoformat()))
-
-    def get_sessions_in_range(self, start: date, end: date) -> list[dict]:
-        return self._query_sessions("date >= ? AND date <= ?", (start.isoformat(), end.isoformat()))
-
-    def sessions_on_date(self, target: date) -> list[dict]:
-        return self._query_sessions("date = ?", (target.isoformat(),))
-
-    def _query_sessions(self, where: str, params: tuple) -> list[dict]:
+    def append_journal(self, entry: str, when: Optional[datetime] = None) -> None:
+        """Append a timestamped entry to the journal."""
+        ts = (when or datetime.now()).strftime("%Y-%m-%d %H:%M")
+        block = f"\n---\n\n## {ts}\n\n{entry.rstrip()}\n"
         with self._conn() as conn:
-            rows = conn.execute(
-                f"SELECT data FROM sessions WHERE {where} ORDER BY date, id",
-                params,
-            ).fetchall()
-        out: list[dict] = []
-        for r in rows:
-            try:
-                out.append(json.loads(r["data"]))
-            except json.JSONDecodeError:
-                continue  # mirror old behaviour: skip malformed entries
-        return out
+            row = conn.execute("SELECT content FROM journal WHERE id = 1").fetchone()
+            if row is None or not row["content"]:
+                conn.execute(
+                    "INSERT INTO journal (id, content, updated_at) VALUES (1, ?, datetime('now')) "
+                    "ON CONFLICT(id) DO UPDATE SET content = excluded.content, "
+                    "updated_at = excluded.updated_at",
+                    (_JOURNAL_HEADER + block,),
+                )
+            else:
+                conn.execute(
+                    "UPDATE journal SET content = content || ?, updated_at = datetime('now') WHERE id = 1",
+                    (block,),
+                )
 
-    def existing_strava_ids(self) -> set[int]:
-        """Return all ``details.strava_id`` values from sessions. Used by the
-        Strava backfill + webhook handler for idempotency (the partial UNIQUE
-        index now also enforces this at the DB level)."""
-        with self._conn() as conn:
-            rows = conn.execute(
-                "SELECT CAST(json_extract(data, '$.details.strava_id') AS INTEGER) AS sid "
-                "FROM sessions WHERE json_extract(data, '$.details.strava_id') IS NOT NULL"
-            ).fetchall()
-        return {r["sid"] for r in rows if r["sid"] is not None}
-
-    # ---------- Gcal sync state (replaces .gcal_sync_state.json) ----------
+    # ---------- Gcal sync state ----------
 
     def load_gcal_sync_state(self) -> dict[str, dict]:
-        """Return the per-event sync state as ``{event_id: {hash, completed, ...}}``.
-
-        Behavioural equivalence with the old JSON file: callers do
-        ``.get("completed")`` / ``.get("hash")`` and don't care about exact dict
-        shape, so missing fields are simply absent rather than ``None``.
-        """
+        """Return per-event sync state as ``{event_id: {hash, completed, ...}}``."""
         with self._conn() as conn:
             rows = conn.execute(
                 "SELECT event_id, hash, last_synced_at, completed, last_completed_at, off_plan FROM gcal_sync_state"
@@ -227,9 +584,7 @@ class StateManager:
         return out
 
     def save_gcal_sync_state(self, state: dict[str, dict]) -> None:
-        """Replace the gcal sync state wholesale, matching the old file's
-        write-the-whole-dict semantics. Done inside a single transaction so
-        readers never see a partial state."""
+        """Replace the gcal sync state wholesale, in one transaction."""
         with self._conn() as conn:
             conn.execute("DELETE FROM gcal_sync_state")
             conn.executemany(
@@ -252,14 +607,9 @@ class StateManager:
     # ---------- Composite read for system prompt ----------
 
     def load_full_context(self, recent_days: int = 21, journal_entries: int = 5) -> str:
-        """Format all state into a single markdown blob for the system prompt.
-
-        Byte-equivalent to the file-backed implementation: same headers, same
-        athlete YAML fence, same per-line JSON dump for sessions, same journal
-        truncation semantics.
-        """
+        """Format all state into a single markdown blob for the system prompt."""
         athlete_yaml = self._load_athlete_yaml()
-        plan_text = self.load_plan()
+        plan_text = self.render_plan()
         recent = self.get_recent_sessions(days=recent_days)
         journal = self.load_journal(max_entries=journal_entries)
 
@@ -280,229 +630,8 @@ class StateManager:
         ]
         return "\n".join(parts)
 
-    # ---------- Writers ----------
-
-    def append_session(self, session: dict) -> None:
-        """Insert a new session row.
-
-        Raises ``sqlite3.IntegrityError`` if ``details.strava_id`` is set and
-        a row with that ID already exists. Strava webhook callers should catch
-        this and treat it as already-logged; manual ``log_session`` tool calls
-        without a strava_id never trigger the partial index.
-        """
-        if "date" not in session:
-            raise ValueError("session entry must include a 'date' field")
-        payload = json.dumps(session, ensure_ascii=False)
-        with self._conn() as conn:
-            conn.execute(
-                "INSERT INTO sessions (date, type, data) VALUES (?, ?, ?)",
-                (session["date"], session.get("type", ""), payload),
-            )
-
-    def update_session_by_strava_id(self, activity_id: int, new_entry: dict) -> bool:
-        """Replace the sessions row with matching ``details.strava_id``.
-
-        Returns True if a row was updated; False if no matching row exists
-        (caller decides whether to append instead).
-
-        Used by the Strava webhook handler when an ``aspect_type=update`` event
-        fires (e.g., the user retags a Run as a Workout after upload).
-        """
-        if "date" not in new_entry:
-            raise ValueError("new_entry must include a 'date' field")
-        payload = json.dumps(new_entry, ensure_ascii=False)
-        with self._conn() as conn:
-            cur = conn.execute(
-                "UPDATE sessions "
-                "SET data = ?, date = ?, type = ?, updated_at = datetime('now') "
-                "WHERE json_extract(data, '$.details.strava_id') = ?",
-                (payload, new_entry["date"], new_entry.get("type", ""), activity_id),
-            )
-            return cur.rowcount > 0
-
-    def update_plan(self, new_plan_md: str, change_note: str) -> None:
-        """Replace the plan content and append ``change_note`` to the changelog."""
-        ts = datetime.now().isoformat(timespec="seconds")
-        changelog_entry = f"- {ts}: {change_note}\n"
-        with self._conn() as conn:
-            conn.execute(
-                "INSERT INTO plan (id, content, updated_at) VALUES (1, ?, datetime('now')) "
-                "ON CONFLICT(id) DO UPDATE SET content = excluded.content, updated_at = excluded.updated_at",
-                (new_plan_md,),
-            )
-            conn.execute(
-                "INSERT INTO plan_changelog (id, content, updated_at) VALUES (1, ?, datetime('now')) "
-                "ON CONFLICT(id) DO UPDATE SET "
-                "content = plan_changelog.content || excluded.content, "
-                "updated_at = excluded.updated_at",
-                (changelog_entry,),
-            )
-
-    # ---------- Surgical plan edits (PR B / issue #19) ----------
-    #
-    # The full update_plan path requires the LLM to re-emit the entire plan
-    # markdown as a tool argument. These helpers take a small patch, apply
-    # it server-side, and route the result through update_plan so the
-    # SQLite transaction + changelog guarantees are reused.
-
-    def update_workout(
-        self,
-        target_date: date,
-        change_note: str,
-        workout: Optional[str] = None,
-        pace_target: Optional[str] = None,
-        notes: Optional[str] = None,
-        detail_body: Optional[str] = None,
-    ) -> None:
-        """Patch the locked-table row for ``target_date`` and/or its per-day
-        ``#### YYYY-MM-DD`` detail section. Both edits compose into one
-        update_plan transaction (one changelog entry, atomic write).
-
-        Only non-None row fields (workout, pace_target, notes) are touched;
-        the day and date cells stay as-is. ``detail_body``, if passed, is
-        normalized (trimmed) and either replaces the existing section's
-        body or appends a new section at the end of the plan.
-
-        Raises ValueError when no fields are passed, when the plan is
-        empty, or when ``target_date`` has no row in the locked table
-        (only checked when a row field was passed — detail-only edits
-        don't require an existing table row).
-        """
-        has_row_edit = any(v is not None for v in (workout, pace_target, notes))
-        body_clean = (detail_body or "").strip()
-        has_detail_edit = bool(body_clean)
-        if not has_row_edit and not has_detail_edit:
-            raise ValueError("must pass at least one of workout, pace_target, notes, detail_body")
-        plan_text = self.load_plan()
-        if not plan_text:
-            raise ValueError("plan is empty; nothing to patch")
-
-        if has_row_edit:
-            patched = _replace_workout_row(plan_text, target_date, workout, pace_target, notes)
-            if patched is None:
-                raise ValueError(f"no row found in locked table for date {target_date.isoformat()}")
-            plan_text = patched
-
-        if has_detail_edit:
-            plan_text = _set_workout_detail(plan_text, target_date.isoformat(), body_clean)
-
-        self.update_plan(plan_text, change_note)
-
-    def replace_week_table(
-        self,
-        rows: list[dict],
-        change_note: str,
-    ) -> None:
-        """Replace the (first) locked-format weekly table with ``rows``.
-
-        Each row dict must have keys: day, date, workout, pace_target, notes.
-        The header and separator lines are preserved; only data rows change.
-        Per-day ``#### YYYY-MM-DD`` sections elsewhere in the plan are NOT
-        touched. Raises ValueError if no locked-format table is found or
-        rows are malformed."""
-        if not rows:
-            raise ValueError("rows must be non-empty")
-        required = ("day", "date", "workout", "pace_target", "notes")
-        for r in rows:
-            missing = [k for k in required if k not in r]
-            if missing:
-                raise ValueError(f"row missing required keys {missing}: {r}")
-        plan_text = self.load_plan()
-        if not plan_text:
-            raise ValueError("plan is empty; nothing to replace")
-        new_text = _replace_locked_table(plan_text, rows)
-        if new_text is None:
-            raise ValueError("no locked-format table found in plan")
-        self.update_plan(new_text, change_note)
-
-    def append_journal(self, entry: str, when: Optional[datetime] = None) -> None:
-        """Append a timestamped entry to the journal."""
-        ts = (when or datetime.now()).strftime("%Y-%m-%d %H:%M")
-        block = f"\n---\n\n## {ts}\n\n{entry.rstrip()}\n"
-        with self._conn() as conn:
-            row = conn.execute("SELECT content FROM journal WHERE id = 1").fetchone()
-            if row is None or not row["content"]:
-                # First-ever entry: write the header preamble plus this block.
-                conn.execute(
-                    "INSERT INTO journal (id, content, updated_at) "
-                    "VALUES (1, ?, datetime('now')) "
-                    "ON CONFLICT(id) DO UPDATE SET content = excluded.content, "
-                    "updated_at = excluded.updated_at",
-                    (_JOURNAL_HEADER + block,),
-                )
-            else:
-                conn.execute(
-                    "UPDATE journal SET content = content || ?, updated_at = datetime('now') WHERE id = 1",
-                    (block,),
-                )
-
-    def update_athlete(self, updates: dict) -> None:
-        """Patch fields in athlete YAML. Preserves comments, key order, and
-        quotes via ruamel round-trip on the ``yaml_text`` column."""
-        with self._conn() as conn:
-            row = conn.execute("SELECT yaml_text FROM athlete WHERE id = 1").fetchone()
-            if row is None:
-                raise FileNotFoundError("athlete row not found; run scripts/migrate_state_to_sqlite.py first")
-            data = _yaml.load(row["yaml_text"])
-            if data is None:
-                data = {}
-            _deep_merge(data, updates)
-            buf = io.StringIO()
-            _yaml.dump(data, buf)
-            conn.execute(
-                "UPDATE athlete SET yaml_text = ?, updated_at = datetime('now') WHERE id = 1",
-                (buf.getvalue(),),
-            )
-
-    # ---------- Today's workout ----------
-
-    def get_todays_workout(self, target_date: Optional[date] = None) -> dict:
-        """Parse the locked-format 'This Week' table from the plan.
-
-        Locked format: ``| Day | Date | Workout | Pace target | Notes |``
-        Date column may be ISO (2026-04-28) or M/D (4/28).
-
-        Returns a dict with keys: date, day_name, workout, pace_target,
-        notes, is_rest_day, found.
-        """
-        if target_date is None:
-            target_date = date.today()
-        result = {
-            "date": target_date.isoformat(),
-            "day_name": target_date.strftime("%A"),
-            "workout": "",
-            "pace_target": "",
-            "notes": "",
-            "is_rest_day": False,
-            "found": False,
-        }
-        plan_text = self.load_plan()
-        if not plan_text:
-            return result
-
-        row = _find_workout_row(plan_text, target_date)
-        if row is None:
-            return result
-        result.update(row)
-        result["found"] = True
-        result["is_rest_day"] = _is_rest_day(result["workout"])
-        return result
-
 
 # ---------- module helpers ----------
-
-
-def _parse_entry_date(value: Any) -> Optional[date]:
-    if isinstance(value, datetime):
-        return value.date()
-    if isinstance(value, date):
-        return value
-    if isinstance(value, str):
-        try:
-            return date.fromisoformat(value[:10])
-        except ValueError:
-            return None
-    return None
 
 
 def _deep_merge(dst: dict, src: dict) -> None:
@@ -514,9 +643,6 @@ def _deep_merge(dst: dict, src: dict) -> None:
             dst[k] = v
 
 
-_REST_PATTERNS = ("off", "rest", "no run", "no running")
-
-
 def _is_rest_day(workout: str) -> bool:
     w = workout.strip().lower()
     if not w or w in {"-", "—"}:
@@ -524,154 +650,23 @@ def _is_rest_day(workout: str) -> bool:
     return any(w.startswith(p) for p in _REST_PATTERNS)
 
 
-def _find_workout_row(plan_text: str, target_date: date) -> Optional[dict]:
-    iso = target_date.isoformat()
-    md = f"{target_date.month}/{target_date.day}"
-    for line in plan_text.splitlines():
-        if "|" not in line:
-            continue
-        parts = [p.strip() for p in line.strip().strip("|").split("|")]
-        if len(parts) < 5:
-            continue
-        cell = parts[1]
-        if cell == iso or cell == md or iso in cell or md in cell:
-            return {
-                "day_name": parts[0],
-                "date": iso,
-                "workout": parts[2],
-                "pace_target": parts[3],
-                "notes": parts[4],
-            }
-    return None
+def _pick_planned_match(activity_type: str, planned: list) -> Optional[Any]:
+    """Choose which planned row a logged activity completes.
 
-
-# ---------- Surgical plan-edit helpers (PR B / issue #19) ----------
-
-# Locked weekly-table contract (also enforced by the system prompt + the
-# update_plan post-write check). Header text comparison is case-sensitive
-# and exact — the LLM is instructed to emit this header verbatim.
-_LOCKED_HEADER_TOKENS = ("Day", "Date", "Workout", "Pace target", "Notes")
-
-# Per-day detail sections are H4 headings whose only content is an ISO date.
-# Tolerant of trailing whitespace; insensitive to leading whitespace on the
-# heading line itself.
-_DETAIL_HEADING_RE = re.compile(r"^####\s+(\d{4}-\d{2}-\d{2})\s*$")
-
-
-def _matches_date_cell(cell: str, iso: str, md: str) -> bool:
-    """Same matching rule used by _find_workout_row, factored out so the
-    edit path and the read path can't drift."""
-    return cell == iso or cell == md or iso in cell or md in cell
-
-
-def _replace_workout_row(
-    plan_text: str,
-    target_date: date,
-    workout: Optional[str],
-    pace_target: Optional[str],
-    notes: Optional[str],
-) -> Optional[str]:
-    """Return plan_text with the locked-table row for target_date patched.
-    Returns None if no row matches. Preserves the trailing newline status
-    of the original plan_text so byte-equivalence in tests stays clean."""
-    iso = target_date.isoformat()
-    md = f"{target_date.month}/{target_date.day}"
-    lines = plan_text.splitlines()
-    for i, line in enumerate(lines):
-        if "|" not in line:
-            continue
-        parts = [p.strip() for p in line.strip().strip("|").split("|")]
-        if len(parts) < 5:
-            continue
-        if not _matches_date_cell(parts[1], iso, md):
-            continue
-        # Replace only non-None fields. Day name + date stay.
-        if workout is not None:
-            parts[2] = workout
-        if pace_target is not None:
-            parts[3] = pace_target
-        if notes is not None:
-            parts[4] = notes
-        lines[i] = "| " + " | ".join(parts) + " |"
-        return "\n".join(lines) + ("\n" if plan_text.endswith("\n") else "")
-    return None
-
-
-def _set_workout_detail(plan_text: str, iso: str, body: str) -> str:
-    """Create or replace the '#### {iso}' section's body. The heading line
-    itself is rewritten to a canonical form ('#### YYYY-MM-DD') even when
-    replacing — minor normalization, no semantic change."""
-    lines = plan_text.splitlines() if plan_text else []
-    canonical_heading = f"#### {iso}"
-
-    start = None
-    for i, line in enumerate(lines):
-        m = _DETAIL_HEADING_RE.match(line.strip())
-        if m and m.group(1) == iso:
-            start = i
-            break
-
-    body_lines = body.splitlines()
-
-    if start is None:
-        # Append at end. Strip any trailing blank lines on the existing
-        # plan first so we don't end up with three blank lines in a row.
-        result = lines[:]
-        while result and not result[-1].strip():
-            result.pop()
-        if result:
-            result.append("")
-        result.append(canonical_heading)
-        result.append("")
-        result.extend(body_lines)
-        # Always end the new plan with a trailing newline.
-        return "\n".join(result) + "\n"
-
-    # Replace existing section's body. End is the next heading or EOF.
-    end = len(lines)
-    for j in range(start + 1, len(lines)):
-        if lines[j].lstrip().startswith("#"):
-            end = j
-            break
-
-    replacement = [canonical_heading, "", *body_lines, ""]
-    new_lines = lines[:start] + replacement + lines[end:]
-    return "\n".join(new_lines) + ("\n" if plan_text.endswith("\n") else "")
-
-
-def _replace_locked_table(plan_text: str, rows: list[dict]) -> Optional[str]:
-    """Replace the first locked-format table found. Returns None if no
-    locked header is present."""
-    lines = plan_text.splitlines() if plan_text else []
-    header_idx = None
-    for i, line in enumerate(lines):
-        if "|" not in line:
-            continue
-        parts = [p.strip() for p in line.strip().strip("|").split("|")]
-        if len(parts) >= 5 and tuple(parts[:5]) == _LOCKED_HEADER_TOKENS:
-            header_idx = i
-            break
-    if header_idx is None:
+    A single planned row on the date is claimed regardless of type. With
+    multiple, prefer an exact type match, then a same-bucket (run-like vs
+    other) match; no match → None (the activity is off-plan).
+    """
+    if not planned:
         return None
-
-    # The separator line is conventionally header_idx + 1. Don't validate
-    # its exact shape — the locked format is enforced upstream by the
-    # system prompt. We keep whatever's there.
-    sep_idx = header_idx + 1
-
-    # Find the end of the table: the first non-pipe line, or any pipe-line
-    # with fewer than 5 cells (a malformed row likely means we've fallen
-    # off the table).
-    table_end = sep_idx + 1
-    while table_end < len(lines):
-        line = lines[table_end]
-        if "|" not in line or not line.strip():
-            break
-        parts = [p.strip() for p in line.strip().strip("|").split("|")]
-        if len(parts) < 5:
-            break
-        table_end += 1
-
-    new_row_lines = [f"| {r['day']} | {r['date']} | {r['workout']} | {r['pace_target']} | {r['notes']} |" for r in rows]
-    new_lines = lines[: sep_idx + 1] + new_row_lines + lines[table_end:]
-    return "\n".join(new_lines) + ("\n" if plan_text.endswith("\n") else "")
+    if len(planned) == 1:
+        return planned[0]
+    at = (activity_type or "").strip().lower()
+    for row in planned:
+        if (row["type"] or "").strip().lower() == at:
+            return row
+    activity_run = at in _RUN_LIKE
+    for row in planned:
+        if ((row["type"] or "").strip().lower() in _RUN_LIKE) == activity_run:
+            return row
+    return None

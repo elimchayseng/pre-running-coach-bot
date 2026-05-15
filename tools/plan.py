@@ -25,11 +25,11 @@ SCHEMAS = [
         "function": {
             "name": "get_todays_workout",
             "description": (
-                "Get the prescribed workout for a date from plan.md. Returns "
-                "{date, day_name, workout, pace_target, notes, is_rest_day, "
-                "found}. Use this before answering any 'what's my workout' "
-                "question — it parses the locked plan table directly rather "
-                "than re-reading the plan blob."
+                "Get the prescribed workout for a date. Returns "
+                "{date, day_name, workout, pace_target, notes, status, "
+                "is_rest_day, found}. Use this before answering any "
+                "'what's my workout' question — it reads the prescription "
+                "row for the date directly."
             ),
             "parameters": {
                 "type": "object",

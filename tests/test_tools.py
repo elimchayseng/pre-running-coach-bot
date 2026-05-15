@@ -145,7 +145,7 @@ class TestStateTools:
         )
         assert out["ok"] is True
         assert "warning" not in out
-        assert state.load_plan() == plan
+        assert state.get_todays_workout(target)["workout"] == "Easy 4mi"
 
     def test_update_plan_clears_pending_proposal(self, state, monkeypatch, fake_redis):
         """A successful plan write consumes any pending post-activity proposal,
@@ -194,8 +194,8 @@ class TestStateTools:
         assert "warning" in out
         assert "not parseable" in out["warning"]
         assert "table format" in out["warning"]
-        # Plan still written despite warning (agent decides whether to retry)
-        assert state.load_plan() == "# Plan v2 with no table"
+        # Prose still written despite warning (agent decides whether to retry)
+        assert "Plan v2 with no table" in state.get_plan_meta()
 
     def test_append_journal(self, state):
         execute_tool("append_journal", {"entry": "feeling great"}, state)
@@ -249,10 +249,10 @@ class TestPatchTools:
         assert out["ok"] is True
         assert out["date"] == "2026-04-28"
         assert "warning" not in out
-        assert "Easy 5mi + 6 strides" in state.load_plan()
+        assert state.get_todays_workout(date(2026, 4, 28))["workout"] == "Easy 5mi + 6 strides"
 
     def test_update_workout_with_detail_body(self, state, monkeypatch):
-        """detail_body in the same call creates the per-day section."""
+        """detail_body in the same call sets the row's per-day prose."""
         self._pin_today(monkeypatch, "2026-04-28")
         out = execute_tool(
             "update_workout",
@@ -265,14 +265,13 @@ class TestPatchTools:
             state,
         )
         assert out["ok"] is True
-        plan = state.load_plan()
-        assert "Workout 5x800" in plan
-        assert "#### 2026-04-28" in plan
-        assert "WU 1mi. Work 5x800. CD 1mi." in plan
+        row = state.get_workout_row(date(2026, 4, 28))
+        assert row["prescribed_workout"] == "Workout 5x800"
+        assert row["detail_md"] == "WU 1mi. Work 5x800. CD 1mi."
 
-    def test_update_workout_unknown_date_returns_error_dict(self, state, monkeypatch):
-        """Errors come back as {"error": ...} (the dispatcher contract), not
-        raised — so the agent can read the message and recover."""
+    def test_update_workout_unknown_date_inserts_row(self, state, monkeypatch):
+        """An unknown date is no longer an error — update_workout seeds a
+        fresh planned row for it."""
         self._pin_today(monkeypatch, "2026-04-28")
         out = execute_tool(
             "update_workout",
@@ -283,8 +282,9 @@ class TestPatchTools:
             },
             state,
         )
-        assert "error" in out
-        assert "no row found" in out["error"]
+        assert out["ok"] is True
+        assert "error" not in out
+        assert state.get_todays_workout(date(2030, 12, 31))["workout"] == "Anything"
 
     def test_update_workout_does_not_clear_pending_proposal(self, state, monkeypatch, fake_redis):
         """Patch-style edits are surgical, not proposal-apply. A pending
@@ -324,19 +324,16 @@ class TestPatchTools:
         )
         assert out["ok"] is True
         assert out["rows_written"] == 2
-        plan = state.load_plan()
-        assert "2026-05-05" in plan
-        # Original Tuesday row is gone.
-        assert "Easy 4mi" not in plan
+        assert state.get_todays_workout(date(2026, 5, 5))["workout"] == "Easy 5mi"
 
     def test_replace_week_table_breaks_today_returns_warning(self, state, monkeypatch):
-        """If the new week table doesn't include today, the post-write check
-        should surface a warning so the agent can self-correct (same contract
-        as update_plan)."""
+        """If the replaced window spans today but omits today's row, the
+        post-write check surfaces a warning so the agent can self-correct."""
         self._pin_today(monkeypatch, "2026-04-28")
-        # New week starts after today — today's row no longer exists.
+        # Window 04-27..04-29 covers today (04-28) but skips it.
         new_rows = [
-            {"day": "Mon", "date": "2026-05-04", "workout": "Off", "pace_target": "—", "notes": ""},
+            {"day": "Mon", "date": "2026-04-27", "workout": "Off", "pace_target": "—", "notes": ""},
+            {"day": "Wed", "date": "2026-04-29", "workout": "Easy 5mi", "pace_target": "8:45", "notes": ""},
         ]
         out = execute_tool(
             "replace_week_table",

@@ -27,7 +27,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import re
 import sys
 from collections import defaultdict
 from pathlib import Path
@@ -36,13 +35,21 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from google_calendar.sync import _parse_plan_rows, _parse_workout_details  # noqa: E402
+# Plan-markdown parsers live in the shared module so the cutover and the
+# update_plan escape hatch reuse the exact same parsing.
+from plan_markdown import (  # noqa: E402
+    build_plan_meta as _build_plan_meta,
+)
+from plan_markdown import (  # noqa: E402
+    infer_workout_type as _infer_planned_type,
+)
+from plan_markdown import (  # noqa: E402
+    parse_plan_rows as _parse_plan_rows,
+)
+from plan_markdown import (  # noqa: E402
+    parse_workout_details as _parse_workout_details,
+)
 from state_manager import StateManager  # noqa: E402
-
-# Locked weekly-table header — same contract enforced everywhere else.
-_LOCKED_HEADER_TOKENS = ("Day", "Date", "Workout", "Pace target", "Notes")
-_DETAIL_HEADING_RE = re.compile(r"^####\s+\d{4}-\d{2}-\d{2}\s*$")
-_HEADING_RE = re.compile(r"^#{1,6}\s+\S")
 
 # Old sessions.type → Phase 1A type vocab. Anything not listed passes through
 # verbatim (return_test, weekly_summary, injury_event, milestone, etc.).
@@ -72,77 +79,6 @@ def _pick_actual(planned_type: str, pool: list):
         if (_norm_type(s["type"]) in _RUN_LIKE) == planned_run:
             return s
     return pool[0]
-
-
-def _infer_planned_type(workout: str) -> str:
-    """Best-effort workout-type classification for a planned table row.
-
-    Heuristic, not authoritative — the runner can correct plan_meta / rows
-    afterwards. Order matters: race, intervals and the run-distance check all
-    run before the cross-training keyword bucket, so a run that merely
-    *mentions* yoga or strides is still classified as a run, not cross.
-    """
-    w = workout.strip().lower()
-    if not w or w in {"-", "—"}:
-        return "rest"
-    if "race" in w or "brooklyn half" in w or "sky race" in w:
-        return "race"
-    if re.search(r"\d+\s*x\s*\d", w) or "tempo" in w or "interval" in w or "repeat" in w:
-        return "workout"
-    if "long run" in w or w.startswith("long "):
-        return "long"
-    if w.startswith("rest"):
-        return "rest"
-    # A run component dominates: "8mi", "3mi shakeout", "easy run". The
-    # \b after mi(le|les)? keeps "75min" / "20min" from reading as a run.
-    if re.search(r"\d+\s*mi(le|les)?\b", w) or "shakeout" in w or "easy run" in w:
-        return "easy"
-    if any(k in w for k in ("walk", "mobility", "off day")):
-        return "rest"
-    if any(k in w for k in ("cycl", "spin", "swim", "bike", "ride", "yoga", "cross")):
-        return "cross"
-    if "strength" in w or "lift" in w:
-        return "strength"
-    return "easy"
-
-
-def _build_plan_meta(plan_text: str) -> str:
-    """Return plan.md with the locked weekly table and every ``#### date``
-    detail block removed — the prose remainder for plan_meta."""
-    lines = plan_text.splitlines()
-    out: list[str] = []
-    i, n = 0, len(lines)
-    while i < n:
-        line = lines[i]
-        # Strip a locked-format table: header + separator + pipe data rows.
-        parts = [p.strip() for p in line.strip().strip("|").split("|")]
-        if "|" in line and len(parts) >= 5 and tuple(parts[:5]) == _LOCKED_HEADER_TOKENS:
-            i += 1  # skip header
-            if i < n and "|" in lines[i]:
-                i += 1  # skip separator
-            while i < n and "|" in lines[i] and lines[i].strip():
-                i += 1
-            continue
-        # Strip a per-day detail block: heading until the next heading / EOF.
-        if _DETAIL_HEADING_RE.match(line.strip()):
-            i += 1
-            while i < n and not _HEADING_RE.match(lines[i]):
-                i += 1
-            continue
-        out.append(line)
-        i += 1
-    # Collapse runs of 3+ blank lines left behind by the stripping.
-    collapsed: list[str] = []
-    blanks = 0
-    for line in out:
-        if line.strip():
-            blanks = 0
-        else:
-            blanks += 1
-            if blanks > 2:
-                continue
-        collapsed.append(line)
-    return "\n".join(collapsed).strip() + "\n"
 
 
 def migrate(db_path: Path, force: bool = False) -> dict:

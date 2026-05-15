@@ -97,7 +97,7 @@ def _build_messages(entry: dict, state: StateManager) -> list[dict]:
     if sid is not None:
         recent = [r for r in recent if (r.get("details") or {}).get("strava_id") != sid]
     athlete = state.load_athlete()
-    plan_md = state.load_plan()
+    plan_md = state.render_plan(today=target_date)
 
     system = (
         "You are PRE, an elite endurance coach reviewing a run the athlete "
