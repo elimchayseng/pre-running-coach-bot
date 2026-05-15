@@ -100,8 +100,7 @@ def _rows(db_path: Path, where: str = "1=1") -> list:
     sm._schema_applied = False
     with sm._conn() as c:
         return c.execute(
-            f"SELECT date, status, type, prescribed_workout, data FROM sessions_v2 "
-            f"WHERE {where} ORDER BY date"
+            f"SELECT date, status, type, prescribed_workout, data FROM sessions_v2 WHERE {where} ORDER BY date"
         ).fetchall()
 
 

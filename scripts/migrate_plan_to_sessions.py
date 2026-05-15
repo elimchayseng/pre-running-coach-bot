@@ -191,17 +191,13 @@ def migrate(db_path: Path, force: bool = False) -> dict:
                     details.get(r["date"]),
                 ),
             )
-            planned_by_date.setdefault(r["date"], []).append(
-                {"id": cur.lastrowid, "type": ptype}
-            )
+            planned_by_date.setdefault(r["date"], []).append({"id": cur.lastrowid, "type": ptype})
             summary["planned_inserted"] += 1
 
         # --- 2. completed rows from the old sessions table ---
         # Group a day's actuals so each can be matched (by type) to its
         # planned row; leftover actuals become standalone completed rows.
-        old_sessions = conn.execute(
-            "SELECT date, type, data FROM sessions ORDER BY date, id"
-        ).fetchall()
+        old_sessions = conn.execute("SELECT date, type, data FROM sessions ORDER BY date, id").fetchall()
         sessions_by_date: dict[str, list] = defaultdict(list)
         for s in old_sessions:
             sessions_by_date[s["date"]].append(s)
@@ -252,8 +248,7 @@ def main() -> int:
     parser.add_argument(
         "--force",
         action="store_true",
-        help="Wipe sessions_v2 + plan_meta and re-run (otherwise a populated "
-        "sessions_v2 makes this a no-op).",
+        help="Wipe sessions_v2 + plan_meta and re-run (otherwise a populated sessions_v2 makes this a no-op).",
     )
     args = parser.parse_args()
 
