@@ -14,8 +14,9 @@ PRAGMA journal_mode = WAL;
 PRAGMA busy_timeout = 5000;
 PRAGMA foreign_keys = ON;
 
--- Migration tracking. StateManager checks MAX(version) on connect; if empty,
--- runs this file end-to-end and inserts version 1.
+-- Migration tracking. StateManager checks MAX(version) on connect; if the DB
+-- is behind, it re-runs this file (every statement is IF NOT EXISTS, so the
+-- re-run only adds tables introduced since) and records the current version.
 CREATE TABLE IF NOT EXISTS schema_version (
     version    INTEGER PRIMARY KEY,
     applied_at TEXT    NOT NULL DEFAULT (datetime('now'))
@@ -68,6 +69,43 @@ CREATE TABLE IF NOT EXISTS athlete (
 CREATE TABLE IF NOT EXISTS journal (
     id         INTEGER PRIMARY KEY CHECK (id = 1),
     content    TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- Plan-as-rows (schema v3). DORMANT until the Phase 1A cutover — these tables
+-- are created and migrated into, but nothing reads them yet. The old `plan`
+-- (blob) and `sessions` (completed-only) tables remain the live source until
+-- the cutover PR archives them.
+--
+-- sessions_v2 unifies planned + completed workouts: one row per workout in
+-- some lifecycle state. After the cutover it is renamed to `sessions`.
+CREATE TABLE IF NOT EXISTS sessions_v2 (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    date               TEXT    NOT NULL,            -- ISO 'YYYY-MM-DD'
+    slot               TEXT,                        -- 'am' | 'pm' | NULL (single)
+    status             TEXT    NOT NULL
+                       CHECK (status IN ('planned','completed','missed','off-plan')),
+    type               TEXT,                        -- easy/workout/long/race/cross/strength/rest/...
+    prescribed_workout TEXT,
+    prescribed_pace    TEXT,
+    prescribed_notes   TEXT,
+    detail_md          TEXT,                        -- per-day prose (race-day pacing tables etc.)
+    data               TEXT,                        -- JSON actuals: miles, pace, hr, strava details
+    created_at         TEXT    NOT NULL DEFAULT (datetime('now')),
+    updated_at         TEXT    NOT NULL DEFAULT (datetime('now')),
+    completed_at       TEXT,                        -- when status flipped to completed
+    UNIQUE (date, slot)                             -- one prescription per date+slot
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_v2_strava_id
+    ON sessions_v2 (json_extract(data, '$.details.strava_id'))
+    WHERE json_extract(data, '$.details.strava_id') IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_sessions_v2_date_status ON sessions_v2 (date, status);
+
+-- Singleton: plan prose that does not belong in a checklist (phases, goal,
+-- pace zones, adjustment triggers). The non-row remainder of the old plan.md.
+CREATE TABLE IF NOT EXISTS plan_meta (
+    id         INTEGER PRIMARY KEY CHECK (id = 1),
+    content    TEXT NOT NULL,
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
