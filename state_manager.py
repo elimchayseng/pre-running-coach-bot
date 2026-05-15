@@ -44,6 +44,11 @@ _yaml.indent(mapping=2, sequence=4, offset=2)
 # — but the schema directory is in the repo root regardless).
 SCHEMA_PATH = Path(__file__).resolve().parent / "state" / "schema.sql"
 
+# Current schema version. Bumped to 3 for the Phase 1A plan-as-rows tables
+# (sessions_v2, plan_meta). schema.sql is fully idempotent (every statement is
+# IF NOT EXISTS), so an older DB is upgraded by simply re-running the file.
+CURRENT_SCHEMA_VERSION = 3
+
 _JOURNAL_HEADER = "# Journal\n\nAppend-only freeform notes. Newest entries at the bottom.\n"
 
 # Double-checked locking so two threads can't try to apply the schema
@@ -100,10 +105,20 @@ class StateManager:
             if self._schema_applied:
                 return
             row = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='schema_version'").fetchone()
+            schema_sql = SCHEMA_PATH.read_text(encoding="utf-8")
             if row is None:
-                conn.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
-            # Always record version 1 (idempotent via PRIMARY KEY).
-            conn.execute("INSERT OR IGNORE INTO schema_version (version) VALUES (1)")
+                # Fresh DB: apply the whole schema, record the baseline.
+                conn.executescript(schema_sql)
+                conn.execute("INSERT OR IGNORE INTO schema_version (version) VALUES (1)")
+            current = conn.execute("SELECT COALESCE(MAX(version), 0) FROM schema_version").fetchone()[0]
+            if current < CURRENT_SCHEMA_VERSION:
+                # DB predates the current schema. Re-running schema.sql is safe
+                # (every statement is IF NOT EXISTS) and adds any new tables.
+                conn.executescript(schema_sql)
+                conn.execute(
+                    "INSERT OR IGNORE INTO schema_version (version) VALUES (?)",
+                    (CURRENT_SCHEMA_VERSION,),
+                )
             conn.commit()
             self._schema_applied = True
 
