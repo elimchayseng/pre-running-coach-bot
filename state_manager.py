@@ -240,6 +240,7 @@ class StateManager:
                 (meta,),
             )
             self._append_changelog(conn, change_note)
+        self._notify_mirror(self._rows("status = 'planned'", ()))
 
     def update_workout(
         self,
@@ -271,7 +272,7 @@ class StateManager:
                     "SELECT id, status FROM sessions WHERE date = ? ORDER BY slot LIMIT 1", (iso,)
                 ).fetchone()
             if row is None:
-                conn.execute(
+                cur = conn.execute(
                     "INSERT INTO sessions "
                     "(date, slot, status, type, prescribed_workout, prescribed_pace, "
                     " prescribed_notes, detail_md) "
@@ -285,6 +286,7 @@ class StateManager:
                         (detail_body or "").strip() or None,
                     ),
                 )
+                affected_id = cur.lastrowid
             else:
                 sets, params = [], []
                 if workout is not None:
@@ -304,7 +306,9 @@ class StateManager:
                 sets.append("updated_at = datetime('now')")
                 params.append(row["id"])
                 conn.execute(f"UPDATE sessions SET {', '.join(sets)} WHERE id = ?", params)
+                affected_id = row["id"]
             self._append_changelog(conn, change_note)
+        self._notify_mirror(self._rows("id = ?", (affected_id,)))
 
     def replace_week_table(self, rows: list[dict], change_note: str) -> None:
         """Replace a week's planned rows.
@@ -347,6 +351,7 @@ class StateManager:
                     ),
                 )
             self._append_changelog(conn, change_note)
+        self._notify_mirror(self._rows("status = 'planned' AND date BETWEEN ? AND ?", (dates[0], dates[-1])))
 
     def _append_changelog(self, conn: sqlite3.Connection, note: str) -> None:
         ts = datetime.now().isoformat(timespec="seconds")
@@ -499,13 +504,16 @@ class StateManager:
                     (payload, stype or None, match["id"]),
                 )
                 self._append_changelog(conn, f"{sdate} completed: {stype or 'session'}")
-                return {"matched": True, "status": "completed", "row_id": match["id"]}
-            cur = conn.execute(
-                "INSERT INTO sessions (date, slot, status, type, data, completed_at) "
-                "VALUES (?, NULL, 'off-plan', ?, ?, datetime('now'))",
-                (sdate, stype or None, payload),
-            )
-            return {"matched": False, "status": "off-plan", "row_id": cur.lastrowid}
+                result = {"matched": True, "status": "completed", "row_id": match["id"]}
+            else:
+                cur = conn.execute(
+                    "INSERT INTO sessions (date, slot, status, type, data, completed_at) "
+                    "VALUES (?, NULL, 'off-plan', ?, ?, datetime('now'))",
+                    (sdate, stype or None, payload),
+                )
+                result = {"matched": False, "status": "off-plan", "row_id": cur.lastrowid}
+        self._notify_mirror(self._rows("id = ?", (result["row_id"],)))
+        return result
 
     def update_session_by_strava_id(self, activity_id: int, new_entry: dict) -> bool:
         """Replace the actuals of the row carrying ``details.strava_id``.
@@ -522,7 +530,25 @@ class StateManager:
                 "WHERE json_extract(data, '$.details.strava_id') = ?",
                 (payload, str(new_entry["date"])[:10], new_entry.get("type") or None, activity_id),
             )
-            return cur.rowcount > 0
+            updated = cur.rowcount > 0
+        if updated:
+            self._notify_mirror(self._rows("json_extract(data, '$.details.strava_id') = ?", (activity_id,)))
+        return updated
+
+    def _notify_mirror(self, rows: list[dict]) -> None:
+        """Best-effort: reflect written session rows into the Notion mirror.
+
+        Lazy-imported and fully exception-swallowing — the mirror is optional
+        and a Notion problem must never break a SQLite write.
+        """
+        if not rows:
+            return
+        try:
+            from notion.mirror import mirror_sessions
+
+            mirror_sessions(rows)
+        except Exception:  # noqa: BLE001 — mirror failures never propagate
+            pass
 
     # ---------- Journal ----------
 
