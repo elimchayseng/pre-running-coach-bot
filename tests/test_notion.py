@@ -136,6 +136,29 @@ class TestClientRequest:
         with pytest.raises(NotionError):
             client.users_me()
 
+    def test_search_paginates_until_has_more_false(self, client):
+        """search() must follow next_cursor — a match on page 2 would
+        otherwise be missed and the bootstrap would create a duplicate DB."""
+        client._session = _FakeSession(
+            [
+                _FakeResp(200, {"results": [{"id": "a"}], "has_more": True, "next_cursor": "c1"}),
+                _FakeResp(200, {"results": [{"id": "b"}], "has_more": False}),
+            ]
+        )
+        out = client.search(query="PRE Sessions")
+        assert [r["id"] for r in out["results"]] == ["a", "b"]
+
+    def test_search_passes_start_cursor_on_second_page(self, client):
+        session = _FakeSession(
+            [
+                _FakeResp(200, {"results": [], "has_more": True, "next_cursor": "cur-xyz"}),
+                _FakeResp(200, {"results": [], "has_more": False}),
+            ]
+        )
+        client._session = session
+        client.search(query="q")
+        assert session.calls[1][2]["start_cursor"] == "cur-xyz"
+
     def test_create_database_payload_shape(self, client):
         session = _FakeSession([_FakeResp(200, {"id": "db1", "data_sources": [{"id": "ds1"}]})])
         client._session = session

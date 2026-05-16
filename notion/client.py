@@ -110,11 +110,30 @@ class NotionClient:
         return self._request("GET", "/users/me")
 
     def search(self, query: str = "", filter_: Optional[dict] = None) -> dict:
-        """POST /search — find pages/databases the integration can see."""
-        payload: dict[str, Any] = {"query": query}
-        if filter_:
-            payload["filter"] = filter_
-        return self._request("POST", "/search", payload)
+        """POST /search — find objects the integration can see.
+
+        Paginates: ``/search`` returns at most 100 results per page, so a
+        single call could miss a match at workspace scale. Follows
+        ``next_cursor`` until ``has_more`` is false (capped at 20 pages so a
+        huge workspace can't spin forever). Returns all results aggregated
+        under ``{"results": [...]}``.
+        """
+        results: list = []
+        cursor: Optional[str] = None
+        for _ in range(20):
+            payload: dict[str, Any] = {"query": query}
+            if filter_:
+                payload["filter"] = filter_
+            if cursor:
+                payload["start_cursor"] = cursor
+            page = self._request("POST", "/search", payload)
+            results.extend(page.get("results", []))
+            if not page.get("has_more"):
+                break
+            cursor = page.get("next_cursor")
+            if not cursor:
+                break
+        return {"results": results}
 
     def create_database(self, parent_page_id: str, title: str, properties: dict) -> dict:
         """POST /databases — create a database with one initial data source.
