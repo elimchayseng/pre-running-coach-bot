@@ -151,6 +151,49 @@ class NotionClient:
     def retrieve_database(self, database_id: str) -> dict:
         return self._request("GET", f"/databases/{database_id}")
 
+    def create_page(self, data_source_id: str, properties: dict, markdown: Optional[str] = None) -> dict:
+        """POST /pages — create a page under a data source, optionally with a
+        Markdown body."""
+        payload: dict[str, Any] = {
+            "parent": {"type": "data_source_id", "data_source_id": data_source_id},
+            "properties": properties,
+        }
+        if markdown:
+            payload["markdown"] = markdown
+        return self._request("POST", "/pages", payload)
+
+    def query_data_source(self, data_source_id: str, filter_: Optional[dict] = None) -> dict:
+        """POST /data_sources/:id/query — query rows.
+
+        Not paginated: the mirror only ever filters on the unique source_key,
+        which yields 0 or 1 result. A general paginating query is a Phase 2
+        concern (bidirectional sync).
+        """
+        payload: dict[str, Any] = {}
+        if filter_:
+            payload["filter"] = filter_
+        return self._request("POST", f"/data_sources/{data_source_id}/query", payload)
+
+    def update_page(self, page_id: str, properties: Optional[dict] = None, in_trash: Optional[bool] = None) -> dict:
+        """PATCH /pages/:id — update properties and/or trash the page."""
+        payload: dict[str, Any] = {}
+        if properties is not None:
+            payload["properties"] = properties
+        if in_trash is not None:
+            payload["in_trash"] = in_trash
+        return self._request("PATCH", f"/pages/{page_id}", payload)
+
+    def replace_page_markdown(self, page_id: str, markdown: str) -> dict:
+        """PATCH /pages/:id/markdown — replace the whole page body."""
+        return self._request(
+            "PATCH",
+            f"/pages/{page_id}/markdown",
+            {
+                "type": "replace_content",
+                "replace_content": {"new_str": markdown, "allow_deleting_content": True},
+            },
+        )
+
     def create_view(
         self,
         database_id: str,
