@@ -36,6 +36,16 @@ def run_health_checks() -> dict[str, bool]:
             logger.error(f"Strava health check failed: {e}")
             results["strava"] = False
 
+    # Notion mirror is optional — only check when a token is configured.
+    if os.getenv("NOTION_TOKEN"):
+        try:
+            from notion.client import NotionClient
+
+            results["notion"] = bool(NotionClient().users_me().get("id"))
+        except Exception as e:
+            logger.error(f"Notion health check failed: {e}")
+            results["notion"] = False
+
     return results
 
 
