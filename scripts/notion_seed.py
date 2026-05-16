@@ -26,7 +26,7 @@ if str(ROOT) not in sys.path:
 from dotenv import load_dotenv  # noqa: E402
 
 from notion import mirror  # noqa: E402
-from notion.client import NotionClient, NotionError  # noqa: E402
+from notion.client import NotionClient  # noqa: E402
 from state_manager import StateManager  # noqa: E402
 
 
@@ -43,7 +43,7 @@ def seed(db_path: Path) -> dict:
         try:
             mirror._upsert_session(row, client)
             summary["ok"] += 1
-        except NotionError as e:
+        except Exception as e:  # noqa: BLE001 — one bad row must not abort the backfill
             summary["failed"] += 1
             print(f"  FAIL session id={row['id']} ({row['date']}): {e}", file=sys.stderr)
     return summary

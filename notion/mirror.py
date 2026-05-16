@@ -28,6 +28,13 @@ logger = logging.getLogger("pre_coach.notion.mirror")
 _TEXT_CAP = 2000
 _BOLD_RE = re.compile(r"\*\*(.+?)\*\*")
 
+# Serializes all mirror upserts. The query-then-insert in _upsert_session is
+# not atomic at the Notion API (no uniqueness constraint on source_key), so
+# two daemon threads mirroring the same row could both miss the query and
+# double-insert a page. A single global lock is fine here: mirror writes are
+# best-effort and off every request path, so serializing them is invisible.
+_upsert_lock = threading.Lock()
+
 
 def enabled() -> bool:
     """True when the mirror is fully configured. Every public entry point
@@ -101,18 +108,24 @@ def _query_page_id(client: NotionClient, data_source_id: str, source_key: str) -
 
 
 def _upsert_session(row: dict, client: NotionClient) -> None:
-    """Insert or update the PRE Sessions page for one SQLite session row."""
+    """Insert or update the PRE Sessions page for one SQLite session row.
+
+    The query → insert/update is held under ``_upsert_lock`` so two threads
+    mirroring the same source_key can't both miss the query and create
+    duplicate pages. Payload building is pure and stays outside the lock.
+    """
     data_source_id = os.environ["NOTION_SESSIONS_DS_ID"]
     source_key = schema.session_key(row["id"])
     props = _session_properties(row, source_key)
     body = render_session_body(row)
-    page_id = _query_page_id(client, data_source_id, source_key)
-    if page_id:
-        client.update_page(page_id, properties=props)
-        # Always sync the body, even to empty, so a removed detail is cleared.
-        client.replace_page_markdown(page_id, body or "")
-    else:
-        client.create_page(data_source_id, props, markdown=body)
+    with _upsert_lock:
+        page_id = _query_page_id(client, data_source_id, source_key)
+        if page_id:
+            client.update_page(page_id, properties=props)
+            # Always sync the body, even to empty, so a removed detail is cleared.
+            client.replace_page_markdown(page_id, body or "")
+        else:
+            client.create_page(data_source_id, props, markdown=body)
 
 
 # ---------- fire-and-forget entry points ----------

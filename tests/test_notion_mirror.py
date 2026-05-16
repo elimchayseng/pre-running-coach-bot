@@ -145,6 +145,20 @@ class TestUpsert:
         # Body always synced (to empty here) so a removed detail is cleared.
         assert client.markdown_patched[0] == {"page_id": "page-7", "markdown": ""}
 
+    def test_query_and_write_run_under_the_lock(self, monkeypatch):
+        """The query+write is serialized so two threads mirroring the same
+        source_key can't both miss the query and double-insert."""
+        monkeypatch.setenv("NOTION_SESSIONS_DS_ID", "ds-1")
+        lock_held: list = []
+
+        class _LockProbeClient(_FakeClient):
+            def query_data_source(self, ds, filter_=None):
+                lock_held.append(mirror._upsert_lock.locked())
+                return super().query_data_source(ds, filter_)
+
+        mirror._upsert_session(_row(), _LockProbeClient())
+        assert lock_held == [True]
+
 
 # ---------------- enable gate ----------------
 
