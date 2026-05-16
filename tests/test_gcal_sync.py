@@ -4,10 +4,12 @@ reconcile_completion."""
 
 from __future__ import annotations
 
+import copy
 from datetime import date
 
 import pytest
 
+import plan_markdown
 from google_calendar import sync
 
 PLAN_FIXTURE = """\
@@ -33,8 +35,11 @@ class _StateStub:
     """StateManager-shaped stub for sync tests — keeps gcal sync state in
     memory so we don't need a real SQLite DB inside unit tests.
 
-    Supports the four methods sync.py touches: ``load_plan``,
-    ``sessions_on_date``, ``load_gcal_sync_state``, ``save_gcal_sync_state``.
+    The plan blob is kept for fixture convenience: it is parsed into
+    prescription rows on demand, so sync.py sees the same row shape it gets
+    from the real ``sessions`` table. Supports the methods sync.py touches:
+    ``get_prescription_rows``, ``get_workout_row``, ``sessions_on_date``,
+    ``load_gcal_sync_state``, ``save_gcal_sync_state``.
     """
 
     def __init__(self, plan_text: str = "", sessions: dict[str, list[dict]] | None = None):
@@ -42,21 +47,37 @@ class _StateStub:
         self._sessions = sessions or {}
         self.gcal_sync: dict[str, dict] = {}
 
-    def load_plan(self) -> str:
-        return self._plan
+    def _rows(self) -> list[dict]:
+        details = plan_markdown.parse_workout_details(self._plan)
+        return [
+            {
+                "date": r["date"],
+                "status": "planned",
+                "type": plan_markdown.infer_workout_type(r["workout"]),
+                "prescribed_workout": r["workout"],
+                "prescribed_pace": r["pace_target"],
+                "prescribed_notes": r["notes"],
+                "detail_md": details.get(r["date"]),
+                "data": None,
+            }
+            for r in plan_markdown.parse_plan_rows(self._plan)
+        ]
+
+    def get_prescription_rows(self, start, end) -> list[dict]:
+        s, e = start.isoformat(), end.isoformat()
+        return [r for r in self._rows() if s <= r["date"] <= e]
+
+    def get_workout_row(self, target) -> dict | None:
+        iso = target.isoformat()
+        return next((r for r in self._rows() if r["date"] == iso), None)
 
     def sessions_on_date(self, d) -> list[dict]:
         return list(self._sessions.get(d.isoformat(), []))
 
     def load_gcal_sync_state(self) -> dict[str, dict]:
-        # Mimic the real load: drop entries with falsy values for parity.
-        import copy
-
         return copy.deepcopy(self.gcal_sync)
 
     def save_gcal_sync_state(self, state: dict[str, dict]) -> None:
-        import copy
-
         self.gcal_sync = copy.deepcopy(state)
 
 
@@ -70,32 +91,6 @@ def fixed_today(monkeypatch):
     """Pin today_local() to 2026-05-11 so prune windows are deterministic."""
     monkeypatch.setattr(sync, "today_local", lambda: date(2026, 5, 11))
     yield date(2026, 5, 11)
-
-
-class TestParsePlanRows:
-    def test_parses_locked_format_rows_only(self):
-        rows = sync._parse_plan_rows(PLAN_FIXTURE)
-        assert len(rows) == 4
-        dates = [r["date"] for r in rows]
-        assert dates == ["2026-05-08", "2026-05-09", "2026-05-11", "2026-05-16"]
-
-    def test_skips_empty_workout(self):
-        text = """\
-| Day | Date | Workout | Pace target | Notes |
-| Sun | 2026-05-10 | — | — | should skip |
-| Mon | 2026-05-11 | Easy 4mi | x | y |
-"""
-        rows = sync._parse_plan_rows(text)
-        assert len(rows) == 1
-        assert rows[0]["date"] == "2026-05-11"
-
-    def test_skips_non_iso_date(self):
-        text = """\
-| Day | Date | Workout | Pace target | Notes |
-| Sat | 5/9 | Easy 8mi | x | y |
-"""
-        rows = sync._parse_plan_rows(text)
-        assert rows == []
 
 
 class TestEventPayload:
@@ -129,66 +124,6 @@ class TestEventPayload:
         _, h1 = sync._build_event_payload(row1, sync._event_id(row1["date"]))
         _, h2 = sync._build_event_payload(row2, sync._event_id(row2["date"]))
         assert h1 != h2
-
-
-class TestParseWorkoutDetails:
-    def test_extracts_block_until_next_anchor(self):
-        text = """\
-### Workout Notes
-
-#### 2026-05-12
-Sharpening, not testing. 4 days out from race.
-
-**Structure:**
-- 1.5mi WU easy
-- 3x1000m @ 6:00-6:05 pace
-- 2:30 jog recovery between reps
-- 1mi CD easy
-
-Cue: feel like you could've done one more.
-
-#### 2026-05-16
-Brooklyn Half. Mile 1 must be 6:15-6:20.
-"""
-        details = sync._parse_workout_details(text)
-        assert set(details.keys()) == {"2026-05-12", "2026-05-16"}
-        assert "Sharpening" in details["2026-05-12"]
-        assert "Cue:" in details["2026-05-12"]
-        assert "Brooklyn Half" in details["2026-05-16"]
-        assert "Brooklyn" not in details["2026-05-12"]
-
-    def test_body_terminates_at_higher_heading(self):
-        text = """\
-#### 2026-05-12
-This is the detail body.
-
-## Phase 2 Bridge
-
-Phase 2 prose, not part of the detail.
-"""
-        details = sync._parse_workout_details(text)
-        assert details["2026-05-12"] == "This is the detail body."
-
-    def test_empty_or_whitespace_body_omitted(self):
-        text = """\
-#### 2026-05-12
-
-#### 2026-05-13
-Has content.
-"""
-        details = sync._parse_workout_details(text)
-        assert "2026-05-12" not in details
-        assert details["2026-05-13"] == "Has content."
-
-    def test_no_anchors_returns_empty(self):
-        assert sync._parse_workout_details("# just prose, no detail anchors") == {}
-
-    def test_anchor_must_be_level_4_only(self):
-        text = """\
-### 2026-05-12
-Body under H3 — should NOT be parsed as a detail block.
-"""
-        assert sync._parse_workout_details(text) == {}
 
 
 class TestRichDescription:

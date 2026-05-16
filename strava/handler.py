@@ -126,8 +126,14 @@ def _handle_create(state: StateManager, activity_id: int) -> None:
         return
 
     try:
-        state.append_session(entry)
-        logger.info(f"Logged Strava activity {activity_id}: {entry.get('miles')}mi {entry.get('type')}")
+        outcome = state.reconcile_strava_activity(entry)
+        logger.info(
+            "Logged Strava activity %s: %smi %s (%s)",
+            activity_id,
+            entry.get("miles"),
+            entry.get("type"),
+            outcome.get("status"),
+        )
     except sqlite3.IntegrityError:
         # Lost the race against a concurrent webhook for the same activity.
         # The other thread won; nothing to do here.

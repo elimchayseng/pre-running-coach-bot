@@ -70,8 +70,8 @@ async def today_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def plan_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Print the current plan.md (truncated if needed for Telegram's 4096 limit)."""
-    plan = _get_state().load_plan()
+    """Print the current plan (truncated if needed for Telegram's 4096 limit)."""
+    plan = _get_state().render_plan()
     if not plan.strip():
         await update.message.reply_text("No plan set. Tell me about your goals and I'll draft one.")
         return

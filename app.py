@@ -30,6 +30,10 @@ load_dotenv()
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# The Phase 1A.2 DB cutover runs in gunicorn's on_starting hook
+# (see gunicorn.conf.py) so it happens once before workers serve traffic and
+# never as a side effect of importing this module.
+
 app = Flask(__name__)
 
 # Initialize Telegram application
@@ -219,5 +223,15 @@ with app.app_context():
 
 
 if __name__ == "__main__":
+    # Direct dev run (prod goes through gunicorn, which runs the cutover in
+    # its on_starting hook). Mirror that here so `python app.py` is safe too.
+    from pathlib import Path
+
+    from scripts.cutover_to_unified_sessions import cutover
+
+    _db = Path(os.getenv("DATABASE_PATH") or "state/coach.db")
+    if _db.exists():
+        cutover(_db)
+
     port = int(os.getenv("PORT", 8080))
     app.run(host="0.0.0.0", port=port)

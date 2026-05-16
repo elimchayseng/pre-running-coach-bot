@@ -179,11 +179,12 @@ SCHEMAS = [
                 "non-table sections, or initial plan creation. "
                 "CRITICAL: preserve the locked "
                 "'| Day | Date | Workout | Pace target | Notes |' "
-                "table format for the current week — get_todays_workout "
-                "depends on it. For QUALITY sessions and races, include "
-                "per-day '#### YYYY-MM-DD' sub-sections with rationale, "
-                "structure (WU / work / CD), and execution cues. The body "
-                "extends until the next heading."
+                "table format — update_plan parses that table into the plan's "
+                "workout rows, so a missing or misformatted table loses the "
+                "week. For QUALITY sessions and races, include per-day "
+                "'#### YYYY-MM-DD' sub-sections with rationale, structure "
+                "(WU / work / CD), and execution cues. The body extends until "
+                "the next heading."
             ),
             "parameters": {
                 "type": "object",

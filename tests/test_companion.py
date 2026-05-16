@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from datetime import date
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -27,15 +28,15 @@ zones:
   marathon_pace: "6:40"
 """
 
-PLAN_MD = """\
-# Plan
-
-## This Week
-
-| Day | Date | Workout | Pace target | Notes |
-|-----|------|---------|-------------|-------|
-| Sun | 2099-01-01 | Easy 4mi | 8:30-9:00 | |
-"""
+# Row dated to today so it lands inside the system prompt's "this week"
+# table (render_plan only renders the current week).
+_TODAY = date.today()
+PLAN_MD = (
+    "# Plan\n\n## This Week\n\n"
+    "| Day | Date | Workout | Pace target | Notes |\n"
+    "|-----|------|---------|-------------|-------|\n"
+    f"| {_TODAY.strftime('%a')} | {_TODAY.isoformat()} | Easy 4mi | 8:30-9:00 | |\n"
+)
 
 
 @pytest.fixture

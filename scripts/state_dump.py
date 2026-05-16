@@ -33,7 +33,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 
-KNOWN = {"log", "plan", "plan_changelog", "athlete", "journal", "gcal_sync", "all"}
+KNOWN = {"log", "plan_meta", "plan_changelog", "athlete", "journal", "gcal_sync", "all"}
 
 
 def _resolve_db(arg_db: str | None) -> Path:
@@ -55,10 +55,14 @@ def _connect(db_path: Path) -> sqlite3.Connection:
 
 
 def dump_log(conn: sqlite3.Connection, since: str | None) -> None:
+    """Dump logged-session actuals (rows whose `data` JSON is populated)."""
     if since:
-        rows = conn.execute("SELECT data FROM sessions WHERE date >= ? ORDER BY date, id", (since,)).fetchall()
+        rows = conn.execute(
+            "SELECT data FROM sessions WHERE date >= ? AND data IS NOT NULL ORDER BY date, id",
+            (since,),
+        ).fetchall()
     else:
-        rows = conn.execute("SELECT data FROM sessions ORDER BY date, id").fetchall()
+        rows = conn.execute("SELECT data FROM sessions WHERE data IS NOT NULL ORDER BY date, id").fetchall()
     for r in rows:
         print(r["data"])
 
@@ -94,7 +98,7 @@ def dump_gcal_sync(conn: sqlite3.Connection) -> None:
 def dump_all(conn: sqlite3.Connection) -> None:
     for label, fn in [
         ("athlete.yaml", lambda: dump_singleton(conn, "athlete", "yaml_text")),
-        ("plan.md", lambda: dump_singleton(conn, "plan")),
+        ("plan_meta.md", lambda: dump_singleton(conn, "plan_meta")),
         ("plan_changelog.md", lambda: dump_singleton(conn, "plan_changelog")),
         ("journal.md", lambda: dump_singleton(conn, "journal")),
         ("log.jsonl", lambda: dump_log(conn, None)),
@@ -128,8 +132,8 @@ def main() -> int:
             dump_all(conn)
         elif args.table == "log":
             dump_log(conn, args.since)
-        elif args.table == "plan":
-            dump_singleton(conn, "plan")
+        elif args.table == "plan_meta":
+            dump_singleton(conn, "plan_meta")
         elif args.table == "plan_changelog":
             dump_singleton(conn, "plan_changelog")
         elif args.table == "athlete":

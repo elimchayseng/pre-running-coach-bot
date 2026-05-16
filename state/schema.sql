@@ -5,51 +5,64 @@
 -- when schema_version is empty. All statements use IF NOT EXISTS so the script
 -- is safe to re-run.
 --
--- Document blobs (plan, journal, athlete, plan_changelog) are stored as
--- singleton-row TEXT so the system prompt sees the same bytes as today.
--- sessions.data holds the full JSON entry to preserve variable top-level
--- fields. gcal_sync_state is normalized for SQL-joined reconcile queries.
+-- Schema v4 (Phase 1A cutover): `sessions` is the unified plan-as-rows table —
+-- one row per workout in a lifecycle state (planned → completed/missed/
+-- off-plan). The old plan markdown blob is gone; non-checklist plan prose
+-- lives in the `plan_meta` singleton. An existing pre-cutover DB is migrated
+-- by scripts/cutover_to_unified_sessions.py (run as a release step); a fresh
+-- DB gets this final shape directly.
 
 PRAGMA journal_mode = WAL;
 PRAGMA busy_timeout = 5000;
 PRAGMA foreign_keys = ON;
 
--- Migration tracking. StateManager checks MAX(version) on connect; if the DB
--- is behind, it re-runs this file (every statement is IF NOT EXISTS, so the
--- re-run only adds tables introduced since) and records the current version.
+-- Migration tracking. StateManager records the version it observes on connect;
+-- the cutover script records v4 once an existing DB has been migrated.
 CREATE TABLE IF NOT EXISTS schema_version (
     version    INTEGER PRIMARY KEY,
     applied_at TEXT    NOT NULL DEFAULT (datetime('now'))
 );
 
--- Append-only session log. Replaces state/log.jsonl.
+-- Unified plan-as-rows table. Each row is one workout in a lifecycle state.
 --
--- `data` holds the full JSON entry so additional top-level fields (notes,
--- weather, pace, etc.) round-trip exactly. `date` and `type` are indexed
--- copies for query speed. The partial UNIQUE index on the JSON-extracted
--- strava_id closes the TOCTOU window in the webhook handler — duplicate
--- inserts raise IntegrityError instead of silently double-logging.
+-- `prescribed_*` hold what the plan asked for; `data` holds the JSON actuals
+-- (miles, paces, HR, Strava details) once the workout is logged. `detail_md`
+-- is per-day coaching prose (race-day pacing tables etc.) synced verbatim into
+-- the Google Calendar event. The partial UNIQUE index on the JSON-extracted
+-- strava_id closes the webhook-handler TOCTOU window. UNIQUE(date, slot) keeps
+-- one prescription per date+slot (NULL slot = the day's single session).
 CREATE TABLE IF NOT EXISTS sessions (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    date       TEXT    NOT NULL,
-    type       TEXT    NOT NULL,
-    data       TEXT    NOT NULL,
-    created_at TEXT    NOT NULL DEFAULT (datetime('now')),
-    updated_at TEXT    NOT NULL DEFAULT (datetime('now'))
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    date               TEXT    NOT NULL,
+    slot               TEXT,
+    status             TEXT    NOT NULL
+                       CHECK (status IN ('planned','completed','missed','off-plan')),
+    type               TEXT,
+    prescribed_workout TEXT,
+    prescribed_pace    TEXT,
+    prescribed_notes   TEXT,
+    detail_md          TEXT,
+    data               TEXT,
+    created_at         TEXT    NOT NULL DEFAULT (datetime('now')),
+    updated_at         TEXT    NOT NULL DEFAULT (datetime('now')),
+    completed_at       TEXT,
+    UNIQUE (date, slot)
 );
-CREATE INDEX IF NOT EXISTS idx_sessions_date ON sessions(date DESC);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_strava_id
-    ON sessions(json_extract(data, '$.details.strava_id'))
+    ON sessions (json_extract(data, '$.details.strava_id'))
     WHERE json_extract(data, '$.details.strava_id') IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_sessions_date_status ON sessions (date, status);
 
--- Singleton document blobs. CHECK (id = 1) enforces the singleton at the
--- schema level; INSERT OR REPLACE on writes keeps it that way.
-
-CREATE TABLE IF NOT EXISTS plan (
+-- Singleton: plan prose that does not belong in a checklist — phases, goal,
+-- pace zones, adjustment triggers. The non-row remainder of the old plan.md.
+CREATE TABLE IF NOT EXISTS plan_meta (
     id         INTEGER PRIMARY KEY CHECK (id = 1),
     content    TEXT NOT NULL,
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+-- Singleton document blobs. CHECK (id = 1) enforces the singleton at the
+-- schema level; INSERT OR REPLACE on writes keeps it that way.
 
 CREATE TABLE IF NOT EXISTS plan_changelog (
     id         INTEGER PRIMARY KEY CHECK (id = 1),
@@ -69,43 +82,6 @@ CREATE TABLE IF NOT EXISTS athlete (
 CREATE TABLE IF NOT EXISTS journal (
     id         INTEGER PRIMARY KEY CHECK (id = 1),
     content    TEXT NOT NULL DEFAULT '',
-    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
-
--- Plan-as-rows (schema v3). DORMANT until the Phase 1A cutover — these tables
--- are created and migrated into, but nothing reads them yet. The old `plan`
--- (blob) and `sessions` (completed-only) tables remain the live source until
--- the cutover PR archives them.
---
--- sessions_v2 unifies planned + completed workouts: one row per workout in
--- some lifecycle state. After the cutover it is renamed to `sessions`.
-CREATE TABLE IF NOT EXISTS sessions_v2 (
-    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
-    date               TEXT    NOT NULL,            -- ISO 'YYYY-MM-DD'
-    slot               TEXT,                        -- 'am' | 'pm' | NULL (single)
-    status             TEXT    NOT NULL
-                       CHECK (status IN ('planned','completed','missed','off-plan')),
-    type               TEXT,                        -- easy/workout/long/race/cross/strength/rest/...
-    prescribed_workout TEXT,
-    prescribed_pace    TEXT,
-    prescribed_notes   TEXT,
-    detail_md          TEXT,                        -- per-day prose (race-day pacing tables etc.)
-    data               TEXT,                        -- JSON actuals: miles, pace, hr, strava details
-    created_at         TEXT    NOT NULL DEFAULT (datetime('now')),
-    updated_at         TEXT    NOT NULL DEFAULT (datetime('now')),
-    completed_at       TEXT,                        -- when status flipped to completed
-    UNIQUE (date, slot)                             -- one prescription per date+slot
-);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_v2_strava_id
-    ON sessions_v2 (json_extract(data, '$.details.strava_id'))
-    WHERE json_extract(data, '$.details.strava_id') IS NOT NULL;
-CREATE INDEX IF NOT EXISTS idx_sessions_v2_date_status ON sessions_v2 (date, status);
-
--- Singleton: plan prose that does not belong in a checklist (phases, goal,
--- pace zones, adjustment triggers). The non-row remainder of the old plan.md.
-CREATE TABLE IF NOT EXISTS plan_meta (
-    id         INTEGER PRIMARY KEY CHECK (id = 1),
-    content    TEXT NOT NULL,
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
