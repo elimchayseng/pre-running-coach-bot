@@ -508,3 +508,208 @@ class TestFitnessSummary:
         )
         out = execute_tool("get_fitness_summary", {"window_days": 21}, state)
         assert any("No quality sessions" in s for s in out["signals"])
+
+
+# ------------- end-of-turn calendar sync debounce (issue #26) -------------
+
+
+class TestAutoSyncDebounce:
+    """Plan-edit tools mark a dirty flag; a single end-of-turn flush fires
+    one fire-and-forget gcal sync per turn regardless of how many edits ran.
+
+    Verified properties:
+      - N edits in one turn -> exactly one sync call.
+      - No edits -> no sync.
+      - The sync runs off the response path (in a separate thread).
+      - A sync failure does not propagate or break tool responses.
+    """
+
+    def _pin_today(self, monkeypatch, target):
+        from datetime import date as _date
+
+        import temporal_context
+
+        if isinstance(target, str):
+            target = _date.fromisoformat(target)
+        monkeypatch.setattr(temporal_context, "today_local", lambda: target)
+
+    def _drain_dirty(self):
+        """Reset the module-level dirty flag between tests so leakage from
+        earlier tests in this file (which call plan-edit tools without
+        flushing) doesn't contaminate the assertion baseline."""
+        from tools import state as state_tools
+
+        state_tools._consume_plan_dirty()
+
+    def test_multiple_edits_one_sync(self, state, monkeypatch):
+        """Three plan-edit tool calls + one flush -> exactly one sync_plan call."""
+        self._pin_today(monkeypatch, "2026-04-28")
+        self._drain_dirty()
+
+        calls: list[dict] = []
+        # Patch the sync target on the google_calendar.sync module — the daemon
+        # thread imports from there inside _run, so patching there is what gets
+        # called.
+        from google_calendar import sync as gcal_sync
+        from tools import state as state_tools
+
+        def _fake_sync(state, dry_run=False):
+            calls.append({"dry_run": dry_run})
+            return {"inserted": 0, "patched": 0, "deleted": 0, "unchanged": 0, "errors": []}
+
+        monkeypatch.setattr(gcal_sync, "sync_plan", _fake_sync)
+
+        # Three edits in the same "turn"
+        execute_tool(
+            "update_workout",
+            {"date": "2026-04-28", "workout": "Easy 5mi", "change_reason": "a"},
+            state,
+        )
+        execute_tool(
+            "update_workout",
+            {"date": "2026-04-28", "workout": "Easy 6mi", "change_reason": "b"},
+            state,
+        )
+        execute_tool(
+            "update_workout",
+            {"date": "2026-04-28", "workout": "Easy 7mi", "change_reason": "c"},
+            state,
+        )
+
+        # Single end-of-turn flush -> one sync scheduled
+        scheduled = state_tools.flush_pending_calendar_sync(state)
+        assert scheduled is True
+
+        # Wait for the daemon thread to run (short timeout — sync is mocked).
+        import threading
+        import time
+
+        deadline = time.time() + 2.0
+        while time.time() < deadline and not calls:
+            time.sleep(0.01)
+        # Make sure any spawned plan-sync thread finishes before next test.
+        for t in threading.enumerate():
+            if t.name == "pre-plan-sync":
+                t.join(timeout=2.0)
+
+        assert len(calls) == 1
+
+        # A second flush with no further edits should NOT schedule another sync.
+        scheduled_again = state_tools.flush_pending_calendar_sync(state)
+        assert scheduled_again is False
+        assert len(calls) == 1
+
+    def test_flush_with_no_edits_is_noop(self, state, monkeypatch):
+        """End-of-turn flush with no plan edits -> sync never called."""
+        self._pin_today(monkeypatch, "2026-04-28")
+        self._drain_dirty()
+
+        calls: list[dict] = []
+        from google_calendar import sync as gcal_sync
+        from tools import state as state_tools
+
+        def _fake_sync(state, dry_run=False):
+            calls.append({"dry_run": dry_run})
+            return {"inserted": 0, "patched": 0, "deleted": 0, "unchanged": 0, "errors": []}
+
+        monkeypatch.setattr(gcal_sync, "sync_plan", _fake_sync)
+
+        # Only a read tool — does not mutate the plan.
+        execute_tool("get_sessions", {"start_date": "2026-04-26", "end_date": "2026-04-27"}, state)
+
+        scheduled = state_tools.flush_pending_calendar_sync(state)
+        assert scheduled is False
+        assert calls == []
+
+    def test_sync_failure_does_not_break_tool_response(self, state, monkeypatch):
+        """If gcal sync raises, the tool result already returned to the agent
+        is unaffected (the sync runs after the tool returned, on a daemon
+        thread, and swallows exceptions)."""
+        self._pin_today(monkeypatch, "2026-04-28")
+        self._drain_dirty()
+
+        from google_calendar import sync as gcal_sync
+        from tools import state as state_tools
+
+        def _broken_sync(state, dry_run=False):
+            raise RuntimeError("gcal down")
+
+        monkeypatch.setattr(gcal_sync, "sync_plan", _broken_sync)
+
+        # The tool call still returns ok regardless of gcal's downstream state.
+        out = execute_tool(
+            "update_workout",
+            {"date": "2026-04-28", "workout": "Easy 5mi", "change_reason": "a"},
+            state,
+        )
+        assert out["ok"] is True
+        assert "error" not in out
+
+        # Flush schedules the thread; the thread will swallow the RuntimeError.
+        # If exceptions propagated, this call (or the thread join below) would
+        # raise. We don't observe the swallowed error here — only confirm that
+        # flushing + thread completion is clean.
+        scheduled = state_tools.flush_pending_calendar_sync(state)
+        assert scheduled is True
+
+        import threading
+
+        for t in threading.enumerate():
+            if t.name == "pre-plan-sync":
+                t.join(timeout=2.0)
+
+    def test_sync_runs_off_the_response_path(self, state, monkeypatch):
+        """The sync must execute in a daemon thread, not on the caller's thread,
+        so a slow gcal API cannot delay the agent's response. We verify by
+        capturing thread identity inside the patched sync function and
+        comparing to the test's main thread."""
+        self._pin_today(monkeypatch, "2026-04-28")
+        self._drain_dirty()
+
+        import threading
+        import time
+
+        captured: dict = {}
+        sync_started = threading.Event()
+        sync_can_finish = threading.Event()
+
+        from google_calendar import sync as gcal_sync
+        from tools import state as state_tools
+
+        def _slow_sync(state, dry_run=False):
+            captured["thread_name"] = threading.current_thread().name
+            captured["is_daemon"] = threading.current_thread().daemon
+            captured["thread_id"] = threading.get_ident()
+            sync_started.set()
+            # Block until the test releases us — proves flush() didn't wait.
+            sync_can_finish.wait(timeout=2.0)
+            return {"inserted": 0, "patched": 0, "deleted": 0, "unchanged": 0, "errors": []}
+
+        monkeypatch.setattr(gcal_sync, "sync_plan", _slow_sync)
+
+        execute_tool(
+            "update_workout",
+            {"date": "2026-04-28", "workout": "Easy 5mi", "change_reason": "a"},
+            state,
+        )
+
+        main_thread_id = threading.get_ident()
+        t0 = time.perf_counter()
+        scheduled = state_tools.flush_pending_calendar_sync(state)
+        flush_ms = (time.perf_counter() - t0) * 1000
+        assert scheduled is True
+
+        # flush returns immediately — well under a second even though the sync
+        # itself blocks on sync_can_finish.
+        assert flush_ms < 500, f"flush_pending_calendar_sync blocked for {flush_ms:.0f}ms"
+
+        # Sync started on a different thread.
+        assert sync_started.wait(timeout=2.0), "sync thread never started"
+        assert captured["thread_id"] != main_thread_id
+        assert captured["is_daemon"] is True
+        assert captured["thread_name"] == "pre-plan-sync"
+
+        sync_can_finish.set()
+        for t in threading.enumerate():
+            if t.name == "pre-plan-sync":
+                t.join(timeout=2.0)
