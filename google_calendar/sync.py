@@ -510,22 +510,28 @@ def mark_complete(state, log_date) -> dict:
             payload = _build_completed_payload(prescribed_id, plan_row, plan_detail, matching, log_date)
             outcome = _apply_completed_event(client, prescribed_id, payload)
             result["prescribed"] = outcome
-            sync_state[prescribed_id] = {
-                **(sync_state.get(prescribed_id) or {}),
-                "completed": True,
-                "last_completed_at": _now_iso(),
-            }
+            # Only stamp the completion sentinel when gcal actually accepted
+            # the write — see #31. Setting completed=True on an error poisoned
+            # sync state and made reconcile permanently skip the date even
+            # after the underlying gcal issue (e.g. expired token) was fixed.
+            if outcome.get("action") in {"inserted", "patched"}:
+                sync_state[prescribed_id] = {
+                    **(sync_state.get(prescribed_id) or {}),
+                    "completed": True,
+                    "last_completed_at": _now_iso(),
+                }
 
         if off_plan:
             payload = _build_completed_payload(offplan_id, None, None, off_plan, log_date)
             outcome = _apply_completed_event(client, offplan_id, payload)
             result["off_plan"] = outcome
-            sync_state[offplan_id] = {
-                **(sync_state.get(offplan_id) or {}),
-                "completed": True,
-                "off_plan": True,
-                "last_completed_at": _now_iso(),
-            }
+            if outcome.get("action") in {"inserted", "patched"}:
+                sync_state[offplan_id] = {
+                    **(sync_state.get(offplan_id) or {}),
+                    "completed": True,
+                    "off_plan": True,
+                    "last_completed_at": _now_iso(),
+                }
         else:
             # No off-plan entries this call. If a precomplete event lingers from a
             # previous call that mis-classified the same activity (Strava commonly
