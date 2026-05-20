@@ -10,8 +10,9 @@
 
 - **Auto-logs every run from Strava** — pulls splits, laps, HR, elevation the moment an activity uploads.
 - **Writes and adapts your training plan** — a Claude-powered coach drafts the week, adjusts when life intervenes.
-- **Reviews each workout** — a separate post-activity LLM pass critiques the session and can propose a plan change for you to approve on your next chat.
+- **Reviews each workout** — a separate post-activity LLM pass critiques the session and can propose a plan change for you to approve on your next chat. Reviews are persisted, not ephemeral.
 - **Pushes workouts to your Google Calendar** — your week shows up on your phone alongside everything else, with full coaching notes in the event description.
+- **Mirrors your training data into Notion** — sessions, journal entries, every plan change with before/after diffs, and every post-activity review land in four Notion databases under a single parent page. One-way, best-effort, fully optional.
 - **Talks to you over Telegram** — chat naturally, or use slash commands like `/today`, `/race`, `/log`.
 - **Remembers your context** — PRs, pace and HR zones, injury history, strength routine, and a journal of sleep / stress / travel.
 
@@ -28,6 +29,7 @@ graph LR
   Plan["📅 Your plan<br/>• This week's workouts<br/>• Pace targets<br/>• Coaching notes"]
   Journal["📝 Journal<br/>• Sleep / stress<br/>• Travel, illness<br/>• Decisions"]
   GCal["📆 Google Calendar"]
+  Notion["📓 Notion<br/>(4 mirror DBs)"]
   You --> Telegram
   Telegram <--> PRE
   You -->|"upload run"| Strava
@@ -37,58 +39,64 @@ graph LR
   PRE --- Plan
   PRE --- Journal
   PRE -->|"syncs weekly workouts"| GCal
+  PRE -->|"mirrors plan, sessions,<br/>changes, reviews"| Notion
 ```
 
-Everything PRE remembers lives in local files in `state/`. Strava feeds into PRE read-only; Google Calendar is written one-way out.
+Everything PRE remembers lives in a single SQLite DB (`state/coach.db`, mounted on a Railway volume in prod). Strava feeds into PRE read-only; Google Calendar and Notion are written one-way out.
 
 ## How it works
 
-Every turn the agent loads the full state (athlete profile, training plan, recent sessions, journal) into the system prompt and decides which tools to call:
+Every turn the agent loads the full state (athlete profile, plan prose + this week's prescribed table, recent sessions, journal) into the system prompt and decides which tools to call:
 
-- `get_today` / `get_todays_workout` / `get_week_plan` — read the prescribed plan
-- `log_session` — append a session to `log.jsonl`
-- `update_plan` — replace `plan.md` (preserving the locked weekly table format)
-- `update_athlete` — patch `athlete.yaml` (PRs, zones, resolved injuries)
+- `get_today` / `get_todays_workout` / `get_week_plan` / `get_week_status` — read the prescribed plan and weekly completion state
+- `log_session` — log a session; under the hood it reconciles against the plan (flips a matching planned row to `completed` or inserts an off-plan row)
+- `update_workout(date, …)` — **preferred** single-day prescription edit (patches one row)
+- `replace_week_table(rows, …)` — bulk replace for block / phase transitions
+- `update_plan(markdown, …)` — escape hatch for full-plan rewrites (parses the markdown into planned rows + plan prose)
+- `update_athlete` — patch the athlete YAML (PRs, zones, resolved injuries)
 - `append_journal` — add a timestamped life-context note
-- `get_sessions` — date-range query on `log.jsonl`
+- `get_sessions` — date-range query
 - `get_fitness_summary` — soft-touch trailing snapshot: weekly volume, pace-vs-zone decoration on quality sessions, HR context, English signals (no prescriptions)
-- `sync_plan_to_calendar` / `get_calendar_status` — push the locked weekly table from `plan.md` to a dedicated "PRE Training" Google Calendar (one-way, bot → gcal). Called once per turn after plan edits are final.
+- `sync_plan_to_calendar` / `get_calendar_status` — push the prescription rows to a dedicated "PRE Training" Google Calendar (one-way, bot → gcal). Called once per turn after plan edits are final.
 
-Strava activity uploads run on a separate path: the webhook fetches the activity, deterministically translates it into a `log.jsonl` entry, fires a Telegram ping, and asynchronously runs a post-activity LLM review that may stash a plan-change proposal in Redis for the next chat turn.
+Strava activity uploads run on a separate path: the webhook fetches the activity, deterministically translates it into a session row (reconciling it against the plan), fires a Telegram ping, and asynchronously runs a post-activity LLM review. The review is persisted to the `reviews` table and mirrored into Notion; any proposed plan change is also stashed in Redis for the next chat turn so the user can approve it.
 
-Short-term conversation history lives in Redis (~10 turns, 2-hour TTL). Long-term context lives in `state/` files.
+Short-term conversation history lives in Redis (~10 turns, 2-hour TTL). Long-term state lives in SQLite. The Notion mirror (when configured) reflects new writes into four Notion databases within a few seconds via daemon threads — see [Notion mirror](#notion-mirror) below.
 
 ## Tech stack
 
 - **LLM**: Claude Sonnet 4.6 (default) via Heroku Inference, OpenAI-compatible client. Prompt-caching attempted via `cache_control` (falls back to plain string if the proxy rejects it).
-- **State**: local files — `athlete.yaml` (round-trip via `ruamel.yaml`), `plan.md`, `log.jsonl`, `journal.md`
+- **State**: single SQLite DB (`state/coach.db`) at schema v5. `athlete` round-trips via `ruamel.yaml`; plan lives as rows in `sessions` + prose in `plan_meta`.
 - **Session store**: Redis (single-user, single key, 2h TTL)
 - **Pending proposals**: Redis (`pending_plan_proposal`, 24h TTL) — surfaces in the next system prompt
 - **Interfaces**: Telegram webhook (`app.py` + `bot.py`), CLI (`main.py`), test harness (`scripts/test_agent.py`)
-- **External integrations**: Strava (webhook + REST), Google Calendar (REST, write-only)
-- **Deployment**: Railway via gunicorn (`Procfile`)
+- **External integrations**: Strava (webhook + REST), Google Calendar (REST, write-only), Notion (REST, write-only mirror to four databases — optional)
+- **Deployment**: Railway via gunicorn (`Procfile`). DB schema migrations run from `gunicorn.conf.py:on_starting` before workers serve traffic.
 
 ## State
 
-All bot/agent state lives in a single SQLite database (`state/coach.db` locally, mounted on a Railway persistent volume in prod). Tables map 1:1 to the legacy file layout:
+All bot/agent state lives in a single SQLite database (`state/coach.db` locally, mounted on a Railway persistent volume in prod). Current schema: **v5**.
 
-| Table | Replaces | Contents |
-|-------|----------|----------|
-| `athlete` | `athlete.yaml` | identity, target races, PRs, pace + HR zones, preferences, injury history. YAML text preserved verbatim for round-trip via ruamel. |
-| `plan` | `plan.md` | current training block; locked `\| Day \| Date \| Workout \| Pace target \| Notes \|` weekly table (parsed by `/today` and the calendar sync) |
-| `plan_changelog` | `plan_changelog.md` | append-only log of plan edits + reasons |
-| `sessions` | `log.jsonl` | one row per session; `data` JSON column preserves the full entry shape. Partial UNIQUE index on `details.strava_id` enforces webhook idempotency. |
-| `journal` | `journal.md` | freeform timestamped notes |
-| `gcal_sync_state` | `.gcal_sync_state.json` | per-event sync metadata for the calendar integration |
+| Table | Contents |
+|-------|----------|
+| `sessions` | **Unified plan-as-rows.** One row per workout in a lifecycle state — `planned` / `completed` / `missed` / `off-plan`. `prescribed_workout` / `prescribed_pace` / `prescribed_notes` / `detail_md` carry what the plan asked for; `data` JSON carries the actuals once logged. Partial UNIQUE index on `details.strava_id` enforces webhook idempotency. |
+| `plan_meta` | Plan prose that doesn't belong in the weekly checklist — phases, goals, pace zones, adjustment triggers. |
+| `plan_changelog` | Append-only changelog of every plan write (note + timestamp). |
+| `athlete` | YAML text in `yaml_text` — identity, target races, PRs, pace + HR zones, preferences, injury history. Round-trip via ruamel. |
+| `journal` | Freeform timestamped entries. |
+| `reviews` | One row per post-activity LLM review — critique, optional `proposed_change` JSON, `status` (NULL = Pending). FK to `sessions(id)`. |
+| `gcal_sync_state` | Per-event sync metadata for the Google Calendar integration. |
 
-Schema: [`state/schema.sql`](state/schema.sql). Full reference: [docs/state-schema.md](docs/state-schema.md).
+Schema source of truth: [`state/schema.sql`](state/schema.sql). Full reference: [docs/state-schema.md](docs/state-schema.md). The Phase 1A cutover (v3 → v4) runs once on deploy from `gunicorn.conf.py:on_starting` via `scripts/cutover_to_unified_sessions.py`; later migrations (e.g. v4 → v5) are purely additive `CREATE TABLE IF NOT EXISTS` and land the next time `_ensure_schema` runs.
 
 ### Inspecting state
 
 ```bash
 # Local
-sqlite3 state/coach.db 'SELECT date, type, miles FROM sessions ORDER BY date DESC LIMIT 20'
-python scripts/state_dump.py log --since 2026-05-01
+sqlite3 state/coach.db 'SELECT date, status, type, prescribed_workout FROM sessions ORDER BY date DESC LIMIT 20'
+sqlite3 state/coach.db 'SELECT id, date, status FROM reviews ORDER BY id DESC LIMIT 10'
+python scripts/state_dump.py log --since 2026-05-01     # completed-session actuals
+python scripts/state_dump.py plan_meta                  # plan prose
 python scripts/state_dump.py --all
 
 # Prod (Railway): one-shot query
@@ -169,6 +177,15 @@ Singleton blobs (plan, athlete, journal) are upserted on every run so re-running
 | `GCAL_CLIENT_ID` / `GCAL_CLIENT_SECRET` | OAuth credentials (Desktop app type) |
 | `CALENDAR_ID` | ID of your dedicated "PRE Training" calendar |
 | `GCAL_TOKENS_BACKEND` | `file` (default) or `redis` |
+
+**Notion mirror (optional)**
+
+| Var | Purpose |
+|-----|---------|
+| `NOTION_TOKEN` | Integration token from <https://app.notion.com/developers> (Read/Insert/Update content capabilities). Unset → mirror short-circuits silently. |
+| `NOTION_PARENT_PAGE_ID` | Page id (32-char hex) of the parent page that holds the four mirror databases. Connect your integration to it. |
+| `NOTION_API_VERSION` | Pinned to `2026-03-11` by default. |
+| `NOTION_SESSIONS_DS_ID` / `NOTION_JOURNAL_DS_ID` / `NOTION_PLAN_CHANGES_DS_ID` / `NOTION_REVIEWS_DS_ID` | Data-source ids printed by `scripts/notion_bootstrap.py`. Each gates its DB independently — a partially-configured workspace mirrors just what's wired. |
 
 ## Usage
 
@@ -269,6 +286,50 @@ To back out the integration entirely:
 ./venv/bin/python scripts/google_calendar_setup.py purge --yes
 ```
 
+## Notion mirror
+
+PRE mirrors its state into four Notion databases so you can see your training in the same workspace you already use for everything else. SQLite stays the **source of truth**; the mirror is one-way, best-effort, and fully optional — without `NOTION_TOKEN`, the bot behaves exactly as before.
+
+**The four databases (all under a single parent page):**
+
+| DB | Source | Page body |
+|---|---|---|
+| **PRE Sessions** | every `sessions` row, `sid:{id}` | coaching detail + notes / laps / splits |
+| **PRE Journal** | every journal entry, `jid:{title}` | the entry text |
+| **PRE Plan Changes** | every changelog entry, `cid:{timestamp}` | `## Before` / `## After` fenced markdown of the affected row(s) — flips to `## Prescribed` / `## Actuals` when the change is a Strava completion |
+| **PRE Reviews** | every post-activity review, `rid:{id}` | `## Critique` + `## Proposed change` (summary as quote, proposed new plan fenced as markdown, italic reason). `Session` property relates back to the matching Sessions page. |
+
+**How it works.** Every SQLite write (session reconcile, plan edit, journal append, post-activity review) ends with a daemon-thread fire-and-forget call into `notion/mirror.py`. The mirror queries the target Notion database by a hidden `source_key` property — hit → patch, miss → insert — so re-running the seed or remirroring the same row never duplicates. A module-level lock serializes the query-then-insert path so two threads can't race into a duplicate page. Failures (auth, rate-limit, network) log a warning and are dropped; nothing on the user-facing path waits for Notion.
+
+**One-time setup:**
+
+1. Create an internal integration at <https://app.notion.com/developers>. Enable **Read content**, **Insert content**, **Update content**. Copy the secret into `.env` as `NOTION_TOKEN`.
+2. Create a Notion page to be the parent (e.g. `PRE Training`). On that page: `••• → Connections → connect` your integration. Copy the 32-char page id from the URL into `.env` as `NOTION_PARENT_PAGE_ID`.
+3. Bootstrap the four databases (idempotent — safe to re-run):
+
+```bash
+./venv/bin/python scripts/notion_bootstrap.py
+```
+
+   Paste the printed `NOTION_*_DB_ID` / `NOTION_*_DS_ID` lines into `.env`.
+
+4. Backfill from SQLite (idempotent via `source_key`):
+
+```bash
+./venv/bin/python scripts/notion_seed.py
+```
+
+From that point on, every live write reflects into Notion within ~5 seconds. `/health` includes a Notion probe (`users.me`) when `NOTION_TOKEN` is set.
+
+**Verifying the mirror is working.** Edit a plan day via Telegram (`"swap Tuesday to easy 5"`), then look in the **PRE Plan Changes** database — a new row should appear within a few seconds with the diff in the page body. Or query directly:
+
+```bash
+sqlite3 state/coach.db "SELECT content FROM plan_changelog WHERE id=1" | tail -3
+# ...then look up the matching `cid:<timestamp>` page in Notion
+```
+
+**Reversing it.** The mirror is one-way. Editing or trashing a Notion page changes nothing in SQLite. `scripts/notion_seed.py` reconstructs the Notion side from SQLite at any time.
+
 ## Coach personality
 
 > PRE is an elite endurance coach: clinical, demanding, uncompromising. Brutal truth over comfort. Thinks macrocycle → mesocycle → microcycle → today. Obsessive about biometrics (HRV, HR, RPE, sleep) — uses them to catch trouble early. Shuts down training when fatigue, pain, or form warrant it.
@@ -310,31 +371,55 @@ python scripts/migrate_state_to_sqlite.py /app/state --db /app/data/coach.db --r
 ## Project structure
 
 ```
-├── app.py                        Flask webhook (Telegram + Strava)
-├── bot.py                        Telegram handlers
-├── main.py                       CLI chat
-├── companion.py                  Agent loop: build_system_prompt, agent_turn, chat
-├── state_manager.py              State file I/O (read/write/atomic/round-trip YAML)
-├── temporal_context.py           Timezone-aware now/today + race resolution
-├── conversation_store.py         Redis short-term history
-├── pending_proposal_store.py     Redis stash for post-activity plan proposals
-├── config.py                     LLM client, env validation, PRE_PERSONALITY
-├── health.py                     Health checks + slash command list
-├── tools/                        Tool schemas + handlers
-│   ├── state.py                  log_session, update_plan, append_journal,
-│   │                             update_athlete, get_sessions
-│   ├── plan.py                   get_today, get_todays_workout, get_week_plan
-│   ├── fitness.py                get_fitness_summary (soft-touch signals)
-│   └── calendar.py               sync_plan_to_calendar, get_calendar_status
-├── strava/                       OAuth, REST client, webhook handler,
-│                                 translator (activity → log entry),
-│                                 post-activity LLM review, Telegram notify
-├── google_calendar/              OAuth, REST client, plan → events sync
+├── app.py                              Flask webhook (Telegram + Strava)
+├── bot.py                              Telegram handlers
+├── main.py                             CLI chat
+├── companion.py                        Agent loop: build_system_prompt, agent_turn, chat
+├── state_manager.py                    SQLite state I/O; mirror hooks fire after commit
+├── plan_markdown.py                    Plan-blob parsers + week-table renderer
+├── temporal_context.py                 Timezone-aware now/today + race resolution
+├── conversation_store.py               Redis short-term history
+├── pending_proposal_store.py           Redis stash for post-activity plan proposals
+├── config.py                           LLM client, env validation, PRE_PERSONALITY
+├── health.py                           Health checks + slash command list
+├── gunicorn.conf.py                    on_starting hook: runs the cutover before workers serve
+├── tools/                              Tool schemas + handlers
+│   ├── state.py                        log_session, update_workout, replace_week_table,
+│   │                                   update_plan, append_journal, update_athlete, get_sessions
+│   ├── plan.py                         get_today, get_todays_workout, get_week_plan, get_week_status
+│   ├── fitness.py                      get_fitness_summary (soft-touch signals)
+│   └── calendar.py                     sync_plan_to_calendar, get_calendar_status
+├── notion/                             Notion mirror (Phase 1B)
+│   ├── client.py                       Thin requests wrapper pinned to Notion-Version 2026-03-11
+│   ├── schema.py                       Four DB property schemas + source_key helpers
+│   ├── markdown.py                     render_session_body / render_change_body / render_review_body
+│   ├── entries.py                      Parsers for journal + plan_changelog singletons
+│   └── mirror.py                       Upserts + fire-and-forget daemon threads
+├── strava/                             OAuth, REST client, webhook handler,
+│                                       translator (activity → session row),
+│                                       post-activity LLM review (persists to `reviews`)
+├── google_calendar/                    OAuth, REST client, plan rows → events sync
 ├── scripts/
-│   ├── test_agent.py             CLI harness, no Redis required
-│   ├── strava_setup.py           OAuth + webhook subscription mgmt
-│   ├── strava_backfill.py        Import historical activities
-│   └── google_calendar_setup.py  OAuth + sync/purge ops
-├── docs/                         Schema reference, audit notes
-└── tests/                        pytest
+│   ├── test_agent.py                   CLI harness, no Redis required
+│   ├── strava_setup.py                 OAuth + webhook subscription mgmt
+│   ├── strava_backfill.py              Import historical activities
+│   ├── google_calendar_setup.py        OAuth + sync/purge ops
+│   ├── cutover_to_unified_sessions.py  Phase 1A.2 schema cutover (idempotent)
+│   ├── notion_bootstrap.py             Find-or-create the four mirror DBs
+│   └── notion_seed.py                  Backfill SQLite → Notion (idempotent)
+├── docs/                               Schema reference, audit notes
+└── tests/                              pytest (~440)
 ```
+
+## What's next
+
+Phase 1 (the SQLite cutover + the four-database one-way Notion mirror) is complete. Three contained follow-ups are filed as issues for next-day work: [#26](https://github.com/elimchayseng/pre-running-coach-bot/issues/26) (auto-sync plan edits to Google Calendar), [#33](https://github.com/elimchayseng/pre-running-coach-bot/issues/33) (auto-resolve reviews when a proposal is applied), and [#34](https://github.com/elimchayseng/pre-running-coach-bot/issues/34) (custom Notion views — calendar, board, smart filters).
+
+The longer-arc direction for the Notion integration:
+
+- **Phase 2 — bidirectional sync.** Lift `notion/mirror.py` into a Notion Worker (the 3.5 platform's hosted runtime), subscribe to Webhook Triggers so a row edit in Notion writes back into SQLite. Optionally swap our planned-sessions push for Notion's Database Sync pulling from `/notion/sessions`. The mirror becomes a real two-way bridge instead of a read-only reflection.
+- **Phase 3 — race-day briefing pages.** LLM-authored markdown via the Markdown API; GPX / route maps as page attachments via the File Upload API. The runner opens the race's Notion page on race morning and has the full pacing plan, course preview, and execution cues in one place.
+- **Phase 4 — coaching log + External Agents.** Register PRE via Notion's External Agents API so the runner can `@PRE` from any Notion page to ask about training. State-changing turns get logged into a fifth database so the coaching record is reviewable like any other source of truth.
+- **Beyond:** multi-athlete / workspace-scoped OAuth, semantic plan-change diffs (not just before/after row snippets), week-over-week training-load comparisons rendered into Notion as charts.
+
+The architectural choice that makes all of this cheap: SQLite is the source of truth, and every external system (GCal, Notion) is a derived view written one-way. Adding a new sink is a new module under `notion/` (or `gcal/`) with its own `_with_retry`, `enabled()`, and daemon-thread fire-and-forget — no changes to `state_manager.py` beyond a new hook line.
