@@ -203,7 +203,8 @@ class StateManager:
                 "ON CONFLICT(id) DO UPDATE SET content = excluded.content, updated_at = excluded.updated_at",
                 (content,),
             )
-            self._append_changelog(conn, change_note)
+            change_entry = self._append_changelog(conn, change_note)
+        self._notify_mirror_change(change_entry)
 
     def update_plan(self, new_plan_md: str, change_note: str) -> None:
         """Escape hatch: replace the whole plan from a full markdown document.
@@ -239,8 +240,9 @@ class StateManager:
                 "ON CONFLICT(id) DO UPDATE SET content = excluded.content, updated_at = excluded.updated_at",
                 (meta,),
             )
-            self._append_changelog(conn, change_note)
+            change_entry = self._append_changelog(conn, change_note)
         self._notify_mirror(self._rows("status = 'planned'", ()))
+        self._notify_mirror_change(change_entry)
 
     def update_workout(
         self,
@@ -307,8 +309,9 @@ class StateManager:
                 params.append(row["id"])
                 conn.execute(f"UPDATE sessions SET {', '.join(sets)} WHERE id = ?", params)
                 affected_id = row["id"]
-            self._append_changelog(conn, change_note)
+            change_entry = self._append_changelog(conn, change_note)
         self._notify_mirror(self._rows("id = ?", (affected_id,)))
+        self._notify_mirror_change(change_entry)
 
     def replace_week_table(self, rows: list[dict], change_note: str) -> None:
         """Replace a week's planned rows.
@@ -350,18 +353,26 @@ class StateManager:
                         r["notes"],
                     ),
                 )
-            self._append_changelog(conn, change_note)
+            change_entry = self._append_changelog(conn, change_note)
         self._notify_mirror(self._rows("status = 'planned' AND date BETWEEN ? AND ?", (dates[0], dates[-1])))
+        self._notify_mirror_change(change_entry)
 
-    def _append_changelog(self, conn: sqlite3.Connection, note: str) -> None:
+    def _append_changelog(self, conn: sqlite3.Connection, note: str) -> dict:
+        """Append a timestamped note to the changelog blob.
+
+        Returns ``{"timestamp", "note", "action"}`` so the caller can mirror
+        the new entry to Notion after the transaction commits.
+        """
         ts = datetime.now().isoformat(timespec="seconds")
-        entry = f"- {ts}: {note}\n"
+        line = f"- {ts}: {note}\n"
         conn.execute(
             "INSERT INTO plan_changelog (id, content, updated_at) VALUES (1, ?, datetime('now')) "
             "ON CONFLICT(id) DO UPDATE SET "
             "content = plan_changelog.content || excluded.content, updated_at = excluded.updated_at",
-            (entry,),
+            (line,),
         )
+        action = "completed" if " completed:" in note or note.startswith("completed:") else "planned-edit"
+        return {"timestamp": ts, "note": note, "action": action}
 
     # ---------- Plan-row reads ----------
 
@@ -491,6 +502,7 @@ class StateManager:
         sdate = str(session["date"])[:10]
         stype = session.get("type") or ""
         payload = json.dumps(session, ensure_ascii=False)
+        change_entry: Optional[dict] = None
         with self._conn() as conn:
             planned = conn.execute(
                 "SELECT id, type FROM sessions WHERE date = ? AND status = 'planned' ORDER BY slot, id",
@@ -503,7 +515,7 @@ class StateManager:
                     "completed_at = datetime('now'), updated_at = datetime('now') WHERE id = ?",
                     (payload, stype or None, match["id"]),
                 )
-                self._append_changelog(conn, f"{sdate} completed: {stype or 'session'}")
+                change_entry = self._append_changelog(conn, f"{sdate} completed: {stype or 'session'}")
                 result = {"matched": True, "status": "completed", "row_id": match["id"]}
             else:
                 cur = conn.execute(
@@ -513,6 +525,7 @@ class StateManager:
                 )
                 result = {"matched": False, "status": "off-plan", "row_id": cur.lastrowid}
         self._notify_mirror(self._rows("id = ?", (result["row_id"],)))
+        self._notify_mirror_change(change_entry)  # None when the activity went off-plan
         return result
 
     def update_session_by_strava_id(self, activity_id: int, new_entry: dict) -> bool:
@@ -550,6 +563,28 @@ class StateManager:
         except Exception:  # noqa: BLE001 — mirror failures never propagate
             pass
 
+    def _notify_mirror_change(self, entry: Optional[dict]) -> None:
+        """Best-effort mirror of one changelog entry to Notion Plan Changes."""
+        if not entry:
+            return
+        try:
+            from notion.mirror import mirror_plan_change
+
+            mirror_plan_change(entry)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _notify_mirror_journal(self, entry: Optional[dict]) -> None:
+        """Best-effort mirror of one journal entry to Notion Journal."""
+        if not entry:
+            return
+        try:
+            from notion.mirror import mirror_journal_entry
+
+            mirror_journal_entry(entry)
+        except Exception:  # noqa: BLE001
+            pass
+
     # ---------- Journal ----------
 
     def load_journal(self, max_entries: Optional[int] = None) -> str:
@@ -567,9 +602,15 @@ class StateManager:
         return "\n---\n".join([head, *kept])
 
     def append_journal(self, entry: str, when: Optional[datetime] = None) -> None:
-        """Append a timestamped entry to the journal."""
-        ts = (when or datetime.now()).strftime("%Y-%m-%d %H:%M")
-        block = f"\n---\n\n## {ts}\n\n{entry.rstrip()}\n"
+        """Append a timestamped entry to the journal.
+
+        Second precision (not just minutes): the entry timestamp is the
+        Notion mirror's source_key for the row, and multiple entries in the
+        same minute would otherwise collapse into one mirrored page.
+        """
+        ts = (when or datetime.now()).strftime("%Y-%m-%d %H:%M:%S")
+        body = entry.rstrip()
+        block = f"\n---\n\n## {ts}\n\n{body}\n"
         with self._conn() as conn:
             row = conn.execute("SELECT content FROM journal WHERE id = 1").fetchone()
             if row is None or not row["content"]:
@@ -584,6 +625,7 @@ class StateManager:
                     "UPDATE journal SET content = content || ?, updated_at = datetime('now') WHERE id = 1",
                     (block,),
                 )
+        self._notify_mirror_journal({"title": ts, "date": ts[:10], "body": body})
 
     # ---------- Gcal sync state ----------
 
