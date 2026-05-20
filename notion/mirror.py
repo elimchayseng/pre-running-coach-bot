@@ -184,16 +184,25 @@ def _upsert_journal_entry(entry: dict, client: NotionClient) -> None:
 
 def _upsert_plan_change(entry: dict, client: NotionClient) -> None:
     """Insert or update the PRE Plan Changes page for one changelog entry.
-    No body in 1B.3 (before/after fenced diffs need write-time row tracking)."""
+
+    Writes the before/after fenced markdown into the page body when the entry
+    carries one (live writers do; the seed parses the changelog blob and has
+    no body data, so historical pages stay bodyless).
+    """
     data_source_id = os.environ["NOTION_PLAN_CHANGES_DS_ID"]
     source_key = plan_change_source_key(entry)
     props = _plan_change_properties(entry, source_key)
+    body = (entry.get("body") or "").strip()
     with _upsert_lock:
         page_id = _query_page_id(client, data_source_id, source_key)
         if page_id:
             client.update_page(page_id, properties=props)
+            # Only patch the body when we have one — don't blow away a body
+            # written by a live writer just because a later re-seed has none.
+            if body:
+                client.replace_page_markdown(page_id, body)
         else:
-            client.create_page(data_source_id, props)
+            client.create_page(data_source_id, props, markdown=body or None)
 
 
 def _upsert_session(row: dict, client: NotionClient) -> None:

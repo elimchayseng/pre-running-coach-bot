@@ -51,6 +51,31 @@ def _render_splits(splits: Any) -> Optional[str]:
     return "## Splits\n\n" + "\n".join(lines)
 
 
+def render_change_body(
+    before: Optional[str],
+    after: Optional[str],
+    *,
+    before_heading: str = "Before",
+    after_heading: str = "After",
+) -> Optional[str]:
+    """Render a before/after diff as the Markdown body of a Plan Changes page.
+
+    Each side becomes a ``## heading`` followed by a fenced block so wide
+    rows / multi-line plan_meta survive Notion's renderer intact. Returns
+    ``None`` when both sides are empty so the caller can skip the body
+    patch entirely.
+    """
+    # `plain text` fence tag prevents Notion from guessing the language
+    # ("javascript" by default on bare ``` blocks, which colours the rows
+    # in unhelpful syntax tones).
+    parts: list[str] = []
+    if before is not None and str(before).strip():
+        parts.append(f"## {before_heading}\n\n```plain text\n{str(before).strip()}\n```")
+    if after is not None and str(after).strip():
+        parts.append(f"## {after_heading}\n\n```plain text\n{str(after).strip()}\n```")
+    return "\n\n".join(parts) if parts else None
+
+
 def render_session_body(row: dict) -> Optional[str]:
     """Return the Markdown body for a Sessions page, or None when empty.
 

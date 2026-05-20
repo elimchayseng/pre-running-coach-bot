@@ -501,3 +501,98 @@ class TestLoadFullContext:
         assert "```yaml" in blob
         # The athlete YAML text is included verbatim
         assert "target_races:" in blob
+
+
+# ---------------- change-body formatters ----------------
+
+
+class TestChangeFormatters:
+    def test_format_session_row_short_includes_all_present_fields(self):
+        from state_manager import _format_session_row_short
+
+        row = {
+            "date": "2026-05-19",
+            "status": "planned",
+            "type": "easy",
+            "prescribed_workout": "Easy 5mi",
+            "prescribed_pace": "8:30",
+            "prescribed_notes": "ankle prep",
+        }
+        line = _format_session_row_short(row)
+        assert "2026-05-19" in line and "[planned/easy]" in line and "Easy 5mi" in line
+        assert "pace=8:30" in line and "notes=ankle prep" in line
+
+    def test_format_session_row_short_handles_none(self):
+        from state_manager import _format_session_row_short
+
+        assert _format_session_row_short(None) == "(none)"
+
+    def test_format_actuals_parses_json_string(self):
+        from state_manager import _format_actuals
+
+        out = _format_actuals(json.dumps({"miles": 5.1, "details": {"strava_id": 42}}))
+        assert "miles: 5.1" in out and "strava_id: 42" in out
+
+    def test_format_actuals_empty(self):
+        from state_manager import _format_actuals
+
+        assert _format_actuals(None) == "(no actuals)"
+
+
+# ---------------- change-body plumbing (writers attach a body) ----------------
+
+
+def _capture_changes(state, monkeypatch):
+    """Replace _notify_mirror_change with a list-capturer. Returns the list."""
+    captured: list = []
+    monkeypatch.setattr(state, "_notify_mirror_change", lambda entry: captured.append(entry))
+    return captured
+
+
+class TestWriterChangeBody:
+    def test_update_workout_records_before_and_after(self, state, monkeypatch):
+        state.update_plan(PLAN_WITH_DETAIL, "seed")
+        captured = _capture_changes(state, monkeypatch)
+        state.update_workout(
+            target_date=date(2026, 4, 28),
+            change_note="bump strides",
+            workout="Easy 4mi + 6 strides",
+        )
+        [entry] = captured
+        body = entry["body"]
+        assert "## Before" in body and "## After" in body
+        assert "Easy 4mi + 4 strides" in body  # before
+        assert "Easy 4mi + 6 strides" in body  # after
+
+    def test_replace_week_table_records_before_and_after(self, state, monkeypatch):
+        state.update_plan(PLAN_WITH_DETAIL, "seed")
+        captured = _capture_changes(state, monkeypatch)
+        state.replace_week_table(
+            [
+                {"day": "Mon", "date": "2026-04-27", "workout": "Rest", "pace_target": "—", "notes": ""},
+                {"day": "Tue", "date": "2026-04-28", "workout": "Easy 5mi", "pace_target": "8:45", "notes": ""},
+            ],
+            "rewrite",
+        )
+        body = captured[-1]["body"]
+        assert "Off / strength upper" in body  # was on 2026-04-27
+        assert "Easy 5mi" in body  # new 2026-04-28
+
+    def test_update_plan_meta_diffs_prose(self, state, monkeypatch):
+        state.update_plan_meta("# v1\n", "seed")
+        captured = _capture_changes(state, monkeypatch)
+        state.update_plan_meta("# v2\n", "rewrite goals")
+        body = captured[-1]["body"]
+        assert "Before (plan_meta)" in body and "After (plan_meta)" in body
+        assert "# v1" in body and "# v2" in body
+
+    def test_reconcile_completed_uses_prescribed_vs_actuals(self, state, monkeypatch):
+        state.update_plan(PLAN_WITH_DETAIL, "seed")  # plants a planned row for 2026-04-28
+        captured = _capture_changes(state, monkeypatch)
+        state.reconcile_strava_activity(
+            {"date": "2026-04-28", "type": "easy", "miles": 4.1, "details": {"strava_id": 99}}
+        )
+        body = captured[-1]["body"]
+        assert "## Prescribed" in body and "## Actuals" in body
+        assert "Easy 4mi" in body  # prescribed
+        assert "miles: 4.1" in body and "strava_id: 99" in body  # actuals
