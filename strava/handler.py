@@ -149,7 +149,7 @@ def _handle_create(state: StateManager, activity_id: int) -> None:
     # the deterministic templated ping. If the review fails for any reason,
     # fall back to the templated ping so the user always hears something.
     if review.is_run_type(entry):
-        message = review.run_post_activity_review(entry, state)
+        message = review.run_post_activity_review(entry, state, session_id=outcome.get("row_id"))
         if message:
             notify.send_telegram_text(message)
             return

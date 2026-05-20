@@ -78,6 +78,19 @@ def _seed_plan_changes(sm: StateManager, client: NotionClient) -> dict:
     return summary
 
 
+def _seed_reviews(sm: StateManager, client: NotionClient) -> dict:
+    rows = sm.get_all_reviews()
+    summary = {"total": len(rows), "ok": 0, "failed": 0}
+    for row in rows:
+        try:
+            mirror._upsert_review(row, client)
+            summary["ok"] += 1
+        except Exception as ex:  # noqa: BLE001
+            summary["failed"] += 1
+            print(f"  FAIL review id={row.get('id')}: {ex}", file=sys.stderr)
+    return summary
+
+
 def seed(db_path: Path) -> dict:
     sm = StateManager()
     sm.db_path = db_path
@@ -95,15 +108,19 @@ def seed(db_path: Path) -> dict:
     if mirror.plan_changes_enabled():
         print("seeding PRE Plan Changes ...")
         out["plan_changes"] = _seed_plan_changes(sm, client)
+    if mirror.reviews_enabled():
+        print("seeding PRE Reviews ...")
+        out["reviews"] = _seed_reviews(sm, client)
     return out
 
 
 def main() -> int:
     load_dotenv()
-    if not (mirror.enabled() or mirror.journal_enabled() or mirror.plan_changes_enabled()):
+    if not (mirror.enabled() or mirror.journal_enabled() or mirror.plan_changes_enabled() or mirror.reviews_enabled()):
         print(
             "error: at least one of NOTION_SESSIONS_DS_ID / NOTION_JOURNAL_DS_ID / "
-            "NOTION_PLAN_CHANGES_DS_ID must be set in .env (with NOTION_TOKEN)",
+            "NOTION_PLAN_CHANGES_DS_ID / NOTION_REVIEWS_DS_ID must be set in .env "
+            "(with NOTION_TOKEN)",
             file=sys.stderr,
         )
         return 1

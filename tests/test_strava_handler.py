@@ -139,7 +139,7 @@ class TestHandleEvent:
         monkeypatch.setattr(handler.notify, "send_activity_ping", ping_mock)
         # Force review to return None so we fall back to the templated ping
         # (covers the path this test was originally written for).
-        monkeypatch.setattr(handler.review, "run_post_activity_review", lambda e, s: None)
+        monkeypatch.setattr(handler.review, "run_post_activity_review", lambda e, s, session_id=None: None)
 
         handler.handle_event({"aspect_type": "create", "object_type": "activity", "object_id": 12345678902})
 
@@ -171,7 +171,7 @@ class TestHandleEvent:
         """When review returns None, the templated ping still fires so the
         user is never left without a confirmation message."""
         monkeypatch.setattr(handler.client, "get_activity", lambda aid: _easy_run_activity())
-        monkeypatch.setattr(handler.review, "run_post_activity_review", lambda e, s: None)
+        monkeypatch.setattr(handler.review, "run_post_activity_review", lambda e, s, session_id=None: None)
         text_mock = MagicMock(return_value=True)
         ping_mock = MagicMock(return_value=True)
         monkeypatch.setattr(handler.notify, "send_telegram_text", text_mock)

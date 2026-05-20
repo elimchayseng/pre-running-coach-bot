@@ -242,13 +242,17 @@ def _format_user_message(parsed: dict, entry: dict) -> str:
     return text
 
 
-def run_post_activity_review(entry: dict, state: StateManager) -> Optional[str]:
+def run_post_activity_review(entry: dict, state: StateManager, session_id: Optional[int] = None) -> Optional[str]:
     """Generate post-activity review text. Returns None on any failure so the
     caller can fall back to the deterministic templated ping.
 
-    Side effects: if the model proposes a plan_change, the proposal is
-    written to pending_proposal_store (Redis, 24h TTL) for the next chat
-    turn to surface and apply on user confirmation.
+    Side effects:
+      - The review (critique + optional proposed plan_change) is persisted
+        to the ``reviews`` SQLite table and mirrored to Notion via
+        ``state.save_review``. The Notion page starts at Status=Pending.
+      - If the model proposed a plan_change, the proposal is also written
+        to pending_proposal_store (Redis, 24h TTL) so the next chat turn
+        can surface and apply it on user confirmation.
     """
     if llm_client is None:
         logger.warning("llm_client not initialized; skipping review")
@@ -277,6 +281,20 @@ def run_post_activity_review(entry: dict, state: StateManager) -> Optional[str]:
                 # be applyable, so strip it from the user message.
                 logger.error(f"Failed to stash pending proposal: {e}")
                 parsed["plan_change"] = None
+        try:
+            review_date = _safe_parse_date(entry.get("date")) or today_local()
+            strava_id = (entry.get("details") or {}).get("strava_id")
+            state.save_review(
+                session_id=session_id,
+                strava_id=strava_id,
+                review_date=review_date,
+                critique=parsed["feedback"],
+                proposed_change=parsed.get("plan_change"),
+            )
+        except Exception as e:
+            # Persisting the review is best-effort — never break the user
+            # ping over a SQLite or Notion hiccup.
+            logger.error(f"Failed to persist post-activity review: {e}")
         return _format_user_message(parsed, entry)
     except Exception as e:
         logger.error(f"Post-activity review failed: {e}", exc_info=True)

@@ -503,6 +503,44 @@ class TestLoadFullContext:
         assert "target_races:" in blob
 
 
+# ---------------- reviews ----------------
+
+
+class TestReviews:
+    def test_save_review_inserts_pending_row(self, state, monkeypatch):
+        # Disconnect the mirror so save_review stays purely SQLite for this test.
+        monkeypatch.setattr(state, "_notify_mirror_review", lambda entry: None)
+        # Seed a session so the reviews.session_id foreign key is satisfied.
+        outcome = state.append_session({"date": "2026-05-20", "type": "easy", "miles": 5})
+        row = state.save_review(
+            session_id=outcome["row_id"],
+            strava_id=123,
+            review_date=date(2026, 5, 20),
+            critique="Felt smooth.",
+            proposed_change={"summary": "Bump tempo", "new_plan_md": "# v2", "reason": "fitness up"},
+        )
+        assert row["session_id"] == outcome["row_id"]
+        assert row["strava_id"] == 123
+        assert row["date"] == "2026-05-20"
+        assert row["status"] is None  # Pending
+        # proposed_change round-trips back to a dict (JSON parsed on the way out)
+        assert row["proposed_change"]["summary"] == "Bump tempo"
+
+    def test_get_reviews_in_range(self, state, monkeypatch):
+        monkeypatch.setattr(state, "_notify_mirror_review", lambda entry: None)
+        state.save_review(None, None, date(2026, 5, 1), "a", None)
+        state.save_review(None, None, date(2026, 5, 15), "b", None)
+        state.save_review(None, None, date(2026, 6, 1), "c", None)
+        got = state.get_reviews_in_range(date(2026, 5, 1), date(2026, 5, 31))
+        assert [r["critique"] for r in got] == ["a", "b"]
+
+    def test_save_review_fires_mirror(self, state, monkeypatch):
+        captured: list = []
+        monkeypatch.setattr(state, "_notify_mirror_review", lambda entry: captured.append(entry))
+        state.save_review(None, None, date(2026, 5, 20), "feedback", None)
+        assert len(captured) == 1 and captured[0]["critique"] == "feedback"
+
+
 # ---------------- change-body formatters ----------------
 
 

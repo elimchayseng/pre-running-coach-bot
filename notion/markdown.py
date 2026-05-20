@@ -76,6 +76,34 @@ def render_change_body(
     return "\n\n".join(parts) if parts else None
 
 
+def render_review_body(critique: Optional[str], proposed_change: Any) -> Optional[str]:
+    """Markdown body for a Reviews page: ``## Critique`` + ``## Proposed change``.
+
+    ``proposed_change`` is the dict the review writer produced
+    (``summary``, ``new_plan_md``, ``reason``) or ``None`` when the review
+    proposed no edit. Returns ``None`` when the review has neither side —
+    the mirror skips the body patch in that case.
+    """
+    parts: list[str] = []
+    crit = (critique or "").strip()
+    if crit:
+        parts.append(f"## Critique\n\n{crit}")
+    if isinstance(proposed_change, dict) and proposed_change:
+        summary = (proposed_change.get("summary") or "").strip()
+        new_plan_md = (proposed_change.get("new_plan_md") or "").strip()
+        reason = (proposed_change.get("reason") or "").strip()
+        block = ["## Proposed change"]
+        if summary:
+            block.append(f"> {summary}")
+        if new_plan_md:
+            block.append(f"```markdown\n{new_plan_md}\n```")
+        if reason:
+            block.append(f"*Reason:* {reason}")
+        if len(block) > 1:
+            parts.append("\n\n".join(block))
+    return "\n\n".join(parts) if parts else None
+
+
 def render_session_body(row: dict) -> Optional[str]:
     """Return the Markdown body for a Sessions page, or None when empty.
 

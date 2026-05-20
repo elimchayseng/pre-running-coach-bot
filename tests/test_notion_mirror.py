@@ -280,10 +280,121 @@ class TestPlanChangeMirror:
         assert client.markdown_patched == []
 
 
+# ---------------- review mirror ----------------
+
+
+def _r(**over) -> dict:
+    base = {
+        "id": 7,
+        "session_id": 42,
+        "strava_id": 99999,
+        "date": "2026-05-20",
+        "critique": "Held HR cap, paced even.",
+        "proposed_change": None,
+        "status": None,
+    }
+    base.update(over)
+    return base
+
+
+class _ReviewFakeClient:
+    """Fake client that branches its query response on the data_source_id —
+    review upserts query both the Sessions DS (sid lookup) and the Reviews DS."""
+
+    def __init__(self, *, session_page_id=None, review_page_id=None):
+        self.session_page_id = session_page_id
+        self.review_page_id = review_page_id
+        self.created: list = []
+        self.updated: list = []
+        self.markdown_patched: list = []
+
+    def query_data_source(self, ds, filter_=None):
+        if ds == "ds-sessions":
+            return {"results": [{"id": self.session_page_id}] if self.session_page_id else []}
+        if ds == "ds-reviews":
+            return {"results": [{"id": self.review_page_id}] if self.review_page_id else []}
+        return {"results": []}
+
+    def create_page(self, ds, properties, markdown=None):
+        self.created.append({"ds": ds, "properties": properties, "markdown": markdown})
+        return {"id": "new-page"}
+
+    def update_page(self, page_id, properties=None):
+        self.updated.append({"page_id": page_id, "properties": properties})
+        return {"id": page_id}
+
+    def replace_page_markdown(self, page_id, markdown):
+        self.markdown_patched.append({"page_id": page_id, "markdown": markdown})
+        return {"id": page_id}
+
+
+class TestReviewMirror:
+    def test_source_key_uses_review_id(self):
+        assert mirror.review_source_key(_r()) == "rid:7"
+
+    def test_properties_when_session_page_exists(self):
+        props = mirror._review_properties(_r(), "rid:7", session_page_id="page-s")
+        assert props["Date"] == {"date": {"start": "2026-05-20"}}
+        assert props["Status"] == {"select": None}  # pending
+        assert props["Session"] == {"relation": [{"id": "page-s"}]}
+
+    def test_properties_when_session_page_missing(self):
+        props = mirror._review_properties(_r(), "rid:7", session_page_id=None)
+        assert props["Session"] == {"relation": []}
+
+    def test_insert_links_session_and_writes_body(self, monkeypatch):
+        monkeypatch.setenv("NOTION_REVIEWS_DS_ID", "ds-reviews")
+        monkeypatch.setenv("NOTION_SESSIONS_DS_ID", "ds-sessions")
+        client = _ReviewFakeClient(session_page_id="page-s", review_page_id=None)
+        mirror._upsert_review(
+            _r(critique="Strong", proposed_change={"summary": "x", "new_plan_md": "# p", "reason": "y"}),
+            client,
+        )
+        [created] = client.created
+        assert created["ds"] == "ds-reviews"
+        assert created["properties"]["Session"] == {"relation": [{"id": "page-s"}]}
+        body = created["markdown"]
+        assert "## Critique" in body and "Strong" in body
+        assert "## Proposed change" in body and "> x" in body
+
+    def test_update_when_review_page_exists(self, monkeypatch):
+        monkeypatch.setenv("NOTION_REVIEWS_DS_ID", "ds-reviews")
+        monkeypatch.setenv("NOTION_SESSIONS_DS_ID", "ds-sessions")
+        client = _ReviewFakeClient(session_page_id="page-s", review_page_id="page-r")
+        mirror._upsert_review(_r(critique="new note"), client)
+        assert client.created == []
+        assert client.updated[0]["page_id"] == "page-r"
+        # critique-only review still produces a body
+        assert client.markdown_patched[0]["page_id"] == "page-r"
+        assert "## Critique" in client.markdown_patched[0]["markdown"]
+
+
 # ---------------- render_change_body ----------------
 
 
-from notion.markdown import render_change_body  # noqa: E402
+from notion.markdown import render_change_body, render_review_body  # noqa: E402
+
+
+class TestRenderReviewBody:
+    def test_critique_only(self):
+        body = render_review_body("Steady run.", None)
+        assert body.startswith("## Critique")
+        assert "## Proposed change" not in body
+
+    def test_critique_plus_proposal(self):
+        body = render_review_body(
+            "Strong execution.",
+            {"summary": "Bump tempo 5s", "new_plan_md": "# v2", "reason": "fitness up"},
+        )
+        assert "## Critique" in body and "Strong execution" in body
+        assert "## Proposed change" in body
+        assert "> Bump tempo 5s" in body
+        assert "```markdown\n# v2\n```" in body
+        assert "*Reason:* fitness up" in body
+
+    def test_empty_returns_none(self):
+        assert render_review_body(None, None) is None
+        assert render_review_body("", {}) is None
 
 
 class TestRenderChangeBody:

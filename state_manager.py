@@ -45,11 +45,12 @@ _yaml.indent(mapping=2, sequence=4, offset=2)
 
 SCHEMA_PATH = Path(__file__).resolve().parent / "state" / "schema.sql"
 
-# Current schema version. v4 is the Phase 1A cutover (unified `sessions`
-# table, `plan_meta`). An older DB is migrated by
-# scripts/cutover_to_unified_sessions.py — _ensure_schema never force-applies
-# the unified schema onto a pre-cutover DB.
-CURRENT_SCHEMA_VERSION = 4
+# Current schema version. v4 was the Phase 1A cutover (unified `sessions`
+# table, `plan_meta`); v5 adds the `reviews` table for Phase 1B.4.
+# scripts/cutover_to_unified_sessions.py handles v3→v4; v4→v5 is purely
+# additive (CREATE TABLE IF NOT EXISTS) and lands the next time _ensure_schema
+# re-runs schema.sql against a unified DB.
+CURRENT_SCHEMA_VERSION = 5
 
 _JOURNAL_HEADER = "# Journal\n\nAppend-only freeform notes. Newest entries at the bottom.\n"
 
@@ -635,6 +636,60 @@ class StateManager:
         except Exception:  # noqa: BLE001
             pass
 
+    def _notify_mirror_review(self, entry: Optional[dict]) -> None:
+        """Best-effort mirror of one review to Notion Reviews."""
+        if not entry:
+            return
+        try:
+            from notion.mirror import mirror_review
+
+            mirror_review(entry)
+        except Exception:  # noqa: BLE001
+            pass
+
+    # ---------- Reviews ----------
+
+    def save_review(
+        self,
+        session_id: Optional[int],
+        strava_id: Optional[int],
+        review_date: date,
+        critique: str,
+        proposed_change: Optional[dict] = None,
+    ) -> dict:
+        """Persist a post-activity review and fire the Notion mirror.
+
+        Returns the inserted row as a dict with ``proposed_change`` parsed
+        back into a dict (it's stored as JSON in SQLite). ``status`` starts
+        NULL (= Pending in the Notion view).
+        """
+        proposed_json = json.dumps(proposed_change, ensure_ascii=False) if proposed_change else None
+        iso = review_date.isoformat() if isinstance(review_date, date) else str(review_date)[:10]
+        with self._conn() as conn:
+            cur = conn.execute(
+                "INSERT INTO reviews (session_id, strava_id, date, critique, proposed_change) VALUES (?, ?, ?, ?, ?)",
+                (session_id, strava_id, iso, critique, proposed_json),
+            )
+            row = _parse_review_row(
+                dict(conn.execute("SELECT * FROM reviews WHERE id = ?", (cur.lastrowid,)).fetchone())
+            )
+        self._notify_mirror_review(row)
+        return row
+
+    def get_reviews_in_range(self, start: date, end: date) -> list[dict]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM reviews WHERE date BETWEEN ? AND ? ORDER BY date, id",
+                (start.isoformat(), end.isoformat()),
+            ).fetchall()
+        return [_parse_review_row(dict(r)) for r in rows]
+
+    def get_all_reviews(self) -> list[dict]:
+        """Return every review row, in id order. Used by the Notion seed."""
+        with self._conn() as conn:
+            rows = conn.execute("SELECT * FROM reviews ORDER BY id").fetchall()
+        return [_parse_review_row(dict(r)) for r in rows]
+
     # ---------- Journal ----------
 
     def load_journal(self, max_entries: Optional[int] = None) -> str:
@@ -825,6 +880,18 @@ def _format_actuals(data_value: Any) -> str:
 def _row_dict(row: Any) -> Optional[dict]:
     """sqlite3.Row → dict; None passthrough."""
     return None if row is None else dict(row)
+
+
+def _parse_review_row(row: dict) -> dict:
+    """Parse ``proposed_change`` JSON back to a dict so callers and the
+    Notion mirror see structured data, not a string."""
+    raw = row.get("proposed_change")
+    if isinstance(raw, str) and raw:
+        try:
+            row["proposed_change"] = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            pass  # leave the raw string so debugging is still possible
+    return row
 
 
 def _pick_planned_match(activity_type: str, planned: list) -> Optional[Any]:

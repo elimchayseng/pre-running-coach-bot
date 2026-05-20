@@ -85,6 +85,26 @@ CREATE TABLE IF NOT EXISTS journal (
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+-- Post-activity reviews (schema v5). One row per LLM-generated review of a
+-- logged session: the critique, the optional proposed plan change, and an
+-- eventual resolution. `proposed_change` is JSON ({summary, new_plan_md,
+-- reason, ...}) or NULL when the review proposes no edit. `status` is NULL
+-- until the runner approves / rejects (NULL → "Pending" in the Notion view).
+CREATE TABLE IF NOT EXISTS reviews (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id      INTEGER REFERENCES sessions(id),
+    strava_id       INTEGER,
+    date            TEXT    NOT NULL,
+    critique        TEXT,
+    proposed_change TEXT,
+    status          TEXT
+                    CHECK (status IS NULL OR status IN ('approved','rejected','expired','no-op')),
+    created_at      TEXT    NOT NULL DEFAULT (datetime('now')),
+    resolved_at     TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_reviews_session_id ON reviews(session_id);
+CREATE INDEX IF NOT EXISTS idx_reviews_date ON reviews(date);
+
 -- Per-event gcal sync state. Replaces state/.gcal_sync_state.json. Each row
 -- corresponds to one calendar event. Booleans are INTEGER 0/1 per SQLite
 -- convention. Reconcile joins this against `sessions` to detect drift.
