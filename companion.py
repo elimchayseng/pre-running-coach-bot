@@ -25,6 +25,7 @@ from pending_proposal_store import get_pending_plan_proposal
 from state_manager import StateManager
 from temporal_context import today_local
 from tools import ALL_TOOLS, execute_tool
+from tools.state import flush_pending_calendar_sync
 
 STATE_DIR = Path(__file__).resolve().parent / "state"
 MAX_TOOL_LOOPS = 8
@@ -254,42 +255,53 @@ def agent_turn(messages: list[dict], state: StateManager) -> str:
     update_plan refactor (PR B) actually targets the bottleneck.
     """
     msg = None
-    for i in range(MAX_TOOL_LOOPS):
-        t_llm = time.perf_counter()
-        msg = _call_llm(messages)
-        llm_ms = int((time.perf_counter() - t_llm) * 1000)
-        n_tool_calls = len(msg.tool_calls) if msg.tool_calls else 0
-        logger.info("agent_turn iter=%d llm_ms=%d tool_calls=%d", i, llm_ms, n_tool_calls)
+    try:
+        for i in range(MAX_TOOL_LOOPS):
+            t_llm = time.perf_counter()
+            msg = _call_llm(messages)
+            llm_ms = int((time.perf_counter() - t_llm) * 1000)
+            n_tool_calls = len(msg.tool_calls) if msg.tool_calls else 0
+            logger.info("agent_turn iter=%d llm_ms=%d tool_calls=%d", i, llm_ms, n_tool_calls)
 
-        msg_dict = msg.model_dump(exclude_none=True)
-        # Heroku rejects null/empty content on assistant messages that carry
-        # tool_calls. Force a non-empty placeholder when needed.
-        if not msg_dict.get("content"):
-            msg_dict["content"] = "(calling tools)"
-        messages.append(msg_dict)
+            msg_dict = msg.model_dump(exclude_none=True)
+            # Heroku rejects null/empty content on assistant messages that carry
+            # tool_calls. Force a non-empty placeholder when needed.
+            if not msg_dict.get("content"):
+                msg_dict["content"] = "(calling tools)"
+            messages.append(msg_dict)
 
-        if not msg.tool_calls:
-            return msg.content or ""
+            if not msg.tool_calls:
+                return msg.content or ""
 
-        for tc in msg.tool_calls:
-            t_tool = time.perf_counter()
-            try:
-                args = json.loads(tc.function.arguments) if tc.function.arguments else {}
-                result = execute_tool(tc.function.name, args, state)
-            except json.JSONDecodeError as e:
-                result = {"error": f"invalid JSON args: {e}"}
-            tool_ms = int((time.perf_counter() - t_tool) * 1000)
-            logger.info("agent_turn iter=%d tool=%s tool_ms=%d", i, tc.function.name, tool_ms)
-            messages.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": tc.id,
-                    "content": json.dumps(result, default=str),
-                }
-            )
+            for tc in msg.tool_calls:
+                t_tool = time.perf_counter()
+                try:
+                    args = json.loads(tc.function.arguments) if tc.function.arguments else {}
+                    result = execute_tool(tc.function.name, args, state)
+                except json.JSONDecodeError as e:
+                    result = {"error": f"invalid JSON args: {e}"}
+                tool_ms = int((time.perf_counter() - t_tool) * 1000)
+                logger.info("agent_turn iter=%d tool=%s tool_ms=%d", i, tc.function.name, tool_ms)
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "content": json.dumps(result, default=str),
+                    }
+                )
 
-    logger.warning("agent_turn hit tool-use iteration cap")
-    return (msg.content if msg else "") or ""
+        logger.warning("agent_turn hit tool-use iteration cap")
+        return (msg.content if msg else "") or ""
+    finally:
+        # End-of-turn calendar sync (issue #26): plan-edit tools set a dirty
+        # flag; this fires at most one fire-and-forget daemon-thread sync per
+        # turn regardless of how many edits happened. Always runs — even on
+        # exception — so a mid-turn LLM failure that left edits on disk still
+        # propagates to gcal on the next clean turn. Never raises.
+        try:
+            flush_pending_calendar_sync(state)
+        except Exception:
+            logger.exception("flush_pending_calendar_sync raised — swallowing")
 
 
 def chat(user_message: str) -> str:

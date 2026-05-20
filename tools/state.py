@@ -2,7 +2,73 @@
 
 from __future__ import annotations
 
+import logging
+import threading
 from datetime import date
+
+logger = logging.getLogger("pre_coach.tools.state")
+
+# ---------- per-turn calendar sync debounce ----------
+#
+# Plan-edit handlers (update_workout / replace_week_table / update_plan) mark
+# this flag when they mutate the plan. ``flush_pending_calendar_sync`` clears
+# it and spawns a single daemon thread that runs ``google_calendar.sync.sync_plan``.
+# Called once at end-of-turn by ``companion.agent_turn`` so a turn with N edits
+# triggers at most one calendar sync — never N — and always off the response
+# path. See issue #26.
+_sync_dirty = False
+_sync_lock = threading.Lock()
+
+
+def _mark_plan_dirty() -> None:
+    """Flag the plan as edited this turn. Idempotent within a turn."""
+    global _sync_dirty
+    with _sync_lock:
+        _sync_dirty = True
+
+
+def _consume_plan_dirty() -> bool:
+    """Atomically read+clear the dirty flag. Returns prior value."""
+    global _sync_dirty
+    with _sync_lock:
+        was_dirty = _sync_dirty
+        _sync_dirty = False
+        return was_dirty
+
+
+def flush_pending_calendar_sync(state) -> bool:
+    """If the plan was edited this turn, spawn a daemon thread to sync gcal.
+
+    Fire-and-forget — never blocks the caller, never raises. Returns True if a
+    sync was scheduled, False if nothing was pending. The thread itself logs any
+    exceptions and exits cleanly; an unhealthy gcal must not crash the worker.
+    """
+    if not _consume_plan_dirty():
+        return False
+
+    def _run() -> None:
+        try:
+            from google_calendar.sync import sync_plan
+
+            result = sync_plan(state)
+            logger.info(
+                "auto-sync after plan edit: inserted=%s patched=%s deleted=%s unchanged=%s errors=%d",
+                result.get("inserted"),
+                result.get("patched"),
+                result.get("deleted"),
+                result.get("unchanged"),
+                len(result.get("errors") or []),
+            )
+        except Exception as e:  # noqa: BLE001 — sync hiccup must not crash worker
+            logger.warning(
+                "auto-sync after plan edit failed: %s: %s",
+                type(e).__name__,
+                e,
+            )
+
+    threading.Thread(target=_run, daemon=True, name="pre-plan-sync").start()
+    return True
+
 
 SESSION_TYPES = [
     "run",
@@ -302,6 +368,7 @@ def _update_plan(args: dict, state) -> dict:
     result = {"ok": True, "change_reason": args["change_reason"]}
     _consume_pending_proposal()
     _attach_today_warning_if_broken(state, result)
+    _mark_plan_dirty()
     return result
 
 
@@ -321,6 +388,7 @@ def _update_workout(args: dict, state) -> dict:
     )
     result = {"ok": True, "date": args["date"], "change_reason": args["change_reason"]}
     _attach_today_warning_if_broken(state, result)
+    _mark_plan_dirty()
     return result
 
 
@@ -334,6 +402,7 @@ def _replace_week_table(args: dict, state) -> dict:
         "change_reason": args["change_reason"],
     }
     _attach_today_warning_if_broken(state, result)
+    _mark_plan_dirty()
     return result
 
 
