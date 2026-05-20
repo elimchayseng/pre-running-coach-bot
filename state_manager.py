@@ -35,6 +35,7 @@ from typing import Any, Iterator, Optional
 from ruamel.yaml import YAML
 
 import plan_markdown
+from notion.markdown import render_change_body
 
 # Round-trip YAML — preserves comments, key order, quotes. update_athlete()
 # depends on this; PyYAML would silently drop them.
@@ -198,12 +199,17 @@ class StateManager:
     def update_plan_meta(self, content: str, change_note: str) -> None:
         """Replace plan_meta and log to the changelog."""
         with self._conn() as conn:
+            prev_row = conn.execute("SELECT content FROM plan_meta WHERE id = 1").fetchone()
+            before = prev_row["content"] if prev_row else ""
             conn.execute(
                 "INSERT INTO plan_meta (id, content, updated_at) VALUES (1, ?, datetime('now')) "
                 "ON CONFLICT(id) DO UPDATE SET content = excluded.content, updated_at = excluded.updated_at",
                 (content,),
             )
-            change_entry = self._append_changelog(conn, change_note)
+            body = render_change_body(
+                before, content, before_heading="Before (plan_meta)", after_heading="After (plan_meta)"
+            )
+            change_entry = self._append_changelog(conn, change_note, body=body)
         self._notify_mirror_change(change_entry)
 
     def update_plan(self, new_plan_md: str, change_note: str) -> None:
@@ -219,6 +225,12 @@ class StateManager:
         details = plan_markdown.parse_workout_details(new_plan_md)
         meta = plan_markdown.build_plan_meta(new_plan_md)
         with self._conn() as conn:
+            before_rows = [
+                _row_dict(r)
+                for r in conn.execute(
+                    "SELECT * FROM sessions WHERE status = 'planned' ORDER BY date, slot, id"
+                ).fetchall()
+            ]
             conn.execute("DELETE FROM sessions WHERE status = 'planned'")
             for r in rows:
                 conn.execute(
@@ -240,7 +252,14 @@ class StateManager:
                 "ON CONFLICT(id) DO UPDATE SET content = excluded.content, updated_at = excluded.updated_at",
                 (meta,),
             )
-            change_entry = self._append_changelog(conn, change_note)
+            after_rows = [
+                _row_dict(r)
+                for r in conn.execute(
+                    "SELECT * FROM sessions WHERE status = 'planned' ORDER BY date, slot, id"
+                ).fetchall()
+            ]
+            body = render_change_body(_format_session_rows(before_rows), _format_session_rows(after_rows))
+            change_entry = self._append_changelog(conn, change_note, body=body)
         self._notify_mirror(self._rows("status = 'planned'", ()))
         self._notify_mirror_change(change_entry)
 
@@ -273,6 +292,11 @@ class StateManager:
                 row = conn.execute(
                     "SELECT id, status FROM sessions WHERE date = ? ORDER BY slot LIMIT 1", (iso,)
                 ).fetchone()
+            before_row = (
+                _row_dict(conn.execute("SELECT * FROM sessions WHERE id = ?", (row["id"],)).fetchone())
+                if row is not None
+                else None
+            )
             if row is None:
                 cur = conn.execute(
                     "INSERT INTO sessions "
@@ -309,7 +333,9 @@ class StateManager:
                 params.append(row["id"])
                 conn.execute(f"UPDATE sessions SET {', '.join(sets)} WHERE id = ?", params)
                 affected_id = row["id"]
-            change_entry = self._append_changelog(conn, change_note)
+            after_row = _row_dict(conn.execute("SELECT * FROM sessions WHERE id = ?", (affected_id,)).fetchone())
+            body = render_change_body(_format_session_row_short(before_row), _format_session_row_short(after_row))
+            change_entry = self._append_changelog(conn, change_note, body=body)
         self._notify_mirror(self._rows("id = ?", (affected_id,)))
         self._notify_mirror_change(change_entry)
 
@@ -330,6 +356,13 @@ class StateManager:
                 raise ValueError(f"row missing required keys {missing}: {r}")
         dates = sorted(r["date"] for r in rows)
         with self._conn() as conn:
+            before_rows = [
+                _row_dict(r)
+                for r in conn.execute(
+                    "SELECT * FROM sessions WHERE status = 'planned' AND date BETWEEN ? AND ? ORDER BY date, slot, id",
+                    (dates[0], dates[-1]),
+                ).fetchall()
+            ]
             conn.execute(
                 "DELETE FROM sessions WHERE status = 'planned' AND date BETWEEN ? AND ?",
                 (dates[0], dates[-1]),
@@ -353,15 +386,25 @@ class StateManager:
                         r["notes"],
                     ),
                 )
-            change_entry = self._append_changelog(conn, change_note)
+            after_rows = [
+                _row_dict(r)
+                for r in conn.execute(
+                    "SELECT * FROM sessions WHERE status = 'planned' AND date BETWEEN ? AND ? ORDER BY date, slot, id",
+                    (dates[0], dates[-1]),
+                ).fetchall()
+            ]
+            body = render_change_body(_format_session_rows(before_rows), _format_session_rows(after_rows))
+            change_entry = self._append_changelog(conn, change_note, body=body)
         self._notify_mirror(self._rows("status = 'planned' AND date BETWEEN ? AND ?", (dates[0], dates[-1])))
         self._notify_mirror_change(change_entry)
 
-    def _append_changelog(self, conn: sqlite3.Connection, note: str) -> dict:
+    def _append_changelog(self, conn: sqlite3.Connection, note: str, body: Optional[str] = None) -> dict:
         """Append a timestamped note to the changelog blob.
 
-        Returns ``{"timestamp", "note", "action"}`` so the caller can mirror
-        the new entry to Notion after the transaction commits.
+        Returns ``{"timestamp", "note", "action", "body"}`` so the caller can
+        mirror the new entry to Notion after the transaction commits. ``body``
+        (if non-empty) is the fenced before/after markdown that lands on the
+        Plan Changes page.
         """
         ts = datetime.now().isoformat(timespec="seconds")
         line = f"- {ts}: {note}\n"
@@ -372,7 +415,7 @@ class StateManager:
             (line,),
         )
         action = "completed" if " completed:" in note or note.startswith("completed:") else "planned-edit"
-        return {"timestamp": ts, "note": note, "action": action}
+        return {"timestamp": ts, "note": note, "action": action, "body": body}
 
     # ---------- Plan-row reads ----------
 
@@ -510,12 +553,19 @@ class StateManager:
             ).fetchall()
             match = _pick_planned_match(stype, planned)
             if match is not None:
+                before_row = _row_dict(conn.execute("SELECT * FROM sessions WHERE id = ?", (match["id"],)).fetchone())
                 conn.execute(
                     "UPDATE sessions SET status = 'completed', data = ?, type = ?, "
                     "completed_at = datetime('now'), updated_at = datetime('now') WHERE id = ?",
                     (payload, stype or None, match["id"]),
                 )
-                change_entry = self._append_changelog(conn, f"{sdate} completed: {stype or 'session'}")
+                body = render_change_body(
+                    _format_session_row_short(before_row),
+                    _format_actuals(payload),
+                    before_heading="Prescribed",
+                    after_heading="Actuals",
+                )
+                change_entry = self._append_changelog(conn, f"{sdate} completed: {stype or 'session'}", body=body)
                 result = {"matched": True, "status": "completed", "row_id": match["id"]}
             else:
                 cur = conn.execute(
@@ -716,6 +766,65 @@ def _is_rest_day(workout: str) -> bool:
     if not w or w in {"-", "—"}:
         return True
     return any(w.startswith(p) for p in _REST_PATTERNS)
+
+
+# ---------- change-body formatters (for the Plan Changes Notion mirror) ----------
+#
+# Each writer that calls _append_changelog snapshots the affected row(s)
+# before and after its writes and renders a body via these helpers; the
+# mirror writes it as the Plan Changes page markdown.
+
+
+def _format_session_row_short(row: Optional[dict]) -> str:
+    """One-line summary of a session row for change-diff bodies."""
+    if row is None:
+        return "(none)"
+    status = row.get("status") or "?"
+    rtype = row.get("type") or "?"
+    line = f"{row['date']} [{status}/{rtype}] {row.get('prescribed_workout') or ''}".rstrip()
+    pace = row.get("prescribed_pace")
+    if pace:
+        line += f" | pace={pace}"
+    notes = row.get("prescribed_notes")
+    if notes:
+        line += f" | notes={notes}"
+    return line
+
+
+def _format_session_rows(rows: Optional[list]) -> str:
+    if not rows:
+        return "(no rows)"
+    return "\n".join(_format_session_row_short(r) for r in rows)
+
+
+def _format_actuals(data_value: Any) -> str:
+    """Format a completed session's actuals JSON as readable lines."""
+    if not data_value:
+        return "(no actuals)"
+    data: Any = data_value
+    if isinstance(data, str):
+        try:
+            data = json.loads(data)
+        except (json.JSONDecodeError, TypeError):
+            return data[:500]
+    if not isinstance(data, dict):
+        return str(data)[:500]
+    bits: list[str] = []
+    for k in ("date", "type", "miles", "pace_avg", "hr_avg", "rpe", "notes"):
+        v = data.get(k)
+        if v is not None:
+            bits.append(f"{k}: {v}")
+    details = data.get("details") or {}
+    for k in ("strava_id", "elevation_gain_ft", "moving_time", "duration"):
+        v = details.get(k)
+        if v is not None:
+            bits.append(f"{k}: {v}")
+    return "\n".join(bits) if bits else "(no actuals)"
+
+
+def _row_dict(row: Any) -> Optional[dict]:
+    """sqlite3.Row → dict; None passthrough."""
+    return None if row is None else dict(row)
 
 
 def _pick_planned_match(activity_type: str, planned: list) -> Optional[Any]:

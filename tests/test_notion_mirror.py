@@ -251,21 +251,65 @@ class TestPlanChangeMirror:
         assert props["Reason"]["rich_text"][0]["text"]["content"] == "Added yoga"
         assert props["Triggered by"] == {"relation": []}
 
-    def test_insert_when_no_existing(self, monkeypatch):
+    def test_insert_without_body(self, monkeypatch):
         monkeypatch.setenv("NOTION_PLAN_CHANGES_DS_ID", "ds-c")
         client = _FakeClient(existing_page_id=None)
         mirror._upsert_plan_change(_c(), client)
-        # No markdown body in 1B.3 — before/after diffs need session tracking
         assert client.created[0]["markdown"] is None
         assert client.markdown_patched == []
 
-    def test_update_skips_markdown_patch(self, monkeypatch):
-        """Plan Changes pages don't carry a body — update touches properties only."""
+    def test_insert_with_body(self, monkeypatch):
+        monkeypatch.setenv("NOTION_PLAN_CHANGES_DS_ID", "ds-c")
+        client = _FakeClient(existing_page_id=None)
+        mirror._upsert_plan_change(_c(body="## Before\n\n```\nx\n```"), client)
+        assert client.created[0]["markdown"] == "## Before\n\n```\nx\n```"
+
+    def test_update_patches_body_when_present(self, monkeypatch):
         monkeypatch.setenv("NOTION_PLAN_CHANGES_DS_ID", "ds-c")
         client = _FakeClient(existing_page_id="page-c")
-        mirror._upsert_plan_change(_c(), client)
+        mirror._upsert_plan_change(_c(body="new diff"), client)
+        assert client.updated[0]["page_id"] == "page-c"
+        assert client.markdown_patched[0] == {"page_id": "page-c", "markdown": "new diff"}
+
+    def test_update_skips_body_patch_when_empty(self, monkeypatch):
+        """A re-seed (no body) must not blow away a body a live writer set."""
+        monkeypatch.setenv("NOTION_PLAN_CHANGES_DS_ID", "ds-c")
+        client = _FakeClient(existing_page_id="page-c")
+        mirror._upsert_plan_change(_c(), client)  # no body
         assert client.updated[0]["page_id"] == "page-c"
         assert client.markdown_patched == []
+
+
+# ---------------- render_change_body ----------------
+
+
+from notion.markdown import render_change_body  # noqa: E402
+
+
+class TestRenderChangeBody:
+    def test_both_sides(self):
+        body = render_change_body("old", "new")
+        assert "## Before" in body and "old" in body
+        assert "## After" in body and "new" in body
+        assert "```" in body
+
+    def test_after_only(self):
+        body = render_change_body(None, "new")
+        assert "## Before" not in body
+        assert "## After" in body
+
+    def test_before_only(self):
+        body = render_change_body("old", "")
+        assert "## Before" in body
+        assert "## After" not in body
+
+    def test_both_empty_returns_none(self):
+        assert render_change_body("", None) is None
+        assert render_change_body(None, "   ") is None
+
+    def test_custom_headings(self):
+        body = render_change_body("p", "a", before_heading="Prescribed", after_heading="Actuals")
+        assert "## Prescribed" in body and "## Actuals" in body
 
 
 if __name__ == "__main__":
