@@ -8,11 +8,11 @@
 
 ## What PRE does for you
 
-- **Auto-logs every run from Strava** — pulls splits, laps, HR, elevation the moment an activity uploads.
+- <img src="https://cdn.simpleicons.org/strava/FC4C02" height="14" alt="Strava" valign="middle" /> **Auto-logs every run from Strava** — pulls splits, laps, HR, elevation the moment an activity uploads.
 - **Writes and adapts your training plan** — a Claude-powered coach drafts the week, adjusts when life intervenes.
 - **Reviews each workout** — a separate post-activity LLM pass critiques the session and can propose a plan change for you to approve on your next chat. Reviews are persisted, not ephemeral.
-- **Pushes workouts to your Google Calendar** — your week shows up on your phone alongside everything else, with full coaching notes in the event description.
-- **Mirrors your training data into Notion** — sessions, journal entries, every plan change with before/after diffs, and every post-activity review land in four Notion databases under a single parent page. One-way, best-effort, fully optional.
+- <img src="https://cdn.simpleicons.org/googlecalendar/4285F4" height="14" alt="Google Calendar" valign="middle" /> **Pushes workouts to your Google Calendar** — your week shows up on your phone alongside everything else, with full coaching notes in the event description.
+- <img src="https://cdn.simpleicons.org/notion/333333" height="14" alt="Notion" valign="middle" /> **Mirrors your training data into Notion** — sessions, journal entries, every plan change with before/after diffs, and every post-activity review land in four Notion databases under a single parent page. One-way, best-effort, fully optional.
 - **Talks to you over Telegram** — chat naturally, or use slash commands like `/today`, `/race`, `/log`.
 - **Remembers your context** — PRs, pace and HR zones, injury history, strength routine, and a journal of sleep / stress / travel.
 
