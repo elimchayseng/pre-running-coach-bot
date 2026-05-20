@@ -109,7 +109,7 @@ sqlite3 /tmp/prod-coach.db
 
 ### Backups
 
-A daily Railway scheduled job runs `scripts/backup_db.py`, which uses SQLite's online-backup API to snapshot the DB and pushes it to a `state-snapshot` branch on GitHub. See the "Deploy" section for the env vars and cron setup.
+A daily Railway scheduled job runs `scripts/backup_db.py`, which uses SQLite's online-backup API to snapshot the DB and pushes it to a `state-snapshot` branch on GitHub. Full runbook (PAT setup, env vars, restore procedure): [docs/backups.md](docs/backups.md). Cron config is summarized in the "Deployment" section below.
 
 ## Prerequisites
 
@@ -359,6 +359,7 @@ python scripts/migrate_state_to_sqlite.py /app/state --db /app/data/coach.db --r
    - **Schedule**: `0 11 * * *` (UTC; adjust to a low-traffic hour)
    - **Start command**: `python scripts/backup_db.py`
    - **Env vars**: `DATABASE_PATH`, `GITHUB_BACKUP_TOKEN` (PAT with repo write), `GITHUB_REPO` (e.g. `you/pre-running-coach-bot`). Optional: `BACKUP_BRANCH` (default `state-snapshot`), `BACKUP_FORMAT` (default `binary`).
+   - Full PAT-setup and restore procedure: [docs/backups.md](docs/backups.md).
 
 **Important — single worker only.** SQLite-on-volume tolerates many threads but only one writer process. `Procfile` ships with `gunicorn app:app` (default 1 worker); leave it alone. If you ever need multiple processes, migrate to Postgres rather than bumping workers.
 
