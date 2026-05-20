@@ -690,6 +690,94 @@ class StateManager:
             rows = conn.execute("SELECT * FROM reviews ORDER BY id").fetchall()
         return [_parse_review_row(dict(r)) for r in rows]
 
+    def find_pending_review_for_activity(
+        self,
+        strava_id: Optional[int] = None,
+        session_id: Optional[int] = None,
+    ) -> Optional[dict]:
+        """Return the most recent Pending review for an activity, or None.
+
+        Pending = ``status IS NULL``. Match priority: ``strava_id`` first
+        (the post-activity review is keyed off Strava), then ``session_id``
+        as a fallback when the activity wasn't logged via Strava.
+        """
+        if strava_id is None and session_id is None:
+            return None
+        with self._conn() as conn:
+            row = None
+            if strava_id is not None:
+                row = conn.execute(
+                    "SELECT * FROM reviews WHERE strava_id = ? AND status IS NULL ORDER BY id DESC LIMIT 1",
+                    (strava_id,),
+                ).fetchone()
+            if row is None and session_id is not None:
+                row = conn.execute(
+                    "SELECT * FROM reviews WHERE session_id = ? AND status IS NULL ORDER BY id DESC LIMIT 1",
+                    (session_id,),
+                ).fetchone()
+        return _parse_review_row(dict(row)) if row else None
+
+    def resolve_pending_review(self, review_id: int, status: str) -> Optional[dict]:
+        """Flip a Pending reviews row to a terminal status and mirror it.
+
+        ``status`` must be one of approved / rejected / expired / no-op
+        (the schema CHECK constraint enforces this). Sets ``resolved_at`` to
+        now. Returns the updated row dict (with ``proposed_change`` parsed)
+        or ``None`` if the row doesn't exist or was already resolved (the
+        UPDATE is conditioned on ``status IS NULL`` so callers can race
+        each other harmlessly). Mirrors the flip to Notion best-effort —
+        a Notion failure logs and is swallowed; SQLite is the source of
+        truth.
+        """
+        with self._conn() as conn:
+            cur = conn.execute(
+                "UPDATE reviews SET status = ?, resolved_at = datetime('now') WHERE id = ? AND status IS NULL",
+                (status, review_id),
+            )
+            if cur.rowcount == 0:
+                return None
+            row = _parse_review_row(dict(conn.execute("SELECT * FROM reviews WHERE id = ?", (review_id,)).fetchone()))
+        self._notify_mirror_review(row)
+        return row
+
+    def expire_old_pending_reviews(self, days: int = 14, today: Optional[date] = None) -> list[dict]:
+        """Flip Pending reviews older than ``days`` to ``expired``.
+
+        Pending = ``status IS NULL``. Cutoff is computed against the review's
+        ``date`` field (the activity date). Returns the list of rows that
+        were just expired (dicts with ``proposed_change`` parsed); each is
+        mirrored to Notion best-effort.
+
+        Intended to run nightly via cron — wire as a Railway scheduled job
+        (e.g. ``0 9 * * *`` UTC, daily at 9 AM) calling
+        ``StateManager().expire_old_pending_reviews()``. This module
+        deliberately does NOT register the schedule itself; scheduling is
+        owned by the deploy config.
+        """
+        ref = today or date.today()
+        cutoff = (ref - timedelta(days=days)).isoformat()
+        with self._conn() as conn:
+            stale = conn.execute(
+                "SELECT id FROM reviews WHERE status IS NULL AND date < ?",
+                (cutoff,),
+            ).fetchall()
+            stale_ids = [r["id"] for r in stale]
+            if not stale_ids:
+                return []
+            conn.execute(
+                f"UPDATE reviews SET status = 'expired', resolved_at = datetime('now') "
+                f"WHERE id IN ({','.join('?' * len(stale_ids))})",
+                stale_ids,
+            )
+            rows = conn.execute(
+                f"SELECT * FROM reviews WHERE id IN ({','.join('?' * len(stale_ids))}) ORDER BY id",
+                stale_ids,
+            ).fetchall()
+        parsed = [_parse_review_row(dict(r)) for r in rows]
+        for row in parsed:
+            self._notify_mirror_review(row)
+        return parsed
+
     # ---------- Journal ----------
 
     def load_journal(self, max_entries: Optional[int] = None) -> str:

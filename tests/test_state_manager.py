@@ -540,6 +540,98 @@ class TestReviews:
         state.save_review(None, None, date(2026, 5, 20), "feedback", None)
         assert len(captured) == 1 and captured[0]["critique"] == "feedback"
 
+    def test_find_pending_review_by_strava_id(self, state, monkeypatch):
+        monkeypatch.setattr(state, "_notify_mirror_review", lambda entry: None)
+        state.save_review(None, 12345, date(2026, 5, 20), "felt fine", None)
+        got = state.find_pending_review_for_activity(strava_id=12345)
+        assert got is not None and got["strava_id"] == 12345 and got["status"] is None
+
+    def test_find_pending_review_returns_none_when_resolved(self, state, monkeypatch):
+        monkeypatch.setattr(state, "_notify_mirror_review", lambda entry: None)
+        row = state.save_review(None, 12345, date(2026, 5, 20), "felt fine", None)
+        state.resolve_pending_review(row["id"], "approved")
+        # Only Pending rows match
+        assert state.find_pending_review_for_activity(strava_id=12345) is None
+
+    def test_find_pending_review_by_session_id_fallback(self, state, monkeypatch):
+        monkeypatch.setattr(state, "_notify_mirror_review", lambda entry: None)
+        outcome = state.append_session({"date": "2026-05-20", "type": "easy", "miles": 5})
+        state.save_review(outcome["row_id"], None, date(2026, 5, 20), "x", None)
+        got = state.find_pending_review_for_activity(session_id=outcome["row_id"])
+        assert got is not None and got["session_id"] == outcome["row_id"]
+
+    def test_find_pending_review_none_inputs_returns_none(self, state):
+        assert state.find_pending_review_for_activity() is None
+
+    def test_resolve_pending_review_updates_row(self, state, monkeypatch):
+        monkeypatch.setattr(state, "_notify_mirror_review", lambda entry: None)
+        row = state.save_review(None, 9, date(2026, 5, 20), "x", None)
+        updated = state.resolve_pending_review(row["id"], "approved")
+        assert updated is not None
+        assert updated["status"] == "approved"
+        assert updated["resolved_at"] is not None
+
+    def test_resolve_pending_review_fires_mirror(self, state, monkeypatch):
+        captured: list = []
+        monkeypatch.setattr(state, "_notify_mirror_review", lambda entry: captured.append(entry))
+        row = state.save_review(None, 9, date(2026, 5, 20), "x", None)
+        captured.clear()  # ignore the save-mirror call
+        state.resolve_pending_review(row["id"], "approved")
+        assert len(captured) == 1 and captured[0]["status"] == "approved"
+
+    def test_resolve_pending_review_idempotent(self, state, monkeypatch):
+        """Second call returns None (no rows updated) — already resolved."""
+        monkeypatch.setattr(state, "_notify_mirror_review", lambda entry: None)
+        row = state.save_review(None, 9, date(2026, 5, 20), "x", None)
+        first = state.resolve_pending_review(row["id"], "approved")
+        second = state.resolve_pending_review(row["id"], "rejected")
+        assert first is not None and second is None
+        # Row stays approved
+        rows = state.get_all_reviews()
+        assert rows[0]["status"] == "approved"
+
+    def test_resolve_pending_review_missing_id(self, state):
+        assert state.resolve_pending_review(999, "approved") is None
+
+    def test_expire_old_pending_reviews_flips_stale_only(self, state, monkeypatch):
+        """Only Pending rows older than the cutoff get expired."""
+        monkeypatch.setattr(state, "_notify_mirror_review", lambda entry: None)
+        # Stale pending — 30 days old
+        old_row = state.save_review(None, 1, date(2026, 4, 1), "old", None)
+        # Recent pending — within 14 days
+        recent_row = state.save_review(None, 2, date(2026, 5, 15), "recent", None)
+        # Stale but already resolved — must not be re-flipped
+        resolved = state.save_review(None, 3, date(2026, 4, 1), "approved-old", None)
+        state.resolve_pending_review(resolved["id"], "approved")
+
+        expired = state.expire_old_pending_reviews(days=14, today=date(2026, 5, 20))
+        expired_ids = {r["id"] for r in expired}
+        assert old_row["id"] in expired_ids
+        assert recent_row["id"] not in expired_ids
+        assert resolved["id"] not in expired_ids
+
+        # Verify in SQLite directly
+        all_rows = {r["id"]: r for r in state.get_all_reviews()}
+        assert all_rows[old_row["id"]]["status"] == "expired"
+        assert all_rows[old_row["id"]]["resolved_at"] is not None
+        assert all_rows[recent_row["id"]]["status"] is None
+        assert all_rows[resolved["id"]]["status"] == "approved"
+
+    def test_expire_old_pending_reviews_returns_empty_when_none(self, state, monkeypatch):
+        monkeypatch.setattr(state, "_notify_mirror_review", lambda entry: None)
+        state.save_review(None, 1, date(2026, 5, 15), "recent", None)
+        assert state.expire_old_pending_reviews(days=14, today=date(2026, 5, 20)) == []
+
+    def test_expire_old_pending_reviews_fires_mirror_per_row(self, state, monkeypatch):
+        captured: list = []
+        monkeypatch.setattr(state, "_notify_mirror_review", lambda entry: captured.append(entry))
+        state.save_review(None, 1, date(2026, 4, 1), "a", None)
+        state.save_review(None, 2, date(2026, 4, 2), "b", None)
+        captured.clear()  # ignore the save-mirror calls
+        state.expire_old_pending_reviews(days=14, today=date(2026, 5, 20))
+        assert len(captured) == 2
+        assert all(c["status"] == "expired" for c in captured)
+
 
 # ---------------- change-body formatters ----------------
 

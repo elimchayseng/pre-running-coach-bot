@@ -175,6 +175,147 @@ class TestStateTools:
         )
         assert get_pending_plan_proposal() is None
 
+    def test_update_plan_auto_resolves_matching_pending_review(self, state, monkeypatch, fake_redis):
+        """update_plan + a pending proposal whose proposed_for_activity points
+        at a recent Pending review (matched by strava_id) flips that review
+        to ``approved`` and fires the Notion review mirror once."""
+        from datetime import date as _date
+
+        import temporal_context
+        from pending_proposal_store import set_pending_plan_proposal
+
+        monkeypatch.setattr(temporal_context, "today_local", lambda: _date(2026, 4, 28))
+        # Capture Notion review-mirror calls so we can assert the flip is mirrored.
+        captured: list = []
+        monkeypatch.setattr(state, "_notify_mirror_review", lambda entry: captured.append(entry))
+
+        # Pre-seed: a pending review for Strava activity 777
+        review = state.save_review(
+            session_id=None,
+            strava_id=777,
+            review_date=_date(2026, 4, 28),
+            critique="Hard easy. HR drifted.",
+            proposed_change={"summary": "demote tempo", "new_plan_md": "x", "reason": "y"},
+        )
+        assert review["status"] is None
+        captured.clear()  # ignore the save-mirror call
+
+        set_pending_plan_proposal(
+            {
+                "summary": "demote tempo",
+                "new_plan_md": "x",
+                "reason": "y",
+                "proposed_for_activity": 777,
+            }
+        )
+
+        plan = (
+            "# Plan\n\n## This Week\n\n"
+            "| Day | Date | Workout | Pace target | Notes |\n"
+            "|-----|------|---------|-------------|-------|\n"
+            "| Tue | 2026-04-28 | Easy 4mi | 8:45-9:15 | |\n"
+        )
+        execute_tool(
+            "update_plan",
+            {"new_plan_markdown": plan, "change_reason": "apply pending"},
+            state,
+        )
+
+        rows = state.get_all_reviews()
+        assert rows[0]["status"] == "approved"
+        assert rows[0]["resolved_at"] is not None
+        # Mirror was called for the flip (status=approved in the entry)
+        assert any(c["status"] == "approved" for c in captured)
+
+    def test_update_plan_no_matching_proposal_leaves_review_pending(self, state, monkeypatch, fake_redis):
+        """No pending proposal in Redis → reviews stay Pending."""
+        from datetime import date as _date
+
+        import temporal_context
+
+        monkeypatch.setattr(temporal_context, "today_local", lambda: _date(2026, 4, 28))
+        monkeypatch.setattr(state, "_notify_mirror_review", lambda entry: None)
+        state.save_review(
+            session_id=None,
+            strava_id=888,
+            review_date=_date(2026, 4, 28),
+            critique="ok",
+            proposed_change=None,
+        )
+
+        plan = (
+            "# Plan\n\n## This Week\n\n"
+            "| Day | Date | Workout | Pace target | Notes |\n"
+            "|-----|------|---------|-------------|-------|\n"
+            "| Tue | 2026-04-28 | Easy 4mi | 8:45-9:15 | |\n"
+        )
+        execute_tool(
+            "update_plan",
+            {"new_plan_markdown": plan, "change_reason": "manual edit"},
+            state,
+        )
+
+        rows = state.get_all_reviews()
+        assert rows[0]["status"] is None  # still Pending
+
+    def test_update_plan_proposal_for_unrelated_activity_leaves_review_pending(self, state, monkeypatch, fake_redis):
+        """A pending proposal targeting strava_id=A must not flip a review
+        for strava_id=B."""
+        from datetime import date as _date
+
+        import temporal_context
+        from pending_proposal_store import set_pending_plan_proposal
+
+        monkeypatch.setattr(temporal_context, "today_local", lambda: _date(2026, 4, 28))
+        monkeypatch.setattr(state, "_notify_mirror_review", lambda entry: None)
+        # Review is for activity 111
+        state.save_review(None, 111, _date(2026, 4, 28), "ok", None)
+        # Pending proposal is for an entirely different activity
+        set_pending_plan_proposal(
+            {
+                "summary": "s",
+                "new_plan_md": "x",
+                "reason": "r",
+                "proposed_for_activity": 222,
+            }
+        )
+
+        plan = (
+            "# Plan\n\n## This Week\n\n"
+            "| Day | Date | Workout | Pace target | Notes |\n"
+            "|-----|------|---------|-------------|-------|\n"
+            "| Tue | 2026-04-28 | Easy 4mi | 8:45-9:15 | |\n"
+        )
+        execute_tool(
+            "update_plan",
+            {"new_plan_markdown": plan, "change_reason": "x"},
+            state,
+        )
+        rows = state.get_all_reviews()
+        assert rows[0]["status"] is None
+
+    def test_update_workout_auto_resolves_matching_pending_review(self, state, monkeypatch, fake_redis):
+        """The patch-style edit tool also resolves a matching pending review."""
+        from datetime import date as _date
+
+        import temporal_context
+        from pending_proposal_store import set_pending_plan_proposal
+
+        monkeypatch.setattr(temporal_context, "today_local", lambda: _date(2026, 4, 28))
+        monkeypatch.setattr(state, "_notify_mirror_review", lambda entry: None)
+        review = state.save_review(None, 333, _date(2026, 4, 28), "x", None)
+        set_pending_plan_proposal({"summary": "s", "new_plan_md": "x", "reason": "r", "proposed_for_activity": 333})
+
+        execute_tool(
+            "update_workout",
+            {"date": "2026-04-28", "workout": "Easy 5mi", "change_reason": "user accepted"},
+            state,
+        )
+
+        rows = state.get_all_reviews()
+        assert rows[0]["id"] == review["id"]
+        assert rows[0]["status"] == "approved"
+
     def test_update_plan_breaks_table_returns_warning(self, state, monkeypatch):
         """Plan without a parseable today row → tool returns a warning so
         the agent can self-correct."""

@@ -300,6 +300,7 @@ def _mark_calendar_complete(state, entry: dict) -> None:
 def _update_plan(args: dict, state) -> dict:
     state.update_plan(args["new_plan_markdown"], args["change_reason"])
     result = {"ok": True, "change_reason": args["change_reason"]}
+    _auto_resolve_matching_review(state)
     _consume_pending_proposal()
     _attach_today_warning_if_broken(state, result)
     return result
@@ -320,6 +321,7 @@ def _update_workout(args: dict, state) -> dict:
         detail_body=args.get("detail_body"),
     )
     result = {"ok": True, "date": args["date"], "change_reason": args["change_reason"]}
+    _auto_resolve_matching_review(state)
     _attach_today_warning_if_broken(state, result)
     return result
 
@@ -333,6 +335,7 @@ def _replace_week_table(args: dict, state) -> dict:
         "rows_written": len(args["rows"]),
         "change_reason": args["change_reason"],
     }
+    _auto_resolve_matching_review(state)
     _attach_today_warning_if_broken(state, result)
     return result
 
@@ -348,6 +351,51 @@ def _consume_pending_proposal() -> None:
         clear_pending_plan_proposal()
     except Exception:
         pass
+
+
+def _auto_resolve_matching_review(state) -> None:
+    """Heuristic: a plan-edit tool just ran. If Redis has a pending proposal
+    whose ``proposed_for_activity`` matches a recent Pending review (by
+    ``strava_id``), flip that review to ``approved`` and mirror the flip
+    to Notion.
+
+    Matching rule: the proposal's ``proposed_for_activity`` is the Strava
+    activity id the post-activity review was generated for. The reviews
+    table also stores ``strava_id``, so a direct equality match is the
+    cleanest signal that this plan write applies that proposal. No match,
+    or no pending proposal in Redis → no-op (reviews stay Pending).
+
+    The "rejected" path (user replies "don't apply") is intentionally NOT
+    auto-detected here — it requires NL-intent parsing on the chat turn,
+    which is the next iteration. TODO: detect explicit-rejection turns
+    and flip the matching review to ``rejected`` from the chat handler.
+
+    Failures swallow silently: this is a best-effort enrichment of the
+    Notion view, never a blocker on the plan edit itself.
+    """
+    import logging
+
+    try:
+        from pending_proposal_store import get_pending_plan_proposal
+
+        proposal = get_pending_plan_proposal()
+    except Exception as e:
+        logging.getLogger("pre_coach.tools.state").debug(f"auto-resolve: failed to read pending proposal: {e}")
+        return
+    if not proposal:
+        return
+    strava_id = proposal.get("proposed_for_activity")
+    if strava_id is None:
+        return
+    try:
+        review = state.find_pending_review_for_activity(strava_id=strava_id)
+        if review is None:
+            return
+        state.resolve_pending_review(review["id"], "approved")
+    except Exception as e:
+        logging.getLogger("pre_coach.tools.state").warning(
+            f"auto-resolve: failed to flip review for strava_id={strava_id}: {e}"
+        )
 
 
 def _attach_today_warning_if_broken(state, result: dict) -> None:
