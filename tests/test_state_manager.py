@@ -193,31 +193,38 @@ class TestUpdateWorkout:
         assert w["pace_target"] == "6:30-6:40"
         assert w["notes"] == "focus on relaxed shoulders"
 
-    def test_unknown_date_inserts_planned_row(self, state):
+    def test_unknown_date_raises_with_self_routing_hint(self, state):
+        """Date with no row in the locked table raises ValueError whose
+        message tells the LLM exactly which other tool to reach for."""
         state.update_plan(PLAN_WITH_DETAIL, "seed")
-        state.update_workout(
-            target_date=date(2030, 1, 1),
-            change_note="add a day",
-            workout="Easy 5mi",
-        )
-        w = state.get_todays_workout(date(2030, 1, 1))
-        assert w["found"] is True
-        assert w["workout"] == "Easy 5mi"
-        assert w["status"] == "planned"
+        with pytest.raises(ValueError) as excinfo:
+            state.update_workout(
+                target_date=date(2030, 1, 1),
+                change_note="add a day",
+                workout="Easy 5mi",
+            )
+        msg = str(excinfo.value)
+        assert "2030-01-01" in msg
+        assert "replace_week_table" in msg
+        assert "update_plan" in msg
 
     def test_no_fields_raises(self, state):
         state.update_plan(PLAN_WITH_DETAIL, "seed")
         with pytest.raises(ValueError, match="must pass at least one"):
             state.update_workout(target_date=date(2026, 4, 28), change_note="x")
 
-    def test_inserts_on_empty_plan(self, state):
-        """No plan yet → update_workout seeds a fresh planned row."""
-        state.update_workout(
-            target_date=date(2026, 4, 28),
-            change_note="x",
-            workout="Easy 5mi",
-        )
-        assert state.get_todays_workout(date(2026, 4, 28))["workout"] == "Easy 5mi"
+    def test_empty_plan_raises_with_self_routing_hint(self, state):
+        """No plan yet → update_workout points the LLM at replace_week_table
+        / update_plan rather than silently seeding an orphan row."""
+        with pytest.raises(ValueError) as excinfo:
+            state.update_workout(
+                target_date=date(2026, 4, 28),
+                change_note="x",
+                workout="Easy 5mi",
+            )
+        msg = str(excinfo.value)
+        assert "replace_week_table" in msg
+        assert "update_plan" in msg
 
     def test_detail_body_only_no_row_edit(self, state):
         state.update_plan(PLAN_WITH_DETAIL, "seed")

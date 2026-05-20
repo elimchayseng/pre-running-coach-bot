@@ -463,9 +463,10 @@ class TestPatchTools:
         assert row["prescribed_workout"] == "Workout 5x800"
         assert row["detail_md"] == "WU 1mi. Work 5x800. CD 1mi."
 
-    def test_update_workout_unknown_date_inserts_row(self, state, monkeypatch):
-        """An unknown date is no longer an error — update_workout seeds a
-        fresh planned row for it."""
+    def test_update_workout_unknown_date_returns_self_routing_error(self, state, monkeypatch):
+        """An unknown date surfaces an error whose message tells the LLM
+        which other tool to reach for (replace_week_table / update_plan)
+        instead of silently inserting an orphan day."""
         self._pin_today(monkeypatch, "2026-04-28")
         out = execute_tool(
             "update_workout",
@@ -476,9 +477,13 @@ class TestPatchTools:
             },
             state,
         )
-        assert out["ok"] is True
-        assert "error" not in out
-        assert state.get_todays_workout(date(2030, 12, 31))["workout"] == "Anything"
+        assert "error" in out
+        err = out["error"]
+        assert "2030-12-31" in err
+        assert "replace_week_table" in err
+        assert "update_plan" in err
+        # The row must not have been silently inserted.
+        assert state.get_todays_workout(date(2030, 12, 31))["found"] is False
 
     def test_update_workout_does_not_clear_pending_proposal(self, state, monkeypatch, fake_redis):
         """Patch-style edits are surgical, not proposal-apply. A pending

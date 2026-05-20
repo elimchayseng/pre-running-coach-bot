@@ -275,8 +275,11 @@ class StateManager:
     ) -> None:
         """Patch a single day's prescription row.
 
-        Updates the planned row for ``target_date`` (only the fields passed
-        are touched). If the day has no planned row, a new one is inserted.
+        Updates the existing row for ``target_date`` (only the fields passed
+        are touched). Raises ``ValueError`` if no row exists for the date so
+        the LLM can self-route to ``replace_week_table`` (to add the
+        containing week) or ``update_plan`` (for structural changes) instead
+        of silently inserting an orphan day.
         """
         has_edit = any(v is not None for v in (workout, pace_target, notes, detail_body))
         if not has_edit:
@@ -289,51 +292,37 @@ class StateManager:
             ).fetchone()
             if row is None:
                 # No planned row — fall back to any prescription row on the
-                # date, else insert a fresh planned row.
+                # date (a completed/missed/off-plan row is still a valid
+                # patch target for detail_body etc.).
                 row = conn.execute(
                     "SELECT id, status FROM sessions WHERE date = ? ORDER BY slot LIMIT 1", (iso,)
                 ).fetchone()
-            before_row = (
-                _row_dict(conn.execute("SELECT * FROM sessions WHERE id = ?", (row["id"],)).fetchone())
-                if row is not None
-                else None
-            )
             if row is None:
-                cur = conn.execute(
-                    "INSERT INTO sessions "
-                    "(date, slot, status, type, prescribed_workout, prescribed_pace, "
-                    " prescribed_notes, detail_md) "
-                    "VALUES (?, NULL, 'planned', ?, ?, ?, ?, ?)",
-                    (
-                        iso,
-                        plan_markdown.infer_workout_type(workout or ""),
-                        workout,
-                        pace_target,
-                        notes,
-                        (detail_body or "").strip() or None,
-                    ),
+                raise ValueError(
+                    f"no row found in locked table for date {iso} — to add the "
+                    "week containing this date, call replace_week_table; for a "
+                    "structural plan change, call update_plan"
                 )
-                affected_id = cur.lastrowid
-            else:
-                sets, params = [], []
-                if workout is not None:
-                    sets.append("prescribed_workout = ?")
-                    params.append(workout)
-                    sets.append("type = ?")
-                    params.append(plan_markdown.infer_workout_type(workout))
-                if pace_target is not None:
-                    sets.append("prescribed_pace = ?")
-                    params.append(pace_target)
-                if notes is not None:
-                    sets.append("prescribed_notes = ?")
-                    params.append(notes)
-                if detail_body is not None:
-                    sets.append("detail_md = ?")
-                    params.append(detail_body.strip() or None)
-                sets.append("updated_at = datetime('now')")
-                params.append(row["id"])
-                conn.execute(f"UPDATE sessions SET {', '.join(sets)} WHERE id = ?", params)
-                affected_id = row["id"]
+            before_row = _row_dict(conn.execute("SELECT * FROM sessions WHERE id = ?", (row["id"],)).fetchone())
+            sets, params = [], []
+            if workout is not None:
+                sets.append("prescribed_workout = ?")
+                params.append(workout)
+                sets.append("type = ?")
+                params.append(plan_markdown.infer_workout_type(workout))
+            if pace_target is not None:
+                sets.append("prescribed_pace = ?")
+                params.append(pace_target)
+            if notes is not None:
+                sets.append("prescribed_notes = ?")
+                params.append(notes)
+            if detail_body is not None:
+                sets.append("detail_md = ?")
+                params.append(detail_body.strip() or None)
+            sets.append("updated_at = datetime('now')")
+            params.append(row["id"])
+            conn.execute(f"UPDATE sessions SET {', '.join(sets)} WHERE id = ?", params)
+            affected_id = row["id"]
             after_row = _row_dict(conn.execute("SELECT * FROM sessions WHERE id = ?", (affected_id,)).fetchone())
             body = render_change_body(_format_session_row_short(before_row), _format_session_row_short(after_row))
             change_entry = self._append_changelog(conn, change_note, body=body)
