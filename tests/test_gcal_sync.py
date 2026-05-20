@@ -566,6 +566,79 @@ class TestMarkComplete:
         state_after = sync._load_sync_state(state)
         assert "precomplete20260509" not in state_after
 
+    def test_prescribed_error_does_not_poison_sync_state(self, monkeypatch):
+        """Regression for #31: when the gcal patch/insert fails, mark_complete
+        must NOT stamp completed=True on the prescribed event. Otherwise
+        reconcile sees the sentinel and permanently skips the date even after
+        gcal auth is restored."""
+        from google_calendar import client as gcal_client
+
+        def _boom_insert(_p):
+            raise gcal_client.GcalAPIError("auth expired")
+
+        def _boom_patch(_eid, _p):
+            raise gcal_client.GcalAPIError("auth expired")
+
+        monkeypatch.setattr(gcal_client, "insert_event", _boom_insert)
+        monkeypatch.setattr(gcal_client, "patch_event", _boom_patch)
+
+        state = _StateStub(
+            _COMPLETION_PLAN,
+            {"2026-05-09": [{"date": "2026-05-09", "type": "easy", "miles": 8.0}]},
+        )
+        result = sync.mark_complete(state, date(2026, 5, 9))
+
+        assert result["prescribed"]["action"] == "error"
+        # Sentinel must NOT be written on error.
+        assert "pretrain20260509" not in state.gcal_sync
+
+    def test_off_plan_error_does_not_poison_sync_state(self, monkeypatch):
+        """Same as above for the off-plan branch."""
+        from google_calendar import client as gcal_client
+
+        def _boom_insert(_p):
+            raise gcal_client.GcalAPIError("auth expired")
+
+        monkeypatch.setattr(gcal_client, "insert_event", _boom_insert)
+        monkeypatch.setattr(gcal_client, "patch_event", lambda eid, p: None)
+
+        state = _StateStub(
+            _COMPLETION_PLAN,
+            {"2026-05-09": [{"date": "2026-05-09", "type": "strength"}]},
+        )
+        result = sync.mark_complete(state, date(2026, 5, 9))
+
+        assert result["off_plan"]["action"] == "error"
+        assert "precomplete20260509" not in state.gcal_sync
+
+    def test_retry_after_transient_error_succeeds(self, monkeypatch):
+        """First call hits a gcal error → sync_state stays clean. Second call
+        with a healthy client must mark the date complete."""
+        from google_calendar import client as gcal_client
+
+        calls = {"n": 0}
+
+        def _flaky_insert(p):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise gcal_client.GcalAPIError("auth expired")
+            raise gcal_client.GcalEventExistsError("exists")
+
+        monkeypatch.setattr(gcal_client, "insert_event", _flaky_insert)
+        monkeypatch.setattr(gcal_client, "patch_event", lambda eid, p: {"id": eid})
+
+        state = _StateStub(
+            _COMPLETION_PLAN,
+            {"2026-05-09": [{"date": "2026-05-09", "type": "easy", "miles": 8.0}]},
+        )
+        first = sync.mark_complete(state, date(2026, 5, 9))
+        assert first["prescribed"]["action"] == "error"
+        assert "pretrain20260509" not in state.gcal_sync
+
+        second = sync.mark_complete(state, date(2026, 5, 9))
+        assert second["prescribed"]["action"] == "patched"
+        assert state.gcal_sync["pretrain20260509"]["completed"] is True
+
     def test_sync_plan_skips_completed_events(self, monkeypatch):
         from google_calendar import client as gcal_client
 
