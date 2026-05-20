@@ -9,18 +9,23 @@ State lives in a single SQLite database (`$DATABASE_PATH`, default `state/coach.
 
 ---
 
-## Table index
+## Table index (schema v5)
 
-| Table | Replaces (legacy file) | Format | Writer | Reader(s) |
-|---|---|---|---|---|
-| `athlete` | `athlete.yaml` | YAML text in `yaml_text` column (round-trip via ruamel) | `tools.state.update_athlete` | `StateManager.load_athlete`, all tools |
-| `plan` | `plan.md` | Markdown text in `content` column (freeform + locked weekly table) | `tools.state.update_plan` | `StateManager.load_plan`, `get_todays_workout` parser |
-| `sessions` | `log.jsonl` | One row per session; full original JSON entry in `data` column. `date` + `type` indexed; partial UNIQUE index on `details.strava_id`. | `StateManager.append_session` (via `tools.state.log_session`, `strava.handler`, `strava_backfill`) | `StateManager.get_recent_sessions`, `get_sessions_in_range`, `existing_strava_ids`; `tools.fitness.get_fitness_summary` |
-| `journal` | `journal.md` | Markdown text in `content` column, timestamped sections separated by `\n---\n` | `StateManager.append_journal` (via `tools.state.append_journal`) | `StateManager.load_journal` (last N entries) |
-| `plan_changelog` | `plan_changelog.md` | Markdown text in `content` column, one line per `update_plan` call | `StateManager.update_plan` (automatic) | Read by humans / agent on demand; not parsed |
-| `gcal_sync_state` | `.gcal_sync_state.json` | Normalized: one row per gcal `event_id` with `hash`, `last_synced_at`, `completed`, `last_completed_at`, `off_plan` | `google_calendar.sync.sync_plan` / `mark_complete` (via `StateManager.save_gcal_sync_state`) | `google_calendar.sync.reconcile_completion`, `get_last_sync_summary` |
+| Table | Format | Writer | Reader(s) |
+|---|---|---|---|
+| `athlete` | YAML text in `yaml_text` column (round-trip via ruamel) | `tools.state.update_athlete` | `StateManager.load_athlete`, all tools |
+| `sessions` | **Unified plan-as-rows.** One row per workout in a lifecycle state — `planned` / `completed` / `missed` / `off-plan`. `prescribed_workout`, `prescribed_pace`, `prescribed_notes`, `detail_md` carry what the plan asked for; `data` JSON carries the actuals once the workout is logged. `UNIQUE(date, slot)` keeps one prescription per slot; partial UNIQUE index on `details.strava_id` enforces webhook idempotency. | `StateManager.update_plan` / `update_workout` / `replace_week_table` / `reconcile_strava_activity` / `update_session_by_strava_id` | `get_workout_row`, `get_todays_workout`, `get_prescription_rows`, `get_recent_sessions`, `get_sessions_in_range`, `existing_strava_ids`; `google_calendar.sync`; `notion.mirror` |
+| `plan_meta` | Singleton row holding plan prose (phases, goal, pace zones, adjustment triggers) — the non-row remainder of the legacy plan.md. | `StateManager.update_plan_meta` (also written by `update_plan`) | `get_plan_meta`, `render_plan` (system prompt) |
+| `plan_changelog` | Singleton row holding append-only changelog (one line per write). | `StateManager._append_changelog` (called by every plan writer) | Read by humans / agent on demand; not parsed |
+| `journal` | Singleton row holding markdown text; timestamped sections separated by `\n---\n`. | `StateManager.append_journal` | `StateManager.load_journal` (last N entries); `notion.entries.parse_journal_entries` for the mirror |
+| `reviews` | One row per post-activity LLM review — `session_id` (FK), `strava_id`, `date`, `critique`, `proposed_change` (JSON), `status` (NULL = Pending; `approved`/`rejected`/`expired`/`no-op` on resolution), `resolved_at`. | `StateManager.save_review` (via `strava.review.run_post_activity_review`) | `get_reviews_in_range`, `get_all_reviews`; `notion.mirror.mirror_review` |
+| `gcal_sync_state` | One row per gcal `event_id` with `hash`, `last_synced_at`, `completed`, `last_completed_at`, `off_plan`. | `google_calendar.sync.sync_plan` / `mark_complete` (via `StateManager.save_gcal_sync_state`) | `google_calendar.sync.reconcile_completion`, `get_last_sync_summary` |
 
-Note the legacy `state/*.{md,yaml,jsonl,json}` files are kept committed as **migration seeds only** — `scripts/migrate_state_to_sqlite.py` reads them once to populate `coach.db`. They are not the runtime source of truth.
+Schema source of truth: [`state/schema.sql`](../state/schema.sql). Schema version is tracked in `schema_version`.
+
+**Migrations.** v3 → v4 is the Phase 1A cutover (plan blob → unified `sessions` rows) — runs once via `scripts/cutover_to_unified_sessions.py`, invoked from `gunicorn.conf.py:on_starting` before workers serve traffic. v4 → v5 (adds `reviews`) is purely additive and lands the next time `_ensure_schema` re-runs `schema.sql`. The legacy `state/*.{md,yaml,jsonl,json}` files in the repo are pre-cutover migration seeds for first-time setup; once the DB is populated they aren't read at runtime.
+
+**Notion mirror.** Every write into `sessions`, `journal`, `plan_changelog`, or `reviews` fires a daemon-thread upsert into the matching Notion database (when `NOTION_TOKEN` is configured). SQLite stays authoritative; the mirror is one-way and best-effort. See [README.md → Notion mirror](../README.md#notion-mirror) and `notion/mirror.py`.
 
 ---
 
@@ -105,50 +110,34 @@ Per-effort pace targets. The agent reads these to write prescriptions. Range str
 
 ---
 
-## `plan.md`
+## Plan: `sessions` rows + `plan_meta`
 
-Freeform markdown. Two sections are special:
+Pre-cutover the plan was a single markdown blob; v4 split it into two tables.
 
-### Locked "This Week" table (CRITICAL — `get_todays_workout` parses this)
+### `sessions` (prescription rows)
 
-Heading flexible; the table itself must match this format exactly:
+The bot's prescription for a given day lives in the `sessions` row(s) on that date with a non-null `prescribed_workout`. The agent never re-parses a markdown table — `get_todays_workout(date)` is `SELECT * FROM sessions WHERE date = ? AND prescribed_workout IS NOT NULL ORDER BY slot`. The locked `| Day | Date | Workout | Pace target | Notes |` format still exists for one purpose: `update_plan(markdown, …)` (the escape-hatch tool) parses it via `plan_markdown.parse_plan_rows` to build new `planned` rows. For day-to-day edits, prefer `update_workout` (single row) or `replace_week_table` (a week of rows).
 
-```markdown
-| Day | Date | Workout | Pace target | Notes |
-|-----|------|---------|-------------|-------|
-| Fri | 2026-05-08 | Rest + gentle yoga PM 30-40min | — | Hip/hamstring focus |
-| Sat | 2026-05-09 | Easy 8mi STRICT | 8:30-9:00, HR ≤155 | Cut from 9-10mi… |
-```
+`plan_markdown.parse_plan_rows` requires:
+- Pipe-delimited rows with at least 5 cells (Day, Date, Workout, Pace target, Notes)
+- Date column matches `YYYY-MM-DD` exactly
+- Rows with empty / `—` / `-` Workout are skipped
 
-Parser (`state_manager.py:_find_workout_row`) requires:
-- Pipe-delimited rows with 5 cells: Day, Date, Workout, Pace target, Notes
-- Date column matches `YYYY-MM-DD` (preferred) OR `M/D`
-- Empty cells use `—` or empty string; never delete the cell separator
+Per-day rich detail (race-day pacing tables, workout structure, execution cues) lives in `sessions.detail_md` on the same row — the calendar sync uses it verbatim as the event description. The legacy `#### YYYY-MM-DD` anchor inside a markdown plan is parsed into `detail_md` by `plan_markdown.parse_workout_details`.
 
-Other weeks in the doc are freeform — the parser only looks for today's row in any pipe-delimited block.
+### `plan_meta` (plan prose)
 
-### "Recent Plan Adjustments" section
+Singleton row. Contains the prose that doesn't belong in a checklist — phases, goals, pace zones, adjustment triggers, target paces / HR zones, race-week protocols. Loaded into every system prompt by `render_plan()`. Edit via `update_plan_meta(content, change_note)` or wholesale via `update_plan(markdown, change_note)` (which fills both `plan_meta` and `sessions`).
 
-By convention, every `update_plan` call should append a dated line. Format:
+### `plan_changelog`
 
-```markdown
-- 2026-05-08: <one-line reason for the change>
-```
-
-Not strictly enforced; the `plan_changelog.md` file is the immutable backup.
-
-### Sections by convention (not enforced)
-
-- `## Active Goals` — bulleted summary of target races
-- `## Phase N — <name>` — per-phase narrative
-- `## Adjustment Triggers (How the Coach Adapts)` — rule set the agent applies when adapting the plan. Currently lives in plan.md so it's loaded into every system prompt.
-- `## Reference` — paces, HR zones, race-week strength protocol, fixed calendar conflicts
+Singleton; one line per write. `_append_changelog` is called automatically by `update_plan`, `update_plan_meta`, `update_workout`, `replace_week_table`, and the matched-completion branch of `reconcile_strava_activity`. Each writer also captures a before/after snapshot and passes it to the Notion `PRE Plan Changes` mirror as the page body. The blob itself doesn't carry the snapshots — only the timestamps and notes.
 
 ---
 
-## `log.jsonl`
+## Session JSON shape (lives in `sessions.data`)
 
-Append-only. One JSON object per line. The shape standardizes top-level queryable fields; type-specific extras live in `details`.
+The JSON shape below is what every logged session carries in the `sessions.data` column. Strava webhooks and manual `log_session` calls produce it via `reconcile_strava_activity`. The shape standardizes top-level queryable fields; type-specific extras live in `details`.
 
 ### Required top-level fields
 
@@ -241,7 +230,7 @@ Common patterns observed:
 
 ---
 
-## `journal.md`
+## `journal` (singleton blob)
 
 Append-only, timestamped. Structure:
 
@@ -263,24 +252,14 @@ Append-only freeform notes. Newest entries at the bottom.
 <next entry body>
 ```
 
-- Header line is exactly `## YYYY-MM-DD HH:MM` (24-hour, local timezone).
+- Header line is exactly `## YYYY-MM-DD HH:MM:SS` (24-hour, local timezone). Second precision is load-bearing — it's the Notion mirror's source_key, and two entries with the same `## ` header would collapse onto one Notion page.
 - Entries separated by `\n---\n`.
 - Body is free text. The agent passes body only (no date/header in the text it submits) — `append_journal` prepends the timestamp.
 - `StateManager.load_journal(max_entries=N)` returns the last N entries (preamble + last N sections).
+- The Notion mirror parses this blob into per-entry dicts via `notion.entries.parse_journal_entries` and upserts a Notion page per entry, keyed on `jid:{title}`.
 
 ---
 
-## `plan_changelog.md`
-
-Append-only audit log. One line per `update_plan` call. Format:
-
-```markdown
-- 2026-05-08T20:42:13: <change_reason from the tool call>
-```
-
-Automatic — written by `StateManager.update_plan`. The agent doesn't touch this file directly.
-
----
 
 ## Schema evolution guidelines
 
@@ -288,8 +267,9 @@ When the agent (or a human) wants to add fields:
 
 1. **Add to optional first.** Required fields are validated at parse time and may break readers.
 2. **Use `details.*` for type-specific richness** rather than top-level fields — keeps the queryable surface small.
-3. **Never change the locked plan-table format** without updating both `state_manager.py:_find_workout_row` and the tool description in `tools/state.py`.
+3. **The locked plan-table format is still load-bearing for `update_plan`** — its `plan_markdown.parse_plan_rows` is how the escape-hatch tool turns full-markdown proposals (e.g. from `strava.review.run_post_activity_review`) into `sessions` rows. Changing the format means updating `plan_markdown.py` and every tool description that mentions it.
 4. **Lists in `athlete.yaml` REPLACE on merge** (per `update_athlete` semantics). To add to a list, include the full new list in the tool call.
+5. **`sessions.status` is checked at the DB level** — see `state/schema.sql`. To add a new lifecycle state (e.g. `deferred`), update the CHECK constraint *and* the Notion `Status` select options in `notion/schema.py:SESSIONS_PROPERTIES`.
 
 When state shapes drift in production:
 - `python scripts/state_dump.py log` to inspect recent sessions (or `--all` for everything).

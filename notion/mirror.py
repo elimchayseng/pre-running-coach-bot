@@ -50,6 +50,10 @@ def plan_changes_enabled() -> bool:
     return bool(os.getenv("NOTION_TOKEN") and os.getenv("NOTION_PLAN_CHANGES_DS_ID"))
 
 
+def reviews_enabled() -> bool:
+    return bool(os.getenv("NOTION_TOKEN") and os.getenv("NOTION_REVIEWS_DS_ID"))
+
+
 # ---------- property-value builders ----------
 #
 # Every builder always emits its property (even for an empty source value) so
@@ -100,6 +104,10 @@ def plan_change_source_key(entry: dict) -> str:
     return "cid:" + (entry.get("timestamp") or "").strip()
 
 
+def review_source_key(row: dict) -> str:
+    return f"rid:{row.get('id')}"
+
+
 def _journal_properties(entry: dict, source_key: str) -> dict:
     return {
         "Title": _title(entry.get("title") or "(entry)"),
@@ -124,6 +132,23 @@ def _plan_change_properties(entry: dict, source_key: str) -> dict:
         # Triggered-by relation needs the changelog to track which session
         # caused each change — deferred (the changelog blob doesn't carry it).
         "Triggered by": _relation(None),
+        schema.SOURCE_KEY: _rich(source_key),
+    }
+
+
+def _review_properties(row: dict, source_key: str, session_page_id: Optional[str] = None) -> dict:
+    """Map a SQLite reviews row to PRE Reviews Notion properties.
+
+    ``session_page_id`` is the Notion Sessions page id for the related
+    session row; looked up by the mirror via ``sid:<session_id>`` source_key.
+    Left empty when the session hasn't been mirrored yet (the next review
+    upsert will fill the relation if the page exists by then).
+    """
+    return {
+        "Title": _title(f"{row['date']} review"),
+        "Date": _date_prop(row.get("date")),
+        "Status": _select(row.get("status")),
+        "Session": _relation([session_page_id] if session_page_id else None),
         schema.SOURCE_KEY: _rich(source_key),
     }
 
@@ -205,6 +230,36 @@ def _upsert_plan_change(entry: dict, client: NotionClient) -> None:
             client.create_page(data_source_id, props, markdown=body or None)
 
 
+def _upsert_review(row: dict, client: NotionClient) -> None:
+    """Insert or update the PRE Reviews page for one SQLite review row.
+
+    Looks up the related Sessions page via ``sid:<session_id>`` to set the
+    Session relation. If the session hasn't been mirrored yet (race against
+    the post-activity fire-and-forget chain), the relation is left empty —
+    the next review upsert (e.g. on resolution) will fill it in.
+    """
+    from .markdown import render_review_body
+
+    data_source_id = os.environ["NOTION_REVIEWS_DS_ID"]
+    source_key = review_source_key(row)
+    sessions_ds = os.getenv("NOTION_SESSIONS_DS_ID")
+    session_page_id = (
+        _query_page_id(client, sessions_ds, f"sid:{row['session_id']}")
+        if sessions_ds and row.get("session_id") is not None
+        else None
+    )
+    props = _review_properties(row, source_key, session_page_id=session_page_id)
+    body = render_review_body(row.get("critique"), row.get("proposed_change"))
+    with _upsert_lock:
+        page_id = _query_page_id(client, data_source_id, source_key)
+        if page_id:
+            client.update_page(page_id, properties=props)
+            if body:
+                client.replace_page_markdown(page_id, body)
+        else:
+            client.create_page(data_source_id, props, markdown=body or None)
+
+
 def _upsert_session(row: dict, client: NotionClient) -> None:
     """Insert or update the PRE Sessions page for one SQLite session row.
 
@@ -266,6 +321,18 @@ def mirror_plan_changes(entries: list[dict]) -> None:
         _spawn(_mirror_plan_change_batch, entries)
 
 
+def mirror_review(row: dict) -> None:
+    """Mirror one review row to Notion in a daemon thread (best-effort)."""
+    if row and reviews_enabled():
+        _spawn(_mirror_review_batch, [row])
+
+
+def mirror_reviews(rows: list[dict]) -> None:
+    rows = [r for r in (rows or []) if r]
+    if rows and reviews_enabled():
+        _spawn(_mirror_review_batch, rows)
+
+
 def _mirror_batch(rows: list[dict]) -> None:
     client = NotionClient()
     for row in rows:
@@ -291,6 +358,15 @@ def _mirror_plan_change_batch(entries: list[dict]) -> None:
             _upsert_plan_change(e, client)
         except Exception as ex:  # noqa: BLE001
             logger.warning("Notion mirror failed for plan change %r: %s", e.get("timestamp"), ex)
+
+
+def _mirror_review_batch(rows: list[dict]) -> None:
+    client = NotionClient()
+    for r in rows:
+        try:
+            _upsert_review(r, client)
+        except Exception as ex:  # noqa: BLE001
+            logger.warning("Notion mirror failed for review id=%s: %s", r.get("id"), ex)
 
 
 def _spawn(fn: Any, *args: Any) -> None:
