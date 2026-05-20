@@ -126,7 +126,9 @@ def build_system_prompt(state: StateManager) -> str:
             "- One quality session does not justify a zone change. Adjust on trends only.",
             "- When the user reports anything affecting readiness today, reassess today's prescription.",
             "  If you modify it, call update_workout with the change reason (single-day edit).",
-            "- Priority A race is Broken Arrow 46K (June 20). Brooklyn is a tune-up — don't over-cook it.",
+            "- Race focus comes from `target_races` in the athlete profile above: priority A is"
+            " the goal race for this cycle, priority B is a tune-up / sharpener / fun race."
+            " Don't over-cook a B race or treat it as the focus when an A race is on the calendar.",
             "- Surface trade-offs explicitly. Don't silently change the plan; explain reasoning.",
             "- If a pending plan proposal is shown above and the user confirms ('yes', 'apply', 'do it'),"
             " call update_plan with the proposed new_plan_md and the proposal's reason as change_reason"
