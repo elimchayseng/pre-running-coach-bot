@@ -181,6 +181,92 @@ class TestEnabled:
         mirror.mirror_session(_row())
         assert called == []  # disabled → no thread spawned
 
+    def test_per_db_gates_independent(self, monkeypatch):
+        """Journal and Plan Changes each gate on their own DS id so a
+        partially-configured workspace mirrors just what's wired."""
+        monkeypatch.setenv("NOTION_TOKEN", "ntn_x")
+        monkeypatch.delenv("NOTION_SESSIONS_DS_ID", raising=False)
+        monkeypatch.setenv("NOTION_JOURNAL_DS_ID", "ds-j")
+        monkeypatch.delenv("NOTION_PLAN_CHANGES_DS_ID", raising=False)
+        assert mirror.enabled() is False
+        assert mirror.journal_enabled() is True
+        assert mirror.plan_changes_enabled() is False
+
+
+# ---------------- journal mirror ----------------
+
+
+def _j(**over) -> dict:
+    base = {"title": "2026-05-19 12:00:00", "date": "2026-05-19", "body": "felt great"}
+    base.update(over)
+    return base
+
+
+class TestJournalMirror:
+    def test_source_key_uses_title(self):
+        assert mirror.journal_source_key(_j(title="A header")) == "jid:A header"
+
+    def test_properties_shape(self):
+        props = mirror._journal_properties(_j(), "jid:k")
+        assert props["Title"]["title"][0]["text"]["content"] == "2026-05-19 12:00:00"
+        assert props["Date"] == {"date": {"start": "2026-05-19"}}
+        assert props["Tags"] == {"multi_select": []}
+        assert props[mirror.schema.SOURCE_KEY]["rich_text"][0]["text"]["content"] == "jid:k"
+
+    def test_date_none_clears(self):
+        assert mirror._journal_properties(_j(date=None), "jid:k")["Date"] == {"date": None}
+
+    def test_insert_when_no_existing(self, monkeypatch):
+        monkeypatch.setenv("NOTION_JOURNAL_DS_ID", "ds-j")
+        client = _FakeClient(existing_page_id=None)
+        mirror._upsert_journal_entry(_j(body="hello"), client)
+        assert client.created[0]["markdown"] == "hello"
+        assert client.updated == []
+
+    def test_update_when_page_exists(self, monkeypatch):
+        monkeypatch.setenv("NOTION_JOURNAL_DS_ID", "ds-j")
+        client = _FakeClient(existing_page_id="page-j")
+        mirror._upsert_journal_entry(_j(body="updated body"), client)
+        assert client.updated[0]["page_id"] == "page-j"
+        assert client.markdown_patched[0] == {"page_id": "page-j", "markdown": "updated body"}
+
+
+# ---------------- plan-change mirror ----------------
+
+
+def _c(**over) -> dict:
+    base = {"timestamp": "2026-05-19T12:00:00", "note": "Added yoga", "action": "planned-edit"}
+    base.update(over)
+    return base
+
+
+class TestPlanChangeMirror:
+    def test_source_key_uses_timestamp(self):
+        assert mirror.plan_change_source_key(_c()) == "cid:2026-05-19T12:00:00"
+
+    def test_properties_shape(self):
+        props = mirror._plan_change_properties(_c(), "cid:k")
+        assert props["Date"] == {"date": {"start": "2026-05-19"}}
+        assert props["Action"] == {"select": {"name": "planned-edit"}}
+        assert props["Reason"]["rich_text"][0]["text"]["content"] == "Added yoga"
+        assert props["Triggered by"] == {"relation": []}
+
+    def test_insert_when_no_existing(self, monkeypatch):
+        monkeypatch.setenv("NOTION_PLAN_CHANGES_DS_ID", "ds-c")
+        client = _FakeClient(existing_page_id=None)
+        mirror._upsert_plan_change(_c(), client)
+        # No markdown body in 1B.3 — before/after diffs need session tracking
+        assert client.created[0]["markdown"] is None
+        assert client.markdown_patched == []
+
+    def test_update_skips_markdown_patch(self, monkeypatch):
+        """Plan Changes pages don't carry a body — update touches properties only."""
+        monkeypatch.setenv("NOTION_PLAN_CHANGES_DS_ID", "ds-c")
+        client = _FakeClient(existing_page_id="page-c")
+        mirror._upsert_plan_change(_c(), client)
+        assert client.updated[0]["page_id"] == "page-c"
+        assert client.markdown_patched == []
+
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))

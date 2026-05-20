@@ -37,9 +37,17 @@ _upsert_lock = threading.Lock()
 
 
 def enabled() -> bool:
-    """True when the mirror is fully configured. Every public entry point
+    """Sessions mirror is fully configured. Every Sessions entry point
     short-circuits on this, so the bot runs untouched without Notion."""
     return bool(os.getenv("NOTION_TOKEN") and os.getenv("NOTION_SESSIONS_DS_ID"))
+
+
+def journal_enabled() -> bool:
+    return bool(os.getenv("NOTION_TOKEN") and os.getenv("NOTION_JOURNAL_DS_ID"))
+
+
+def plan_changes_enabled() -> bool:
+    return bool(os.getenv("NOTION_TOKEN") and os.getenv("NOTION_PLAN_CHANGES_DS_ID"))
 
 
 # ---------- property-value builders ----------
@@ -67,6 +75,57 @@ def _number(value: Any) -> dict:
 
 def _url(value: Optional[str]) -> dict:
     return {"url": value or None}
+
+
+def _date_prop(value: Optional[str]) -> dict:
+    return {"date": {"start": value} if value else None}
+
+
+def _multi_select(values: Optional[list]) -> dict:
+    return {"multi_select": [{"name": str(v)} for v in (values or [])]}
+
+
+def _relation(page_ids: Optional[list]) -> dict:
+    return {"relation": [{"id": pid} for pid in (page_ids or [])]}
+
+
+def journal_source_key(entry: dict) -> str:
+    """Stable id for a journal entry. Keys on the ``## header`` text since
+    journal entries aren't yet rows with ids in SQLite. As long as the
+    runner doesn't rewrite the header line, the key stays stable."""
+    return "jid:" + (entry.get("title") or "").strip()
+
+
+def plan_change_source_key(entry: dict) -> str:
+    return "cid:" + (entry.get("timestamp") or "").strip()
+
+
+def _journal_properties(entry: dict, source_key: str) -> dict:
+    return {
+        "Title": _title(entry.get("title") or "(entry)"),
+        "Date": _date_prop(entry.get("date")),
+        # Sleep / Stress / Tags would require body parsing — left empty for
+        # 1B.3 so the mirror stays a faithful, conservative reflection.
+        "Sleep hours": _number(None),
+        "Stress": _select(None),
+        "Tags": _multi_select(None),
+        schema.SOURCE_KEY: _rich(source_key),
+        "sqlite_id": _rich(None),  # placeholder for the eventual row-ified journal
+    }
+
+
+def _plan_change_properties(entry: dict, source_key: str) -> dict:
+    ts = entry.get("timestamp") or ""
+    return {
+        "Title": _title(ts or "(change)"),
+        "Date": _date_prop(ts[:10] if ts else None),
+        "Action": _select(entry.get("action") or "planned-edit"),
+        "Reason": _rich(entry.get("note")),
+        # Triggered-by relation needs the changelog to track which session
+        # caused each change — deferred (the changelog blob doesn't carry it).
+        "Triggered by": _relation(None),
+        schema.SOURCE_KEY: _rich(source_key),
+    }
 
 
 def _session_properties(row: dict, source_key: str) -> dict:
@@ -107,6 +166,36 @@ def _query_page_id(client: NotionClient, data_source_id: str, source_key: str) -
     return results[0]["id"] if results else None
 
 
+def _upsert_journal_entry(entry: dict, client: NotionClient) -> None:
+    """Insert or update the PRE Journal page for one journal entry.
+    Serialized via ``_upsert_lock`` to keep concurrent mirrors race-free."""
+    data_source_id = os.environ["NOTION_JOURNAL_DS_ID"]
+    source_key = journal_source_key(entry)
+    props = _journal_properties(entry, source_key)
+    body = (entry.get("body") or "").strip()
+    with _upsert_lock:
+        page_id = _query_page_id(client, data_source_id, source_key)
+        if page_id:
+            client.update_page(page_id, properties=props)
+            client.replace_page_markdown(page_id, body)
+        else:
+            client.create_page(data_source_id, props, markdown=body or None)
+
+
+def _upsert_plan_change(entry: dict, client: NotionClient) -> None:
+    """Insert or update the PRE Plan Changes page for one changelog entry.
+    No body in 1B.3 (before/after fenced diffs need write-time row tracking)."""
+    data_source_id = os.environ["NOTION_PLAN_CHANGES_DS_ID"]
+    source_key = plan_change_source_key(entry)
+    props = _plan_change_properties(entry, source_key)
+    with _upsert_lock:
+        page_id = _query_page_id(client, data_source_id, source_key)
+        if page_id:
+            client.update_page(page_id, properties=props)
+        else:
+            client.create_page(data_source_id, props)
+
+
 def _upsert_session(row: dict, client: NotionClient) -> None:
     """Insert or update the PRE Sessions page for one SQLite session row.
 
@@ -133,15 +222,39 @@ def _upsert_session(row: dict, client: NotionClient) -> None:
 
 def mirror_session(row: dict) -> None:
     """Mirror one session row to Notion in a daemon thread (best-effort)."""
-    if row:
+    if row and enabled():
         _spawn(_mirror_batch, [row])
 
 
 def mirror_sessions(rows: list[dict]) -> None:
     """Mirror several session rows to Notion in one daemon thread."""
     rows = [r for r in (rows or []) if r]
-    if rows:
+    if rows and enabled():
         _spawn(_mirror_batch, rows)
+
+
+def mirror_journal_entry(entry: dict) -> None:
+    """Mirror one journal entry to Notion in a daemon thread (best-effort)."""
+    if entry and journal_enabled():
+        _spawn(_mirror_journal_batch, [entry])
+
+
+def mirror_journal_entries(entries: list[dict]) -> None:
+    entries = [e for e in (entries or []) if e]
+    if entries and journal_enabled():
+        _spawn(_mirror_journal_batch, entries)
+
+
+def mirror_plan_change(entry: dict) -> None:
+    """Mirror one changelog entry to Notion in a daemon thread (best-effort)."""
+    if entry and plan_changes_enabled():
+        _spawn(_mirror_plan_change_batch, [entry])
+
+
+def mirror_plan_changes(entries: list[dict]) -> None:
+    entries = [e for e in (entries or []) if e]
+    if entries and plan_changes_enabled():
+        _spawn(_mirror_plan_change_batch, entries)
 
 
 def _mirror_batch(rows: list[dict]) -> None:
@@ -153,9 +266,25 @@ def _mirror_batch(rows: list[dict]) -> None:
             logger.warning("Notion mirror failed for session id=%s: %s", row.get("id"), e)
 
 
+def _mirror_journal_batch(entries: list[dict]) -> None:
+    client = NotionClient()
+    for e in entries:
+        try:
+            _upsert_journal_entry(e, client)
+        except Exception as ex:  # noqa: BLE001
+            logger.warning("Notion mirror failed for journal entry %r: %s", e.get("title"), ex)
+
+
+def _mirror_plan_change_batch(entries: list[dict]) -> None:
+    client = NotionClient()
+    for e in entries:
+        try:
+            _upsert_plan_change(e, client)
+        except Exception as ex:  # noqa: BLE001
+            logger.warning("Notion mirror failed for plan change %r: %s", e.get("timestamp"), ex)
+
+
 def _spawn(fn: Any, *args: Any) -> None:
-    if not enabled():
-        return
     threading.Thread(target=_guard, args=(fn, *args), daemon=True).start()
 
 
