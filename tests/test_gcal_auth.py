@@ -276,3 +276,32 @@ class TestSetupScriptOobFlow:
         # The printed URL must carry the OOB redirect_uri (URL-encoded).
         out = capsys.readouterr().out
         assert "urn%3Aietf%3Awg%3Aoauth%3A2.0%3Aoob" in out
+
+    def test_oob_rejection_emits_deprecation_hint(self, monkeypatch, capsys):
+        """When Google's token endpoint returns 400 + invalid_request on an OOB
+        exchange (the deprecation signature), the script must surface a clear
+        hint pointing at the listener flow as the fallback before re-raising.
+        """
+        mod = self._import_script()
+        monkeypatch.setenv("GCAL_CLIENT_ID", "cid")
+        monkeypatch.setenv("GCAL_CLIENT_SECRET", "secret")
+
+        # Mock the HTTP layer: requests.post returns a 400 with the
+        # deprecation-signature error body Google emits for OOB.
+        import requests as _requests
+
+        class _Resp:
+            status_code = 400
+            text = '{"error": "invalid_request", "error_description": "OOB is deprecated"}'
+
+            def json(self):
+                return {"error": "invalid_request", "error_description": "OOB is deprecated"}
+
+        monkeypatch.setattr(_requests, "post", lambda *a, **kw: _Resp())
+
+        rc = mod._exchange_and_report("any-code", mod.OOB_REDIRECT_URI)
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "Google rejected the OOB redirect_uri" in err
+        assert "deprecated" in err
+        assert "127.0.0.1" in err

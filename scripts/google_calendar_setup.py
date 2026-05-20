@@ -66,6 +66,12 @@ REDIRECT_URI = f"http://{LOOPBACK_HOST}:{LOOPBACK_PORT}/"
 # pastes it into the terminal. Used by the --no-listener / --code flow for
 # container shells (e.g. `railway shell`) where the loopback redirect can't
 # work because the browser runs on the laptop, not the container.
+#
+# Deprecation note: Google announced the deprecation of the OOB redirect
+# (urn:ietf:wg:oauth:2.0:oob) on 2022-10-03, and newer OAuth Desktop clients
+# may reject it with HTTP 400 invalid_request at the token endpoint. If that
+# happens, the fallback is the default listener flow (run `auth` without
+# --no-listener / --code) from a host that can reach 127.0.0.1.
 OOB_REDIRECT_URI = "urn:ietf:wg:oauth:2.0:oob"
 SCOPE = "https://www.googleapis.com/auth/calendar.events"
 AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
@@ -153,6 +159,16 @@ def _exchange_and_report(code: str, redirect_uri: str) -> int:
         auth.exchange_code_for_tokens(code, redirect_uri)
     except Exception as e:
         print(f"\nAuth failed: {e}", file=sys.stderr)
+        # OOB redirect was deprecated 2022-10-03; newer Desktop OAuth clients
+        # reject it at the token endpoint with HTTP 4xx + error=invalid_request.
+        msg = str(e)
+        if redirect_uri == OOB_REDIRECT_URI and "invalid_request" in msg and "400" in msg:
+            print(
+                "\nHint: Google rejected the OOB redirect_uri. This auth method "
+                "is deprecated. Run without --no-listener from a host that can "
+                "reach 127.0.0.1, or use a PKCE loopback flow.",
+                file=sys.stderr,
+            )
         print(
             "\nCommon causes:\n"
             "  - GCAL_CLIENT_SECRET is wrong\n"
