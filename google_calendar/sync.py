@@ -30,12 +30,24 @@ import hashlib
 import json
 import logging
 import re
+import threading
 from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
 from temporal_context import today_local
 
 logger = logging.getLogger("pre_coach.gcal.sync")
+
+# Serializes every load → mutate → save against ``gcal_sync_state``. Two
+# writers exist today: ``sync_plan`` (often invoked from the auto-sync
+# daemon thread that watches plan.md) and ``mark_complete`` (fired from
+# the Strava webhook thread after a log entry lands). Without this lock,
+# their load-modify-save sequences can interleave and silently drop
+# updates — e.g. webhook reads, sync_plan reads, webhook writes
+# completion, sync_plan writes its (now-stale) snapshot, completion is
+# lost. The lock is module-level because the StateManager is recreated
+# per call site, so per-instance locks wouldn't actually serialize them.
+_SYNC_STATE_LOCK = threading.Lock()
 
 # Sync window for prune (centered on today). 60 days each side covers any
 # realistic plan horizon while staying well under the 2500-events page cap.
@@ -68,106 +80,117 @@ def sync_plan(state, dry_run: bool = False) -> dict:
         today - timedelta(days=PRUNE_WINDOW_DAYS),
         today + timedelta(days=PRUNE_WINDOW_DAYS),
     )
-    sync_state = _load_sync_state(state)
-    new_sync_state: dict[str, dict] = {}
+    # Hold the sync-state lock across the entire load → mutate → save
+    # sequence so a concurrent ``mark_complete`` call (e.g. from the
+    # Strava webhook thread) can't squeeze its own write in between our
+    # load and our save and get its ``completed: true`` clobbered by
+    # our stale snapshot. The gcal API calls happen inside the lock —
+    # intentional, since ``new_sync_state`` is built up incrementally as
+    # we go and must be the only mutation source between load and save.
+    # ``reconcile_completion`` is kept outside the lock because it calls
+    # ``mark_complete`` recursively, which would deadlock under a
+    # non-reentrant ``threading.Lock``.
+    with _SYNC_STATE_LOCK:
+        sync_state = _load_sync_state(state)
+        new_sync_state: dict[str, dict] = {}
 
-    counts = {"inserted": 0, "patched": 0, "deleted": 0, "unchanged": 0}
-    errors: list[dict] = []
-    synced_dates: set[str] = set()
+        counts = {"inserted": 0, "patched": 0, "deleted": 0, "unchanged": 0}
+        errors: list[dict] = []
+        synced_dates: set[str] = set()
 
-    from . import client
+        from . import client
 
-    for srow in rows:
-        row = _plan_dict(srow)
-        event_id = _event_id(row["date"])
-        synced_dates.add(row["date"])
-        try:
-            payload, payload_hash = _build_event_payload(row, event_id, srow.get("detail_md"))
-        except Exception as e:
-            errors.append({"date": row["date"], "error": f"payload_build: {e}"})
-            continue
-
-        prior = sync_state.get(event_id)
-        # Completed events are owned by mark_complete from here on — the local
-        # sync_state carries `completed: true` so we don't roll back the ✅
-        # prefix, graphite color, or actuals block. The hash may differ if the
-        # plan row was edited after completion; we still skip (the event has
-        # already happened).
-        if prior and prior.get("completed"):
-            counts["unchanged"] += 1
-            new_sync_state[event_id] = prior
-            continue
-        if prior and prior.get("hash") == payload_hash:
-            counts["unchanged"] += 1
-            new_sync_state[event_id] = prior
-            continue
-
-        if dry_run:
-            action = "would_patch" if prior else "would_insert"
-            logger.info("[dry-run] %s %s (%s)", action, event_id, row["date"])
-            counts["patched" if prior else "inserted"] += 1
-            new_sync_state[event_id] = {"hash": payload_hash, "last_synced_at": _now_iso()}
-            continue
-
-        try:
+        for srow in rows:
+            row = _plan_dict(srow)
+            event_id = _event_id(row["date"])
+            synced_dates.add(row["date"])
             try:
-                client.insert_event(payload)
-                counts["inserted"] += 1
-            except client.GcalEventExistsError:
-                # id collision: patch the existing event instead
-                patch_payload = {k: v for k, v in payload.items() if k != "id"}
-                client.patch_event(event_id, patch_payload)
-                counts["patched"] += 1
-            new_sync_state[event_id] = {"hash": payload_hash, "last_synced_at": _now_iso()}
-        except Exception as e:
-            errors.append({"date": row["date"], "error": f"{type(e).__name__}: {e}"})
-            # Preserve any prior state for this id so a transient failure
-            # doesn't cause us to forget the hash.
-            if prior:
+                payload, payload_hash = _build_event_payload(row, event_id, srow.get("detail_md"))
+            except Exception as e:
+                errors.append({"date": row["date"], "error": f"payload_build: {e}"})
+                continue
+
+            prior = sync_state.get(event_id)
+            # Completed events are owned by mark_complete from here on — the local
+            # sync_state carries `completed: true` so we don't roll back the ✅
+            # prefix, graphite color, or actuals block. The hash may differ if the
+            # plan row was edited after completion; we still skip (the event has
+            # already happened).
+            if prior and prior.get("completed"):
+                counts["unchanged"] += 1
                 new_sync_state[event_id] = prior
+                continue
+            if prior and prior.get("hash") == payload_hash:
+                counts["unchanged"] += 1
+                new_sync_state[event_id] = prior
+                continue
 
-    # Prune: anything pre_managed in the window that we didn't just sync.
-    today = today_local()
-    tmin = _iso_z(today - timedelta(days=PRUNE_WINDOW_DAYS + _PRUNE_TZ_BUFFER_DAYS))
-    tmax = _iso_z(today + timedelta(days=PRUNE_WINDOW_DAYS + _PRUNE_TZ_BUFFER_DAYS))
-    try:
-        managed = client.list_managed_events(tmin, tmax)
-    except Exception as e:
-        errors.append({"date": "prune", "error": f"list_managed: {type(e).__name__}: {e}"})
-        managed = []
+            if dry_run:
+                action = "would_patch" if prior else "would_insert"
+                logger.info("[dry-run] %s %s (%s)", action, event_id, row["date"])
+                counts["patched" if prior else "inserted"] += 1
+                new_sync_state[event_id] = {"hash": payload_hash, "last_synced_at": _now_iso()}
+                continue
 
-    for ev in managed:
-        ev_date = (ev.get("start") or {}).get("date")
-        if not ev_date:
-            continue  # not an all-day event we manage
-        if ev_date in synced_dates:
-            continue
-        # Preserve completed events even when their date is no longer in the
-        # plan (off-plan precomplete events live on dates that have no plan
-        # row, and past prescription events the user later removed from the
-        # plan still represent history).
-        ev_private = (ev.get("extendedProperties") or {}).get("private") or {}
-        if ev_private.get("pre_completed") == "1":
-            continue
-        ev_id = ev.get("id")
-        if not ev_id:
-            continue
-        if dry_run:
-            logger.info("[dry-run] would_delete %s (%s)", ev_id, ev_date)
-            counts["deleted"] += 1
-            continue
+            try:
+                try:
+                    client.insert_event(payload)
+                    counts["inserted"] += 1
+                except client.GcalEventExistsError:
+                    # id collision: patch the existing event instead
+                    patch_payload = {k: v for k, v in payload.items() if k != "id"}
+                    client.patch_event(event_id, patch_payload)
+                    counts["patched"] += 1
+                new_sync_state[event_id] = {"hash": payload_hash, "last_synced_at": _now_iso()}
+            except Exception as e:
+                errors.append({"date": row["date"], "error": f"{type(e).__name__}: {e}"})
+                # Preserve any prior state for this id so a transient failure
+                # doesn't cause us to forget the hash.
+                if prior:
+                    new_sync_state[event_id] = prior
+
+        # Prune: anything pre_managed in the window that we didn't just sync.
+        today = today_local()
+        tmin = _iso_z(today - timedelta(days=PRUNE_WINDOW_DAYS + _PRUNE_TZ_BUFFER_DAYS))
+        tmax = _iso_z(today + timedelta(days=PRUNE_WINDOW_DAYS + _PRUNE_TZ_BUFFER_DAYS))
         try:
-            client.delete_event(ev_id)
-            counts["deleted"] += 1
-            new_sync_state.pop(ev_id, None)
+            managed = client.list_managed_events(tmin, tmax)
         except Exception as e:
-            errors.append({"date": ev_date, "error": f"delete {ev_id}: {type(e).__name__}: {e}"})
+            errors.append({"date": "prune", "error": f"list_managed: {type(e).__name__}: {e}"})
+            managed = []
 
-    if not dry_run:
-        try:
-            _write_sync_state(state, new_sync_state)
-        except Exception as e:
-            errors.append({"date": "sync_state", "error": f"write: {type(e).__name__}: {e}"})
+        for ev in managed:
+            ev_date = (ev.get("start") or {}).get("date")
+            if not ev_date:
+                continue  # not an all-day event we manage
+            if ev_date in synced_dates:
+                continue
+            # Preserve completed events even when their date is no longer in the
+            # plan (off-plan precomplete events live on dates that have no plan
+            # row, and past prescription events the user later removed from the
+            # plan still represent history).
+            ev_private = (ev.get("extendedProperties") or {}).get("private") or {}
+            if ev_private.get("pre_completed") == "1":
+                continue
+            ev_id = ev.get("id")
+            if not ev_id:
+                continue
+            if dry_run:
+                logger.info("[dry-run] would_delete %s (%s)", ev_id, ev_date)
+                counts["deleted"] += 1
+                continue
+            try:
+                client.delete_event(ev_id)
+                counts["deleted"] += 1
+                new_sync_state.pop(ev_id, None)
+            except Exception as e:
+                errors.append({"date": ev_date, "error": f"delete {ev_id}: {type(e).__name__}: {e}"})
+
+        if not dry_run:
+            try:
+                _write_sync_state(state, new_sync_state)
+            except Exception as e:
+                errors.append({"date": "sync_state", "error": f"write: {type(e).__name__}: {e}"})
 
     # Self-heal: walk recent plan rows + log entries and re-fire mark_complete
     # wherever the log shows a session but sync state doesn't yet reflect
@@ -474,57 +497,62 @@ def mark_complete(state, log_date) -> dict:
 
     from . import client
 
-    sync_state = _load_sync_state(state)
     prescribed_id = _event_id(log_date.isoformat())
     offplan_id = _completion_event_id(log_date.isoformat())
 
-    if matching and plan_row:
-        payload = _build_completed_payload(prescribed_id, plan_row, plan_detail, matching, log_date)
-        outcome = _apply_completed_event(client, prescribed_id, payload)
-        result["prescribed"] = outcome
-        # Only stamp the completion sentinel when gcal actually accepted the
-        # write — see #31. Setting completed=True on an error poisoned sync
-        # state and made reconcile permanently skip the date even after the
-        # underlying gcal issue (e.g. expired token) was fixed.
-        if outcome.get("action") in {"inserted", "patched"}:
-            sync_state[prescribed_id] = {
-                **(sync_state.get(prescribed_id) or {}),
-                "completed": True,
-                "last_completed_at": _now_iso(),
-            }
+    # Hold the lock across load → mutate → save so a concurrent
+    # ``sync_plan`` (or another ``mark_complete``) can't read between
+    # our load and save and stomp our completion bits.
+    with _SYNC_STATE_LOCK:
+        sync_state = _load_sync_state(state)
 
-    if off_plan:
-        payload = _build_completed_payload(offplan_id, None, None, off_plan, log_date)
-        outcome = _apply_completed_event(client, offplan_id, payload)
-        result["off_plan"] = outcome
-        if outcome.get("action") in {"inserted", "patched"}:
-            sync_state[offplan_id] = {
-                **(sync_state.get(offplan_id) or {}),
-                "completed": True,
-                "off_plan": True,
-                "last_completed_at": _now_iso(),
-            }
-    else:
-        # No off-plan entries this call. If a precomplete event lingers from a
-        # previous call that mis-classified the same activity (Strava commonly
-        # fires create with a generic sport then update with the proper type
-        # — the first call partitions to off_plan, the second flips matching),
-        # clean it up so the user doesn't end up with a duplicate ✅ event on
-        # the same day.
-        if offplan_id in sync_state:
-            try:
-                client.delete_event(offplan_id)
-                sync_state.pop(offplan_id, None)
-                result["off_plan_cleanup"] = "deleted"
-                logger.info("Deleted stale off-plan event %s", offplan_id)
-            except Exception as e:
-                result["off_plan_cleanup_error"] = f"{type(e).__name__}: {e}"
-                logger.warning("Failed to delete stale off-plan event %s: %s", offplan_id, e)
+        if matching and plan_row:
+            payload = _build_completed_payload(prescribed_id, plan_row, plan_detail, matching, log_date)
+            outcome = _apply_completed_event(client, prescribed_id, payload)
+            result["prescribed"] = outcome
+            # Only stamp the completion sentinel when gcal actually accepted
+            # the write — see #31. Setting completed=True on an error poisoned
+            # sync state and made reconcile permanently skip the date even
+            # after the underlying gcal issue (e.g. expired token) was fixed.
+            if outcome.get("action") in {"inserted", "patched"}:
+                sync_state[prescribed_id] = {
+                    **(sync_state.get(prescribed_id) or {}),
+                    "completed": True,
+                    "last_completed_at": _now_iso(),
+                }
 
-    try:
-        _write_sync_state(state, sync_state)
-    except Exception as e:
-        result["sync_state_error"] = f"{type(e).__name__}: {e}"
+        if off_plan:
+            payload = _build_completed_payload(offplan_id, None, None, off_plan, log_date)
+            outcome = _apply_completed_event(client, offplan_id, payload)
+            result["off_plan"] = outcome
+            if outcome.get("action") in {"inserted", "patched"}:
+                sync_state[offplan_id] = {
+                    **(sync_state.get(offplan_id) or {}),
+                    "completed": True,
+                    "off_plan": True,
+                    "last_completed_at": _now_iso(),
+                }
+        else:
+            # No off-plan entries this call. If a precomplete event lingers from a
+            # previous call that mis-classified the same activity (Strava commonly
+            # fires create with a generic sport then update with the proper type
+            # — the first call partitions to off_plan, the second flips matching),
+            # clean it up so the user doesn't end up with a duplicate ✅ event on
+            # the same day.
+            if offplan_id in sync_state:
+                try:
+                    client.delete_event(offplan_id)
+                    sync_state.pop(offplan_id, None)
+                    result["off_plan_cleanup"] = "deleted"
+                    logger.info("Deleted stale off-plan event %s", offplan_id)
+                except Exception as e:
+                    result["off_plan_cleanup_error"] = f"{type(e).__name__}: {e}"
+                    logger.warning("Failed to delete stale off-plan event %s: %s", offplan_id, e)
+
+        try:
+            _write_sync_state(state, sync_state)
+        except Exception as e:
+            result["sync_state_error"] = f"{type(e).__name__}: {e}"
 
     return result
 

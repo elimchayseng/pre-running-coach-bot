@@ -175,6 +175,200 @@ class TestStateTools:
         )
         assert get_pending_plan_proposal() is None
 
+    def test_update_plan_auto_resolves_matching_pending_review(self, state, monkeypatch, fake_redis):
+        """update_plan + a pending proposal whose proposed_for_activity points
+        at a recent Pending review (matched by strava_id) flips that review
+        to ``approved`` and fires the Notion review mirror once."""
+        from datetime import date as _date
+
+        import temporal_context
+        from pending_proposal_store import set_pending_plan_proposal
+
+        monkeypatch.setattr(temporal_context, "today_local", lambda: _date(2026, 4, 28))
+        # Capture Notion review-mirror calls so we can assert the flip is mirrored.
+        captured: list = []
+        monkeypatch.setattr(state, "_notify_mirror_review", lambda entry: captured.append(entry))
+
+        # Pre-seed: a pending review for Strava activity 777
+        review = state.save_review(
+            session_id=None,
+            strava_id=777,
+            review_date=_date(2026, 4, 28),
+            critique="Hard easy. HR drifted.",
+            proposed_change={"summary": "demote tempo", "new_plan_md": "x", "reason": "y"},
+        )
+        assert review["status"] is None
+        captured.clear()  # ignore the save-mirror call
+
+        set_pending_plan_proposal(
+            {
+                "summary": "demote tempo",
+                "new_plan_md": "x",
+                "reason": "y",
+                "proposed_for_activity": 777,
+            }
+        )
+
+        plan = (
+            "# Plan\n\n## This Week\n\n"
+            "| Day | Date | Workout | Pace target | Notes |\n"
+            "|-----|------|---------|-------------|-------|\n"
+            "| Tue | 2026-04-28 | Easy 4mi | 8:45-9:15 | |\n"
+        )
+        execute_tool(
+            "update_plan",
+            {"new_plan_markdown": plan, "change_reason": "apply pending"},
+            state,
+        )
+
+        rows = state.get_all_reviews()
+        assert rows[0]["status"] == "approved"
+        assert rows[0]["resolved_at"] is not None
+        # Mirror was called for the flip (status=approved in the entry)
+        assert any(c["status"] == "approved" for c in captured)
+
+    def test_update_plan_no_matching_proposal_leaves_review_pending(self, state, monkeypatch, fake_redis):
+        """No pending proposal in Redis → reviews stay Pending."""
+        from datetime import date as _date
+
+        import temporal_context
+
+        monkeypatch.setattr(temporal_context, "today_local", lambda: _date(2026, 4, 28))
+        monkeypatch.setattr(state, "_notify_mirror_review", lambda entry: None)
+        state.save_review(
+            session_id=None,
+            strava_id=888,
+            review_date=_date(2026, 4, 28),
+            critique="ok",
+            proposed_change=None,
+        )
+
+        plan = (
+            "# Plan\n\n## This Week\n\n"
+            "| Day | Date | Workout | Pace target | Notes |\n"
+            "|-----|------|---------|-------------|-------|\n"
+            "| Tue | 2026-04-28 | Easy 4mi | 8:45-9:15 | |\n"
+        )
+        execute_tool(
+            "update_plan",
+            {"new_plan_markdown": plan, "change_reason": "manual edit"},
+            state,
+        )
+
+        rows = state.get_all_reviews()
+        assert rows[0]["status"] is None  # still Pending
+
+    def test_update_plan_proposal_for_unrelated_activity_leaves_review_pending(self, state, monkeypatch, fake_redis):
+        """A pending proposal targeting strava_id=A must not flip a review
+        for strava_id=B."""
+        from datetime import date as _date
+
+        import temporal_context
+        from pending_proposal_store import set_pending_plan_proposal
+
+        monkeypatch.setattr(temporal_context, "today_local", lambda: _date(2026, 4, 28))
+        monkeypatch.setattr(state, "_notify_mirror_review", lambda entry: None)
+        # Review is for activity 111
+        state.save_review(None, 111, _date(2026, 4, 28), "ok", None)
+        # Pending proposal is for an entirely different activity
+        set_pending_plan_proposal(
+            {
+                "summary": "s",
+                "new_plan_md": "x",
+                "reason": "r",
+                "proposed_for_activity": 222,
+            }
+        )
+
+        plan = (
+            "# Plan\n\n## This Week\n\n"
+            "| Day | Date | Workout | Pace target | Notes |\n"
+            "|-----|------|---------|-------------|-------|\n"
+            "| Tue | 2026-04-28 | Easy 4mi | 8:45-9:15 | |\n"
+        )
+        execute_tool(
+            "update_plan",
+            {"new_plan_markdown": plan, "change_reason": "x"},
+            state,
+        )
+        rows = state.get_all_reviews()
+        assert rows[0]["status"] is None
+
+    def test_update_workout_auto_resolves_matching_pending_review(self, state, monkeypatch, fake_redis):
+        """The patch-style edit tool also resolves a matching pending review."""
+        from datetime import date as _date
+
+        import temporal_context
+        from pending_proposal_store import set_pending_plan_proposal
+
+        monkeypatch.setattr(temporal_context, "today_local", lambda: _date(2026, 4, 28))
+        monkeypatch.setattr(state, "_notify_mirror_review", lambda entry: None)
+        review = state.save_review(None, 333, _date(2026, 4, 28), "x", None)
+        set_pending_plan_proposal({"summary": "s", "new_plan_md": "x", "reason": "r", "proposed_for_activity": 333})
+
+        execute_tool(
+            "update_workout",
+            {"date": "2026-04-28", "workout": "Easy 5mi", "change_reason": "user accepted"},
+            state,
+        )
+
+        rows = state.get_all_reviews()
+        assert rows[0]["id"] == review["id"]
+        assert rows[0]["status"] == "approved"
+
+    def test_auto_resolve_clears_redis_proposal(self, state, monkeypatch, fake_redis):
+        """When the auto-resolve flip actually happens, the Redis proposal
+        that triggered it must be cleared too — otherwise the next system
+        prompt resurfaces a proposal the user already applied."""
+        from datetime import date as _date
+
+        import temporal_context
+        from pending_proposal_store import (
+            get_pending_plan_proposal,
+            set_pending_plan_proposal,
+        )
+
+        monkeypatch.setattr(temporal_context, "today_local", lambda: _date(2026, 4, 28))
+        monkeypatch.setattr(state, "_notify_mirror_review", lambda entry: None)
+        state.save_review(None, 444, _date(2026, 4, 28), "x", None)
+        set_pending_plan_proposal({"summary": "s", "new_plan_md": "x", "reason": "r", "proposed_for_activity": 444})
+        assert get_pending_plan_proposal() is not None
+
+        # update_workout doesn't call _consume_pending_proposal — clearing
+        # the proposal here is purely the auto-resolve path's job.
+        execute_tool(
+            "update_workout",
+            {"date": "2026-04-28", "workout": "Easy 5mi", "change_reason": "user accepted"},
+            state,
+        )
+
+        assert get_pending_plan_proposal() is None
+        assert state.get_all_reviews()[0]["status"] == "approved"
+
+    def test_auto_resolve_no_matching_review_keeps_proposal(self, state, monkeypatch, fake_redis):
+        """If the proposal points at a Strava id with no Pending review,
+        nothing is flipped and the proposal stays in Redis (a later
+        update_plan or a subsequent review may yet apply it)."""
+        from datetime import date as _date
+
+        import temporal_context
+        from pending_proposal_store import (
+            get_pending_plan_proposal,
+            set_pending_plan_proposal,
+        )
+
+        monkeypatch.setattr(temporal_context, "today_local", lambda: _date(2026, 4, 28))
+        monkeypatch.setattr(state, "_notify_mirror_review", lambda entry: None)
+        set_pending_plan_proposal({"summary": "s", "new_plan_md": "x", "reason": "r", "proposed_for_activity": 999})
+
+        execute_tool(
+            "update_workout",
+            {"date": "2026-04-28", "workout": "Easy 5mi", "change_reason": "x"},
+            state,
+        )
+
+        assert get_pending_plan_proposal() is not None
+
     def test_update_plan_breaks_table_returns_warning(self, state, monkeypatch):
         """Plan without a parseable today row → tool returns a warning so
         the agent can self-correct."""
@@ -269,9 +463,10 @@ class TestPatchTools:
         assert row["prescribed_workout"] == "Workout 5x800"
         assert row["detail_md"] == "WU 1mi. Work 5x800. CD 1mi."
 
-    def test_update_workout_unknown_date_inserts_row(self, state, monkeypatch):
-        """An unknown date is no longer an error — update_workout seeds a
-        fresh planned row for it."""
+    def test_update_workout_unknown_date_returns_self_routing_error(self, state, monkeypatch):
+        """An unknown date surfaces an error whose message tells the LLM
+        which other tool to reach for (replace_week_table / update_plan)
+        instead of silently inserting an orphan day."""
         self._pin_today(monkeypatch, "2026-04-28")
         out = execute_tool(
             "update_workout",
@@ -282,9 +477,13 @@ class TestPatchTools:
             },
             state,
         )
-        assert out["ok"] is True
-        assert "error" not in out
-        assert state.get_todays_workout(date(2030, 12, 31))["workout"] == "Anything"
+        assert "error" in out
+        err = out["error"]
+        assert "2030-12-31" in err
+        assert "replace_week_table" in err
+        assert "update_plan" in err
+        # The row must not have been silently inserted.
+        assert state.get_todays_workout(date(2030, 12, 31))["found"] is False
 
     def test_update_workout_does_not_clear_pending_proposal(self, state, monkeypatch, fake_redis):
         """Patch-style edits are surgical, not proposal-apply. A pending
@@ -508,3 +707,208 @@ class TestFitnessSummary:
         )
         out = execute_tool("get_fitness_summary", {"window_days": 21}, state)
         assert any("No quality sessions" in s for s in out["signals"])
+
+
+# ------------- end-of-turn calendar sync debounce (issue #26) -------------
+
+
+class TestAutoSyncDebounce:
+    """Plan-edit tools mark a dirty flag; a single end-of-turn flush fires
+    one fire-and-forget gcal sync per turn regardless of how many edits ran.
+
+    Verified properties:
+      - N edits in one turn -> exactly one sync call.
+      - No edits -> no sync.
+      - The sync runs off the response path (in a separate thread).
+      - A sync failure does not propagate or break tool responses.
+    """
+
+    def _pin_today(self, monkeypatch, target):
+        from datetime import date as _date
+
+        import temporal_context
+
+        if isinstance(target, str):
+            target = _date.fromisoformat(target)
+        monkeypatch.setattr(temporal_context, "today_local", lambda: target)
+
+    def _drain_dirty(self):
+        """Reset the module-level dirty flag between tests so leakage from
+        earlier tests in this file (which call plan-edit tools without
+        flushing) doesn't contaminate the assertion baseline."""
+        from tools import state as state_tools
+
+        state_tools._consume_plan_dirty()
+
+    def test_multiple_edits_one_sync(self, state, monkeypatch):
+        """Three plan-edit tool calls + one flush -> exactly one sync_plan call."""
+        self._pin_today(monkeypatch, "2026-04-28")
+        self._drain_dirty()
+
+        calls: list[dict] = []
+        # Patch the sync target on the google_calendar.sync module — the daemon
+        # thread imports from there inside _run, so patching there is what gets
+        # called.
+        from google_calendar import sync as gcal_sync
+        from tools import state as state_tools
+
+        def _fake_sync(state, dry_run=False):
+            calls.append({"dry_run": dry_run})
+            return {"inserted": 0, "patched": 0, "deleted": 0, "unchanged": 0, "errors": []}
+
+        monkeypatch.setattr(gcal_sync, "sync_plan", _fake_sync)
+
+        # Three edits in the same "turn"
+        execute_tool(
+            "update_workout",
+            {"date": "2026-04-28", "workout": "Easy 5mi", "change_reason": "a"},
+            state,
+        )
+        execute_tool(
+            "update_workout",
+            {"date": "2026-04-28", "workout": "Easy 6mi", "change_reason": "b"},
+            state,
+        )
+        execute_tool(
+            "update_workout",
+            {"date": "2026-04-28", "workout": "Easy 7mi", "change_reason": "c"},
+            state,
+        )
+
+        # Single end-of-turn flush -> one sync scheduled
+        scheduled = state_tools.flush_pending_calendar_sync(state)
+        assert scheduled is True
+
+        # Wait for the daemon thread to run (short timeout — sync is mocked).
+        import threading
+        import time
+
+        deadline = time.time() + 2.0
+        while time.time() < deadline and not calls:
+            time.sleep(0.01)
+        # Make sure any spawned plan-sync thread finishes before next test.
+        for t in threading.enumerate():
+            if t.name == "pre-plan-sync":
+                t.join(timeout=2.0)
+
+        assert len(calls) == 1
+
+        # A second flush with no further edits should NOT schedule another sync.
+        scheduled_again = state_tools.flush_pending_calendar_sync(state)
+        assert scheduled_again is False
+        assert len(calls) == 1
+
+    def test_flush_with_no_edits_is_noop(self, state, monkeypatch):
+        """End-of-turn flush with no plan edits -> sync never called."""
+        self._pin_today(monkeypatch, "2026-04-28")
+        self._drain_dirty()
+
+        calls: list[dict] = []
+        from google_calendar import sync as gcal_sync
+        from tools import state as state_tools
+
+        def _fake_sync(state, dry_run=False):
+            calls.append({"dry_run": dry_run})
+            return {"inserted": 0, "patched": 0, "deleted": 0, "unchanged": 0, "errors": []}
+
+        monkeypatch.setattr(gcal_sync, "sync_plan", _fake_sync)
+
+        # Only a read tool — does not mutate the plan.
+        execute_tool("get_sessions", {"start_date": "2026-04-26", "end_date": "2026-04-27"}, state)
+
+        scheduled = state_tools.flush_pending_calendar_sync(state)
+        assert scheduled is False
+        assert calls == []
+
+    def test_sync_failure_does_not_break_tool_response(self, state, monkeypatch):
+        """If gcal sync raises, the tool result already returned to the agent
+        is unaffected (the sync runs after the tool returned, on a daemon
+        thread, and swallows exceptions)."""
+        self._pin_today(monkeypatch, "2026-04-28")
+        self._drain_dirty()
+
+        from google_calendar import sync as gcal_sync
+        from tools import state as state_tools
+
+        def _broken_sync(state, dry_run=False):
+            raise RuntimeError("gcal down")
+
+        monkeypatch.setattr(gcal_sync, "sync_plan", _broken_sync)
+
+        # The tool call still returns ok regardless of gcal's downstream state.
+        out = execute_tool(
+            "update_workout",
+            {"date": "2026-04-28", "workout": "Easy 5mi", "change_reason": "a"},
+            state,
+        )
+        assert out["ok"] is True
+        assert "error" not in out
+
+        # Flush schedules the thread; the thread will swallow the RuntimeError.
+        # If exceptions propagated, this call (or the thread join below) would
+        # raise. We don't observe the swallowed error here — only confirm that
+        # flushing + thread completion is clean.
+        scheduled = state_tools.flush_pending_calendar_sync(state)
+        assert scheduled is True
+
+        import threading
+
+        for t in threading.enumerate():
+            if t.name == "pre-plan-sync":
+                t.join(timeout=2.0)
+
+    def test_sync_runs_off_the_response_path(self, state, monkeypatch):
+        """The sync must execute in a daemon thread, not on the caller's thread,
+        so a slow gcal API cannot delay the agent's response. We verify by
+        capturing thread identity inside the patched sync function and
+        comparing to the test's main thread."""
+        self._pin_today(monkeypatch, "2026-04-28")
+        self._drain_dirty()
+
+        import threading
+        import time
+
+        captured: dict = {}
+        sync_started = threading.Event()
+        sync_can_finish = threading.Event()
+
+        from google_calendar import sync as gcal_sync
+        from tools import state as state_tools
+
+        def _slow_sync(state, dry_run=False):
+            captured["thread_name"] = threading.current_thread().name
+            captured["is_daemon"] = threading.current_thread().daemon
+            captured["thread_id"] = threading.get_ident()
+            sync_started.set()
+            # Block until the test releases us — proves flush() didn't wait.
+            sync_can_finish.wait(timeout=2.0)
+            return {"inserted": 0, "patched": 0, "deleted": 0, "unchanged": 0, "errors": []}
+
+        monkeypatch.setattr(gcal_sync, "sync_plan", _slow_sync)
+
+        execute_tool(
+            "update_workout",
+            {"date": "2026-04-28", "workout": "Easy 5mi", "change_reason": "a"},
+            state,
+        )
+
+        main_thread_id = threading.get_ident()
+        t0 = time.perf_counter()
+        scheduled = state_tools.flush_pending_calendar_sync(state)
+        flush_ms = (time.perf_counter() - t0) * 1000
+        assert scheduled is True
+
+        # flush returns immediately — well under a second even though the sync
+        # itself blocks on sync_can_finish.
+        assert flush_ms < 500, f"flush_pending_calendar_sync blocked for {flush_ms:.0f}ms"
+
+        # Sync started on a different thread.
+        assert sync_started.wait(timeout=2.0), "sync thread never started"
+        assert captured["thread_id"] != main_thread_id
+        assert captured["is_daemon"] is True
+        assert captured["thread_name"] == "pre-plan-sync"
+
+        sync_can_finish.set()
+        for t in threading.enumerate():
+            if t.name == "pre-plan-sync":
+                t.join(timeout=2.0)

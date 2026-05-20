@@ -417,6 +417,110 @@ class TestSyncStateRoundtrip:
         assert loaded == {"pretrain20260511": {"hash": "abc", "last_synced_at": "x"}}
 
 
+class TestSyncStateLock:
+    """Verifies the module-level ``_SYNC_STATE_LOCK`` actually serializes
+    concurrent load → mutate → save sequences. Without the lock, two threads
+    that both load, then both save, would lose one update.
+    """
+
+    def test_concurrent_mark_complete_calls_do_not_lose_updates(self, monkeypatch):
+        """Two threads call mark_complete for different dates. With the lock,
+        both completion entries land in sync state. Without it, the artificial
+        delay between load and save lets one thread's save clobber the other's.
+        """
+        import threading
+        import time
+
+        from google_calendar import client as gcal_client
+
+        monkeypatch.setattr(gcal_client, "insert_event", lambda p: None)
+        monkeypatch.setattr(gcal_client, "patch_event", lambda eid, p: None)
+        monkeypatch.setattr(gcal_client, "delete_event", lambda eid: None)
+
+        # Two-day plan + two days of off-plan strength logs. mark_complete on
+        # each date should write a precomplete entry; both must survive.
+        plan = """\
+| Day | Date | Workout | Pace target | Notes |
+|-----|------|---------|-------------|-------|
+| Sat | 2026-05-09 | Easy 8mi | 8:30 | foo |
+| Sun | 2026-05-10 | Easy 6mi | 8:30 | bar |
+"""
+        sessions = {
+            "2026-05-09": [{"date": "2026-05-09", "type": "strength"}],
+            "2026-05-10": [{"date": "2026-05-10", "type": "strength"}],
+        }
+        state = _StateStub(plan, sessions)
+
+        # Wrap save with a small delay so the race window is wide enough to
+        # be reliably caught when the lock is absent.
+        original_save = state.save_gcal_sync_state
+
+        def slow_save(new_state):
+            time.sleep(0.05)
+            original_save(new_state)
+
+        state.save_gcal_sync_state = slow_save  # type: ignore[method-assign]
+
+        results: list[dict] = []
+        errors: list[BaseException] = []
+
+        def run(log_date_str: str):
+            try:
+                results.append(sync.mark_complete(state, date.fromisoformat(log_date_str)))
+            except BaseException as e:  # noqa: BLE001
+                errors.append(e)
+
+        t1 = threading.Thread(target=run, args=("2026-05-09",))
+        t2 = threading.Thread(target=run, args=("2026-05-10",))
+        t1.start()
+        t2.start()
+        t1.join(timeout=5)
+        t2.join(timeout=5)
+
+        assert not errors, f"thread errors: {errors}"
+        assert len(results) == 2
+
+        final = sync._load_sync_state(state)
+        # Both off-plan completion entries must be present — a lost update
+        # would mean one of these keys is missing.
+        assert "precomplete20260509" in final
+        assert "precomplete20260510" in final
+        assert final["precomplete20260509"].get("completed") is True
+        assert final["precomplete20260510"].get("completed") is True
+
+    def test_lock_is_acquired_during_mark_complete(self, monkeypatch):
+        """Light-touch verification: the module-level lock is touched by
+        mark_complete. Guards against future refactors that silently drop
+        the ``with _SYNC_STATE_LOCK:`` block."""
+        from google_calendar import client as gcal_client
+
+        monkeypatch.setattr(gcal_client, "insert_event", lambda p: None)
+        monkeypatch.setattr(gcal_client, "patch_event", lambda eid, p: None)
+        monkeypatch.setattr(gcal_client, "delete_event", lambda eid: None)
+
+        acquire_calls = {"n": 0}
+        real_lock = sync._SYNC_STATE_LOCK
+
+        class _SpyLock:
+            def __enter__(self):
+                acquire_calls["n"] += 1
+                return real_lock.__enter__()
+
+            def __exit__(self, *args):
+                return real_lock.__exit__(*args)
+
+        monkeypatch.setattr(sync, "_SYNC_STATE_LOCK", _SpyLock())
+
+        state = _StateStub(
+            "| Day | Date | Workout | Pace target | Notes |\n"
+            "|-----|------|---------|-------------|-------|\n"
+            "| Sat | 2026-05-09 | Easy 8mi | 8:30 | foo |\n",
+            {"2026-05-09": [{"date": "2026-05-09", "type": "easy", "miles": 8.0}]},
+        )
+        sync.mark_complete(state, date(2026, 5, 9))
+        assert acquire_calls["n"] == 1
+
+
 class TestPrescriptionClassifier:
     def test_rest_day(self):
         assert sync._prescription_kind("Rest + gentle yoga PM") == "rest"

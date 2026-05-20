@@ -2,7 +2,73 @@
 
 from __future__ import annotations
 
+import logging
+import threading
 from datetime import date
+
+logger = logging.getLogger("pre_coach.tools.state")
+
+# ---------- per-turn calendar sync debounce ----------
+#
+# Plan-edit handlers (update_workout / replace_week_table / update_plan) mark
+# this flag when they mutate the plan. ``flush_pending_calendar_sync`` clears
+# it and spawns a single daemon thread that runs ``google_calendar.sync.sync_plan``.
+# Called once at end-of-turn by ``companion.agent_turn`` so a turn with N edits
+# triggers at most one calendar sync — never N — and always off the response
+# path. See issue #26.
+_sync_dirty = False
+_sync_lock = threading.Lock()
+
+
+def _mark_plan_dirty() -> None:
+    """Flag the plan as edited this turn. Idempotent within a turn."""
+    global _sync_dirty
+    with _sync_lock:
+        _sync_dirty = True
+
+
+def _consume_plan_dirty() -> bool:
+    """Atomically read+clear the dirty flag. Returns prior value."""
+    global _sync_dirty
+    with _sync_lock:
+        was_dirty = _sync_dirty
+        _sync_dirty = False
+        return was_dirty
+
+
+def flush_pending_calendar_sync(state) -> bool:
+    """If the plan was edited this turn, spawn a daemon thread to sync gcal.
+
+    Fire-and-forget — never blocks the caller, never raises. Returns True if a
+    sync was scheduled, False if nothing was pending. The thread itself logs any
+    exceptions and exits cleanly; an unhealthy gcal must not crash the worker.
+    """
+    if not _consume_plan_dirty():
+        return False
+
+    def _run() -> None:
+        try:
+            from google_calendar.sync import sync_plan
+
+            result = sync_plan(state)
+            logger.info(
+                "auto-sync after plan edit: inserted=%s patched=%s deleted=%s unchanged=%s errors=%d",
+                result.get("inserted"),
+                result.get("patched"),
+                result.get("deleted"),
+                result.get("unchanged"),
+                len(result.get("errors") or []),
+            )
+        except Exception as e:  # noqa: BLE001 — sync hiccup must not crash worker
+            logger.warning(
+                "auto-sync after plan edit failed: %s: %s",
+                type(e).__name__,
+                e,
+            )
+
+    threading.Thread(target=_run, daemon=True, name="pre-plan-sync").start()
+    return True
+
 
 SESSION_TYPES = [
     "run",
@@ -300,8 +366,10 @@ def _mark_calendar_complete(state, entry: dict) -> None:
 def _update_plan(args: dict, state) -> dict:
     state.update_plan(args["new_plan_markdown"], args["change_reason"])
     result = {"ok": True, "change_reason": args["change_reason"]}
+    _auto_resolve_matching_review(state)
     _consume_pending_proposal()
     _attach_today_warning_if_broken(state, result)
+    _mark_plan_dirty()
     return result
 
 
@@ -320,7 +388,9 @@ def _update_workout(args: dict, state) -> dict:
         detail_body=args.get("detail_body"),
     )
     result = {"ok": True, "date": args["date"], "change_reason": args["change_reason"]}
+    _auto_resolve_matching_review(state)
     _attach_today_warning_if_broken(state, result)
+    _mark_plan_dirty()
     return result
 
 
@@ -333,7 +403,9 @@ def _replace_week_table(args: dict, state) -> dict:
         "rows_written": len(args["rows"]),
         "change_reason": args["change_reason"],
     }
+    _auto_resolve_matching_review(state)
     _attach_today_warning_if_broken(state, result)
+    _mark_plan_dirty()
     return result
 
 
@@ -348,6 +420,69 @@ def _consume_pending_proposal() -> None:
         clear_pending_plan_proposal()
     except Exception:
         pass
+
+
+def _auto_resolve_matching_review(state) -> None:
+    """Heuristic: a plan-edit tool just ran. If Redis has a pending proposal
+    whose ``proposed_for_activity`` matches a recent Pending review (by
+    ``strava_id``), flip that review to ``approved`` and mirror the flip
+    to Notion.
+
+    Matching rule: the proposal's ``proposed_for_activity`` is the Strava
+    activity id the post-activity review was generated for. The reviews
+    table also stores ``strava_id``, so a direct equality match is the
+    cleanest signal that this plan write applies that proposal. No match,
+    or no pending proposal in Redis → no-op (reviews stay Pending).
+
+    On a successful flip, the matching Redis proposal is cleared too — the
+    write just applied it, so leaving it in Redis would resurface the same
+    proposal in the next system prompt. Clearing is best-effort: a Redis
+    blip logs a warning but never re-raises (the SQLite flip is already
+    committed and is the source of truth).
+
+    The "rejected" path (user replies "don't apply") is intentionally NOT
+    auto-detected here — it requires NL-intent parsing on the chat turn,
+    which is the next iteration. TODO: detect explicit-rejection turns
+    and flip the matching review to ``rejected`` from the chat handler.
+
+    Failures swallow silently: this is a best-effort enrichment of the
+    Notion view, never a blocker on the plan edit itself.
+    """
+    import logging
+
+    try:
+        from pending_proposal_store import get_pending_plan_proposal
+
+        proposal = get_pending_plan_proposal()
+    except Exception as e:
+        logging.getLogger("pre_coach.tools.state").debug(f"auto-resolve: failed to read pending proposal: {e}")
+        return
+    if not proposal:
+        return
+    strava_id = proposal.get("proposed_for_activity")
+    if strava_id is None:
+        return
+    try:
+        review = state.find_pending_review_for_activity(strava_id=strava_id)
+        if review is None:
+            return
+        resolved = state.resolve_pending_review(review["id"], "approved")
+    except Exception as e:
+        logging.getLogger("pre_coach.tools.state").warning(
+            f"auto-resolve: failed to flip review for strava_id={strava_id}: {e}"
+        )
+        return
+    if resolved is None:
+        # Lost a race against another resolver — nothing to clear.
+        return
+    try:
+        from pending_proposal_store import clear_pending_plan_proposal
+
+        clear_pending_plan_proposal()
+    except Exception as e:
+        logging.getLogger("pre_coach.tools.state").warning(
+            f"auto-resolve: review {review['id']} flipped to approved but Redis proposal clear failed: {e}"
+        )
 
 
 def _attach_today_warning_if_broken(state, result: dict) -> None:

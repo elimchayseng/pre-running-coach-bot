@@ -193,31 +193,38 @@ class TestUpdateWorkout:
         assert w["pace_target"] == "6:30-6:40"
         assert w["notes"] == "focus on relaxed shoulders"
 
-    def test_unknown_date_inserts_planned_row(self, state):
+    def test_unknown_date_raises_with_self_routing_hint(self, state):
+        """Date with no row in the locked table raises ValueError whose
+        message tells the LLM exactly which other tool to reach for."""
         state.update_plan(PLAN_WITH_DETAIL, "seed")
-        state.update_workout(
-            target_date=date(2030, 1, 1),
-            change_note="add a day",
-            workout="Easy 5mi",
-        )
-        w = state.get_todays_workout(date(2030, 1, 1))
-        assert w["found"] is True
-        assert w["workout"] == "Easy 5mi"
-        assert w["status"] == "planned"
+        with pytest.raises(ValueError) as excinfo:
+            state.update_workout(
+                target_date=date(2030, 1, 1),
+                change_note="add a day",
+                workout="Easy 5mi",
+            )
+        msg = str(excinfo.value)
+        assert "2030-01-01" in msg
+        assert "replace_week_table" in msg
+        assert "update_plan" in msg
 
     def test_no_fields_raises(self, state):
         state.update_plan(PLAN_WITH_DETAIL, "seed")
         with pytest.raises(ValueError, match="must pass at least one"):
             state.update_workout(target_date=date(2026, 4, 28), change_note="x")
 
-    def test_inserts_on_empty_plan(self, state):
-        """No plan yet → update_workout seeds a fresh planned row."""
-        state.update_workout(
-            target_date=date(2026, 4, 28),
-            change_note="x",
-            workout="Easy 5mi",
-        )
-        assert state.get_todays_workout(date(2026, 4, 28))["workout"] == "Easy 5mi"
+    def test_empty_plan_raises_with_self_routing_hint(self, state):
+        """No plan yet → update_workout points the LLM at replace_week_table
+        / update_plan rather than silently seeding an orphan row."""
+        with pytest.raises(ValueError) as excinfo:
+            state.update_workout(
+                target_date=date(2026, 4, 28),
+                change_note="x",
+                workout="Easy 5mi",
+            )
+        msg = str(excinfo.value)
+        assert "replace_week_table" in msg
+        assert "update_plan" in msg
 
     def test_detail_body_only_no_row_edit(self, state):
         state.update_plan(PLAN_WITH_DETAIL, "seed")
@@ -539,6 +546,136 @@ class TestReviews:
         monkeypatch.setattr(state, "_notify_mirror_review", lambda entry: captured.append(entry))
         state.save_review(None, None, date(2026, 5, 20), "feedback", None)
         assert len(captured) == 1 and captured[0]["critique"] == "feedback"
+
+    def test_find_pending_review_by_strava_id(self, state, monkeypatch):
+        monkeypatch.setattr(state, "_notify_mirror_review", lambda entry: None)
+        state.save_review(None, 12345, date(2026, 5, 20), "felt fine", None)
+        got = state.find_pending_review_for_activity(strava_id=12345)
+        assert got is not None and got["strava_id"] == 12345 and got["status"] is None
+
+    def test_find_pending_review_returns_none_when_resolved(self, state, monkeypatch):
+        monkeypatch.setattr(state, "_notify_mirror_review", lambda entry: None)
+        row = state.save_review(None, 12345, date(2026, 5, 20), "felt fine", None)
+        state.resolve_pending_review(row["id"], "approved")
+        # Only Pending rows match
+        assert state.find_pending_review_for_activity(strava_id=12345) is None
+
+    def test_find_pending_review_by_session_id_fallback(self, state, monkeypatch):
+        monkeypatch.setattr(state, "_notify_mirror_review", lambda entry: None)
+        outcome = state.append_session({"date": "2026-05-20", "type": "easy", "miles": 5})
+        state.save_review(outcome["row_id"], None, date(2026, 5, 20), "x", None)
+        got = state.find_pending_review_for_activity(session_id=outcome["row_id"])
+        assert got is not None and got["session_id"] == outcome["row_id"]
+
+    def test_find_pending_review_none_inputs_returns_none(self, state):
+        assert state.find_pending_review_for_activity() is None
+
+    def test_resolve_pending_review_updates_row(self, state, monkeypatch):
+        monkeypatch.setattr(state, "_notify_mirror_review", lambda entry: None)
+        row = state.save_review(None, 9, date(2026, 5, 20), "x", None)
+        updated = state.resolve_pending_review(row["id"], "approved")
+        assert updated is not None
+        assert updated["status"] == "approved"
+        assert updated["resolved_at"] is not None
+
+    def test_resolve_pending_review_fires_mirror(self, state, monkeypatch):
+        captured: list = []
+        monkeypatch.setattr(state, "_notify_mirror_review", lambda entry: captured.append(entry))
+        row = state.save_review(None, 9, date(2026, 5, 20), "x", None)
+        captured.clear()  # ignore the save-mirror call
+        state.resolve_pending_review(row["id"], "approved")
+        assert len(captured) == 1 and captured[0]["status"] == "approved"
+
+    def test_resolve_pending_review_idempotent(self, state, monkeypatch):
+        """Second call returns None (no rows updated) — already resolved."""
+        monkeypatch.setattr(state, "_notify_mirror_review", lambda entry: None)
+        row = state.save_review(None, 9, date(2026, 5, 20), "x", None)
+        first = state.resolve_pending_review(row["id"], "approved")
+        second = state.resolve_pending_review(row["id"], "rejected")
+        assert first is not None and second is None
+        # Row stays approved
+        rows = state.get_all_reviews()
+        assert rows[0]["status"] == "approved"
+
+    def test_resolve_pending_review_missing_id(self, state):
+        assert state.resolve_pending_review(999, "approved") is None
+
+    def test_expire_old_pending_reviews_flips_stale_only(self, state, monkeypatch):
+        """Only Pending rows older than the cutoff get expired."""
+        monkeypatch.setattr(state, "_notify_mirror_review", lambda entry: None)
+        # Stale pending — 30 days old
+        old_row = state.save_review(None, 1, date(2026, 4, 1), "old", None)
+        # Recent pending — within 14 days
+        recent_row = state.save_review(None, 2, date(2026, 5, 15), "recent", None)
+        # Stale but already resolved — must not be re-flipped
+        resolved = state.save_review(None, 3, date(2026, 4, 1), "approved-old", None)
+        state.resolve_pending_review(resolved["id"], "approved")
+
+        expired = state.expire_old_pending_reviews(days=14, today=date(2026, 5, 20))
+        expired_ids = {r["id"] for r in expired}
+        assert old_row["id"] in expired_ids
+        assert recent_row["id"] not in expired_ids
+        assert resolved["id"] not in expired_ids
+
+        # Verify in SQLite directly
+        all_rows = {r["id"]: r for r in state.get_all_reviews()}
+        assert all_rows[old_row["id"]]["status"] == "expired"
+        assert all_rows[old_row["id"]]["resolved_at"] is not None
+        assert all_rows[recent_row["id"]]["status"] is None
+        assert all_rows[resolved["id"]]["status"] == "approved"
+
+    def test_expire_old_pending_reviews_returns_empty_when_none(self, state, monkeypatch):
+        monkeypatch.setattr(state, "_notify_mirror_review", lambda entry: None)
+        state.save_review(None, 1, date(2026, 5, 15), "recent", None)
+        assert state.expire_old_pending_reviews(days=14, today=date(2026, 5, 20)) == []
+
+    def test_expire_old_pending_reviews_fires_one_batched_mirror_call(self, state, monkeypatch):
+        """Sweep fires ONE batched mirror call carrying every stale row —
+        not one daemon thread per row. Regression guard for the original
+        per-row ``_notify_mirror_review`` loop."""
+        per_row_calls: list = []
+        batch_calls: list = []
+        monkeypatch.setattr(state, "_notify_mirror_review", lambda entry: per_row_calls.append(entry))
+        monkeypatch.setattr(state, "_notify_mirror_reviews", lambda entries: batch_calls.append(list(entries)))
+        state.save_review(None, 1, date(2026, 4, 1), "a", None)
+        state.save_review(None, 2, date(2026, 4, 2), "b", None)
+        state.save_review(None, 3, date(2026, 4, 3), "c", None)
+        per_row_calls.clear()  # ignore the save-mirror calls
+        batch_calls.clear()
+
+        state.expire_old_pending_reviews(days=14, today=date(2026, 5, 20))
+
+        # One batched call, not one per row.
+        assert len(batch_calls) == 1
+        assert len(batch_calls[0]) == 3
+        assert all(r["status"] == "expired" for r in batch_calls[0])
+        # No per-row mirror calls came from the sweep.
+        assert per_row_calls == []
+
+    def test_expire_old_pending_reviews_uses_utc_today(self, state, monkeypatch):
+        """Default ``today`` comes from UTC, not local time. Fix for the
+        local-vs-UTC drift the docstring promised but the code violated."""
+        from datetime import datetime as _dt
+        from datetime import timezone as _tz
+
+        import state_manager as sm
+
+        monkeypatch.setattr(state, "_notify_mirror_reviews", lambda entries: None)
+
+        # Row dated 30 days ago vs the FAKE UTC "now" → must expire.
+        state.save_review(None, 9, date(2026, 4, 1), "old", None)
+
+        class _FakeDateTime:
+            @staticmethod
+            def now(tz=None):
+                assert tz is _tz.utc, "expire sweep must request UTC"
+                return _dt(2026, 5, 20, 9, 0, 0, tzinfo=_tz.utc)
+
+        monkeypatch.setattr(sm, "datetime", _FakeDateTime)
+
+        expired = state.expire_old_pending_reviews(days=14)
+        assert len(expired) == 1
+        assert expired[0]["status"] == "expired"
 
 
 # ---------------- change-body formatters ----------------

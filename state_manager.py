@@ -28,7 +28,7 @@ import os
 import sqlite3
 import threading
 from contextlib import contextmanager
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
@@ -275,8 +275,11 @@ class StateManager:
     ) -> None:
         """Patch a single day's prescription row.
 
-        Updates the planned row for ``target_date`` (only the fields passed
-        are touched). If the day has no planned row, a new one is inserted.
+        Updates the existing row for ``target_date`` (only the fields passed
+        are touched). Raises ``ValueError`` if no row exists for the date so
+        the LLM can self-route to ``replace_week_table`` (to add the
+        containing week) or ``update_plan`` (for structural changes) instead
+        of silently inserting an orphan day.
         """
         has_edit = any(v is not None for v in (workout, pace_target, notes, detail_body))
         if not has_edit:
@@ -289,51 +292,37 @@ class StateManager:
             ).fetchone()
             if row is None:
                 # No planned row — fall back to any prescription row on the
-                # date, else insert a fresh planned row.
+                # date (a completed/missed/off-plan row is still a valid
+                # patch target for detail_body etc.).
                 row = conn.execute(
                     "SELECT id, status FROM sessions WHERE date = ? ORDER BY slot LIMIT 1", (iso,)
                 ).fetchone()
-            before_row = (
-                _row_dict(conn.execute("SELECT * FROM sessions WHERE id = ?", (row["id"],)).fetchone())
-                if row is not None
-                else None
-            )
             if row is None:
-                cur = conn.execute(
-                    "INSERT INTO sessions "
-                    "(date, slot, status, type, prescribed_workout, prescribed_pace, "
-                    " prescribed_notes, detail_md) "
-                    "VALUES (?, NULL, 'planned', ?, ?, ?, ?, ?)",
-                    (
-                        iso,
-                        plan_markdown.infer_workout_type(workout or ""),
-                        workout,
-                        pace_target,
-                        notes,
-                        (detail_body or "").strip() or None,
-                    ),
+                raise ValueError(
+                    f"no row found in locked table for date {iso} — to add the "
+                    "week containing this date, call replace_week_table; for a "
+                    "structural plan change, call update_plan"
                 )
-                affected_id = cur.lastrowid
-            else:
-                sets, params = [], []
-                if workout is not None:
-                    sets.append("prescribed_workout = ?")
-                    params.append(workout)
-                    sets.append("type = ?")
-                    params.append(plan_markdown.infer_workout_type(workout))
-                if pace_target is not None:
-                    sets.append("prescribed_pace = ?")
-                    params.append(pace_target)
-                if notes is not None:
-                    sets.append("prescribed_notes = ?")
-                    params.append(notes)
-                if detail_body is not None:
-                    sets.append("detail_md = ?")
-                    params.append(detail_body.strip() or None)
-                sets.append("updated_at = datetime('now')")
-                params.append(row["id"])
-                conn.execute(f"UPDATE sessions SET {', '.join(sets)} WHERE id = ?", params)
-                affected_id = row["id"]
+            before_row = _row_dict(conn.execute("SELECT * FROM sessions WHERE id = ?", (row["id"],)).fetchone())
+            sets, params = [], []
+            if workout is not None:
+                sets.append("prescribed_workout = ?")
+                params.append(workout)
+                sets.append("type = ?")
+                params.append(plan_markdown.infer_workout_type(workout))
+            if pace_target is not None:
+                sets.append("prescribed_pace = ?")
+                params.append(pace_target)
+            if notes is not None:
+                sets.append("prescribed_notes = ?")
+                params.append(notes)
+            if detail_body is not None:
+                sets.append("detail_md = ?")
+                params.append(detail_body.strip() or None)
+            sets.append("updated_at = datetime('now')")
+            params.append(row["id"])
+            conn.execute(f"UPDATE sessions SET {', '.join(sets)} WHERE id = ?", params)
+            affected_id = row["id"]
             after_row = _row_dict(conn.execute("SELECT * FROM sessions WHERE id = ?", (affected_id,)).fetchone())
             body = render_change_body(_format_session_row_short(before_row), _format_session_row_short(after_row))
             change_entry = self._append_changelog(conn, change_note, body=body)
@@ -647,6 +636,22 @@ class StateManager:
         except Exception:  # noqa: BLE001
             pass
 
+    def _notify_mirror_reviews(self, entries: list[dict]) -> None:
+        """Best-effort batched mirror of N reviews in ONE daemon thread.
+
+        Used by the nightly expire sweep so a 50-row batch fires one Notion
+        worker, not 50. ``mirror_reviews`` upserts each row sequentially
+        inside the single thread.
+        """
+        if not entries:
+            return
+        try:
+            from notion.mirror import mirror_reviews
+
+            mirror_reviews(entries)
+        except Exception:  # noqa: BLE001
+            pass
+
     # ---------- Reviews ----------
 
     def save_review(
@@ -689,6 +694,100 @@ class StateManager:
         with self._conn() as conn:
             rows = conn.execute("SELECT * FROM reviews ORDER BY id").fetchall()
         return [_parse_review_row(dict(r)) for r in rows]
+
+    def find_pending_review_for_activity(
+        self,
+        strava_id: Optional[int] = None,
+        session_id: Optional[int] = None,
+    ) -> Optional[dict]:
+        """Return the most recent Pending review for an activity, or None.
+
+        Pending = ``status IS NULL``. Match priority: ``strava_id`` first
+        (the post-activity review is keyed off Strava), then ``session_id``
+        as a fallback when the activity wasn't logged via Strava.
+        """
+        if strava_id is None and session_id is None:
+            return None
+        with self._conn() as conn:
+            row = None
+            if strava_id is not None:
+                row = conn.execute(
+                    "SELECT * FROM reviews WHERE strava_id = ? AND status IS NULL ORDER BY id DESC LIMIT 1",
+                    (strava_id,),
+                ).fetchone()
+            if row is None and session_id is not None:
+                row = conn.execute(
+                    "SELECT * FROM reviews WHERE session_id = ? AND status IS NULL ORDER BY id DESC LIMIT 1",
+                    (session_id,),
+                ).fetchone()
+        return _parse_review_row(dict(row)) if row else None
+
+    def resolve_pending_review(self, review_id: int, status: str) -> Optional[dict]:
+        """Flip a Pending reviews row to a terminal status and mirror it.
+
+        ``status`` must be one of approved / rejected / expired / no-op
+        (the schema CHECK constraint enforces this). Sets ``resolved_at`` to
+        now. Returns the updated row dict (with ``proposed_change`` parsed)
+        or ``None`` if the row doesn't exist or was already resolved (the
+        UPDATE is conditioned on ``status IS NULL`` so callers can race
+        each other harmlessly). Mirrors the flip to Notion best-effort —
+        a Notion failure logs and is swallowed; SQLite is the source of
+        truth.
+        """
+        with self._conn() as conn:
+            cur = conn.execute(
+                "UPDATE reviews SET status = ?, resolved_at = datetime('now') WHERE id = ? AND status IS NULL",
+                (status, review_id),
+            )
+            if cur.rowcount == 0:
+                return None
+            row = _parse_review_row(dict(conn.execute("SELECT * FROM reviews WHERE id = ?", (review_id,)).fetchone()))
+        self._notify_mirror_review(row)
+        return row
+
+    def expire_old_pending_reviews(self, days: int = 14, today: Optional[date] = None) -> list[dict]:
+        """Flip Pending reviews older than ``days`` to ``expired``.
+
+        Pending = ``status IS NULL``. Cutoff is computed against the review's
+        ``date`` field (the activity date). Returns the list of rows that
+        were just expired (dicts with ``proposed_change`` parsed); the whole
+        batch is mirrored to Notion in a single daemon thread (one mirror
+        call, N upserts inside) so a sweep over many stale rows doesn't
+        spawn N threads.
+
+        ``today`` defaults to the current UTC date — the cron that calls this
+        runs on UTC and the schema's ``date`` field is the activity day, also
+        recorded against UTC. Passing a local date here would make the cutoff
+        drift by up to a day either way.
+
+        Intended to run nightly via cron — wire as a Railway scheduled job
+        (e.g. ``0 9 * * *`` UTC, daily at 9 AM) calling
+        ``StateManager().expire_old_pending_reviews()``. This module
+        deliberately does NOT register the schedule itself; scheduling is
+        owned by the deploy config.
+        """
+        ref = today or datetime.now(timezone.utc).date()
+        cutoff = (ref - timedelta(days=days)).isoformat()
+        with self._conn() as conn:
+            stale = conn.execute(
+                "SELECT id FROM reviews WHERE status IS NULL AND date < ?",
+                (cutoff,),
+            ).fetchall()
+            stale_ids = [r["id"] for r in stale]
+            if not stale_ids:
+                return []
+            conn.execute(
+                f"UPDATE reviews SET status = 'expired', resolved_at = datetime('now') "
+                f"WHERE id IN ({','.join('?' * len(stale_ids))})",
+                stale_ids,
+            )
+            rows = conn.execute(
+                f"SELECT * FROM reviews WHERE id IN ({','.join('?' * len(stale_ids))}) ORDER BY id",
+                stale_ids,
+            ).fetchall()
+        parsed = [_parse_review_row(dict(r)) for r in rows]
+        self._notify_mirror_reviews(parsed)
+        return parsed
 
     # ---------- Journal ----------
 
