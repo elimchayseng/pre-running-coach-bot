@@ -316,6 +316,59 @@ class TestStateTools:
         assert rows[0]["id"] == review["id"]
         assert rows[0]["status"] == "approved"
 
+    def test_auto_resolve_clears_redis_proposal(self, state, monkeypatch, fake_redis):
+        """When the auto-resolve flip actually happens, the Redis proposal
+        that triggered it must be cleared too — otherwise the next system
+        prompt resurfaces a proposal the user already applied."""
+        from datetime import date as _date
+
+        import temporal_context
+        from pending_proposal_store import (
+            get_pending_plan_proposal,
+            set_pending_plan_proposal,
+        )
+
+        monkeypatch.setattr(temporal_context, "today_local", lambda: _date(2026, 4, 28))
+        monkeypatch.setattr(state, "_notify_mirror_review", lambda entry: None)
+        state.save_review(None, 444, _date(2026, 4, 28), "x", None)
+        set_pending_plan_proposal({"summary": "s", "new_plan_md": "x", "reason": "r", "proposed_for_activity": 444})
+        assert get_pending_plan_proposal() is not None
+
+        # update_workout doesn't call _consume_pending_proposal — clearing
+        # the proposal here is purely the auto-resolve path's job.
+        execute_tool(
+            "update_workout",
+            {"date": "2026-04-28", "workout": "Easy 5mi", "change_reason": "user accepted"},
+            state,
+        )
+
+        assert get_pending_plan_proposal() is None
+        assert state.get_all_reviews()[0]["status"] == "approved"
+
+    def test_auto_resolve_no_matching_review_keeps_proposal(self, state, monkeypatch, fake_redis):
+        """If the proposal points at a Strava id with no Pending review,
+        nothing is flipped and the proposal stays in Redis (a later
+        update_plan or a subsequent review may yet apply it)."""
+        from datetime import date as _date
+
+        import temporal_context
+        from pending_proposal_store import (
+            get_pending_plan_proposal,
+            set_pending_plan_proposal,
+        )
+
+        monkeypatch.setattr(temporal_context, "today_local", lambda: _date(2026, 4, 28))
+        monkeypatch.setattr(state, "_notify_mirror_review", lambda entry: None)
+        set_pending_plan_proposal({"summary": "s", "new_plan_md": "x", "reason": "r", "proposed_for_activity": 999})
+
+        execute_tool(
+            "update_workout",
+            {"date": "2026-04-28", "workout": "Easy 5mi", "change_reason": "x"},
+            state,
+        )
+
+        assert get_pending_plan_proposal() is not None
+
     def test_update_plan_breaks_table_returns_warning(self, state, monkeypatch):
         """Plan without a parseable today row → tool returns a warning so
         the agent can self-correct."""

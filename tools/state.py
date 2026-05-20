@@ -365,6 +365,12 @@ def _auto_resolve_matching_review(state) -> None:
     cleanest signal that this plan write applies that proposal. No match,
     or no pending proposal in Redis → no-op (reviews stay Pending).
 
+    On a successful flip, the matching Redis proposal is cleared too — the
+    write just applied it, so leaving it in Redis would resurface the same
+    proposal in the next system prompt. Clearing is best-effort: a Redis
+    blip logs a warning but never re-raises (the SQLite flip is already
+    committed and is the source of truth).
+
     The "rejected" path (user replies "don't apply") is intentionally NOT
     auto-detected here — it requires NL-intent parsing on the chat turn,
     which is the next iteration. TODO: detect explicit-rejection turns
@@ -391,10 +397,22 @@ def _auto_resolve_matching_review(state) -> None:
         review = state.find_pending_review_for_activity(strava_id=strava_id)
         if review is None:
             return
-        state.resolve_pending_review(review["id"], "approved")
+        resolved = state.resolve_pending_review(review["id"], "approved")
     except Exception as e:
         logging.getLogger("pre_coach.tools.state").warning(
             f"auto-resolve: failed to flip review for strava_id={strava_id}: {e}"
+        )
+        return
+    if resolved is None:
+        # Lost a race against another resolver — nothing to clear.
+        return
+    try:
+        from pending_proposal_store import clear_pending_plan_proposal
+
+        clear_pending_plan_proposal()
+    except Exception as e:
+        logging.getLogger("pre_coach.tools.state").warning(
+            f"auto-resolve: review {review['id']} flipped to approved but Redis proposal clear failed: {e}"
         )
 
 

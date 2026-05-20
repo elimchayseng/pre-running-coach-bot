@@ -622,15 +622,53 @@ class TestReviews:
         state.save_review(None, 1, date(2026, 5, 15), "recent", None)
         assert state.expire_old_pending_reviews(days=14, today=date(2026, 5, 20)) == []
 
-    def test_expire_old_pending_reviews_fires_mirror_per_row(self, state, monkeypatch):
-        captured: list = []
-        monkeypatch.setattr(state, "_notify_mirror_review", lambda entry: captured.append(entry))
+    def test_expire_old_pending_reviews_fires_one_batched_mirror_call(self, state, monkeypatch):
+        """Sweep fires ONE batched mirror call carrying every stale row —
+        not one daemon thread per row. Regression guard for the original
+        per-row ``_notify_mirror_review`` loop."""
+        per_row_calls: list = []
+        batch_calls: list = []
+        monkeypatch.setattr(state, "_notify_mirror_review", lambda entry: per_row_calls.append(entry))
+        monkeypatch.setattr(state, "_notify_mirror_reviews", lambda entries: batch_calls.append(list(entries)))
         state.save_review(None, 1, date(2026, 4, 1), "a", None)
         state.save_review(None, 2, date(2026, 4, 2), "b", None)
-        captured.clear()  # ignore the save-mirror calls
+        state.save_review(None, 3, date(2026, 4, 3), "c", None)
+        per_row_calls.clear()  # ignore the save-mirror calls
+        batch_calls.clear()
+
         state.expire_old_pending_reviews(days=14, today=date(2026, 5, 20))
-        assert len(captured) == 2
-        assert all(c["status"] == "expired" for c in captured)
+
+        # One batched call, not one per row.
+        assert len(batch_calls) == 1
+        assert len(batch_calls[0]) == 3
+        assert all(r["status"] == "expired" for r in batch_calls[0])
+        # No per-row mirror calls came from the sweep.
+        assert per_row_calls == []
+
+    def test_expire_old_pending_reviews_uses_utc_today(self, state, monkeypatch):
+        """Default ``today`` comes from UTC, not local time. Fix for the
+        local-vs-UTC drift the docstring promised but the code violated."""
+        from datetime import datetime as _dt
+        from datetime import timezone as _tz
+
+        import state_manager as sm
+
+        monkeypatch.setattr(state, "_notify_mirror_reviews", lambda entries: None)
+
+        # Row dated 30 days ago vs the FAKE UTC "now" → must expire.
+        state.save_review(None, 9, date(2026, 4, 1), "old", None)
+
+        class _FakeDateTime:
+            @staticmethod
+            def now(tz=None):
+                assert tz is _tz.utc, "expire sweep must request UTC"
+                return _dt(2026, 5, 20, 9, 0, 0, tzinfo=_tz.utc)
+
+        monkeypatch.setattr(sm, "datetime", _FakeDateTime)
+
+        expired = state.expire_old_pending_reviews(days=14)
+        assert len(expired) == 1
+        assert expired[0]["status"] == "expired"
 
 
 # ---------------- change-body formatters ----------------

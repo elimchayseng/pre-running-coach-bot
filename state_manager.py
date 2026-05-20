@@ -28,7 +28,7 @@ import os
 import sqlite3
 import threading
 from contextlib import contextmanager
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
@@ -647,6 +647,22 @@ class StateManager:
         except Exception:  # noqa: BLE001
             pass
 
+    def _notify_mirror_reviews(self, entries: list[dict]) -> None:
+        """Best-effort batched mirror of N reviews in ONE daemon thread.
+
+        Used by the nightly expire sweep so a 50-row batch fires one Notion
+        worker, not 50. ``mirror_reviews`` upserts each row sequentially
+        inside the single thread.
+        """
+        if not entries:
+            return
+        try:
+            from notion.mirror import mirror_reviews
+
+            mirror_reviews(entries)
+        except Exception:  # noqa: BLE001
+            pass
+
     # ---------- Reviews ----------
 
     def save_review(
@@ -745,8 +761,15 @@ class StateManager:
 
         Pending = ``status IS NULL``. Cutoff is computed against the review's
         ``date`` field (the activity date). Returns the list of rows that
-        were just expired (dicts with ``proposed_change`` parsed); each is
-        mirrored to Notion best-effort.
+        were just expired (dicts with ``proposed_change`` parsed); the whole
+        batch is mirrored to Notion in a single daemon thread (one mirror
+        call, N upserts inside) so a sweep over many stale rows doesn't
+        spawn N threads.
+
+        ``today`` defaults to the current UTC date — the cron that calls this
+        runs on UTC and the schema's ``date`` field is the activity day, also
+        recorded against UTC. Passing a local date here would make the cutoff
+        drift by up to a day either way.
 
         Intended to run nightly via cron — wire as a Railway scheduled job
         (e.g. ``0 9 * * *`` UTC, daily at 9 AM) calling
@@ -754,7 +777,7 @@ class StateManager:
         deliberately does NOT register the schedule itself; scheduling is
         owned by the deploy config.
         """
-        ref = today or date.today()
+        ref = today or datetime.now(timezone.utc).date()
         cutoff = (ref - timedelta(days=days)).isoformat()
         with self._conn() as conn:
             stale = conn.execute(
@@ -774,8 +797,7 @@ class StateManager:
                 stale_ids,
             ).fetchall()
         parsed = [_parse_review_row(dict(r)) for r in rows]
-        for row in parsed:
-            self._notify_mirror_review(row)
+        self._notify_mirror_reviews(parsed)
         return parsed
 
     # ---------- Journal ----------
