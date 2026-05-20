@@ -127,6 +127,21 @@ class TestBuildSystemPrompt:
         assert "Declaratives" in p
         assert "Tables ONLY" in p
 
+    def test_adaptation_norms_defer_to_athlete_profile(self, state):
+        """Regression for issue #23. The race-focus guidance must NOT hardcode
+        specific race names or dates — those go stale the moment the athlete
+        finishes a cycle. The prompt should defer to `target_races` in the
+        athlete profile (which is already embedded in the prompt blob) and
+        describe priority A vs B in phase-agnostic terms."""
+        p = companion.build_system_prompt(state)
+        # No specific race names / dates baked into the prompt template.
+        assert "Broken Arrow" not in p
+        assert "June 20" not in p
+        # The phase-agnostic instruction is present and points at target_races.
+        assert "target_races" in p
+        assert "priority A" in p
+        assert "priority B" in p
+
     def test_pending_proposal_absent_when_empty(self, state, fake_redis):
         p = companion.build_system_prompt(state)
         assert "PENDING PLAN PROPOSAL" not in p
