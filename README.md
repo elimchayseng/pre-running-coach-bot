@@ -109,7 +109,7 @@ sqlite3 /tmp/prod-coach.db
 
 ### Backups
 
-A daily Railway scheduled job runs `scripts/backup_db.py`, which uses SQLite's online-backup API to snapshot the DB and pushes it to a `state-snapshot` branch on GitHub. See the "Deploy" section for the env vars and cron setup.
+`scripts/backup_db.py` snapshots `coach.db` via SQLite's online-backup API and pushes it to a `state-snapshot` branch on GitHub. Run it manually from your laptop (Railway's volume model is single-attach, so a separate cron service can't read the volume). Full playbook — PAT setup, the one-line `railway ssh` invocation, restore procedure: [docs/backups.md](docs/backups.md).
 
 ## Prerequisites
 
@@ -355,10 +355,7 @@ python scripts/migrate_state_to_sqlite.py /app/state --db /app/data/coach.db --r
 
    The bundled `/app/state/*` files in the image are read once to seed the DB, then ignored. The volume's `/app/data/coach.db` is the runtime source of truth from that point on.
 
-8. (Recommended) Wire up the daily backup as a Railway scheduled job:
-   - **Schedule**: `0 11 * * *` (UTC; adjust to a low-traffic hour)
-   - **Start command**: `python scripts/backup_db.py`
-   - **Env vars**: `DATABASE_PATH`, `GITHUB_BACKUP_TOKEN` (PAT with repo write), `GITHUB_REPO` (e.g. `you/pre-running-coach-bot`). Optional: `BACKUP_BRANCH` (default `state-snapshot`), `BACKUP_FORMAT` (default `binary`).
+8. (Recommended) Set up the manual backup playbook in [docs/backups.md](docs/backups.md): create a fine-grained GitHub PAT, install the Railway CLI, and stash a shell alias. Then run `pre-backup` before any risky DB operation (schema migration, bulk update) and on a weekly hygiene cadence. Backups are versioned snapshots of `coach.db` pushed to a `state-snapshot` branch on GitHub — independent of Railway's storage layer.
 
 **Important — single worker only.** SQLite-on-volume tolerates many threads but only one writer process. `Procfile` ships with `gunicorn app:app` (default 1 worker); leave it alone. If you ever need multiple processes, migrate to Postgres rather than bumping workers.
 
