@@ -19,10 +19,7 @@ class TestParseJournalEntries:
         assert entries[0]["body"] == "body"
 
     def test_multiple_entries_in_order(self):
-        text = (
-            "# J\n\n---\n\n## 2026-04-26 — A\n\nbody A\n"
-            "\n---\n\n## 2026-05-01 — B\n\nbody B\n"
-        )
+        text = "# J\n\n---\n\n## 2026-04-26 — A\n\nbody A\n\n---\n\n## 2026-05-01 — B\n\nbody B\n"
         entries = parse_journal_entries(text)
         assert [e["title"] for e in entries] == ["2026-04-26 — A", "2026-05-01 — B"]
 
