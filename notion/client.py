@@ -219,6 +219,29 @@ class NotionClient:
             payload.update(extra)
         return self._request("POST", "/views", payload)
 
+    def list_views(self, database_id: str) -> dict:
+        """GET /databases/:id/views — list views on a database.
+
+        Used by the views bootstrap to skip specs that already exist (matched
+        on ``name``). Paginates if Notion ever returns more than one page; in
+        practice each mirror DB has only a handful of views so a single page
+        is the realistic case.
+        """
+        results: list = []
+        cursor: Optional[str] = None
+        for _ in range(20):
+            path = f"/databases/{database_id}/views"
+            if cursor:
+                path = f"{path}?start_cursor={cursor}"
+            page = self._request("GET", path)
+            results.extend(page.get("results", []))
+            if not page.get("has_more"):
+                break
+            cursor = page.get("next_cursor")
+            if not cursor:
+                break
+        return {"results": results}
+
 
 # ---------- helpers ----------
 
