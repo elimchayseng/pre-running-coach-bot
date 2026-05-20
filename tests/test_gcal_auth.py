@@ -184,3 +184,95 @@ class TestRefreshRetry:
         with pytest.raises(auth.GcalAuthError):
             _auth._refresh("rt")
         assert attempts["n"] == 1
+
+
+class TestSetupScriptOobFlow:
+    """Cover the new --no-listener / --code flow in scripts/google_calendar_setup.py.
+
+    The bug fixed by issue #13: the default flow binds a loopback HTTP listener
+    that only works on a developer laptop. Inside `railway shell` the redirect
+    lands on the laptop and the script hangs. The OOB flow uses
+    `urn:ietf:wg:oauth:2.0:oob` and asks the user to paste the code.
+    """
+
+    def _import_script(self):
+        import importlib.util
+        from pathlib import Path
+
+        # The script lives in scripts/ which is not on sys.path by default;
+        # load it directly so we can test its helpers without invoking main().
+        script = Path(__file__).resolve().parent.parent / "scripts" / "google_calendar_setup.py"
+        spec = importlib.util.spec_from_file_location("_gcal_setup_under_test", script)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_build_auth_url_uses_oob_redirect(self):
+        mod = self._import_script()
+        url = mod._build_auth_url("cid123", mod.OOB_REDIRECT_URI, "state-xyz")
+        assert "redirect_uri=urn%3Aietf%3Awg%3Aoauth%3A2.0%3Aoob" in url
+        assert "client_id=cid123" in url
+        assert "state=state-xyz" in url
+        assert "access_type=offline" in url
+        assert "prompt=consent" in url
+
+    def test_build_auth_url_uses_loopback_when_requested(self):
+        mod = self._import_script()
+        url = mod._build_auth_url("cid", mod.REDIRECT_URI, "st")
+        # Loopback redirect_uri is URL-encoded but should still embed 127.0.0.1.
+        assert "127.0.0.1" in url
+
+    def test_code_flag_skips_listener_and_uses_oob_redirect(self, monkeypatch):
+        """`--code <code>` must call exchange with OOB redirect_uri and never
+        touch the HTTP listener."""
+        mod = self._import_script()
+        monkeypatch.setenv("GCAL_CLIENT_ID", "cid")
+        monkeypatch.setenv("GCAL_CLIENT_SECRET", "secret")
+
+        called = {}
+
+        def _fake_exchange(code, redirect_uri):
+            called["code"] = code
+            called["redirect_uri"] = redirect_uri
+            return {"refresh_token": "r", "access_token": "a", "expires_at": 1}
+
+        monkeypatch.setattr(mod.auth, "exchange_code_for_tokens", _fake_exchange)
+        # Sanity guard: if the listener path were taken, this would raise
+        # because HTTPServer is not monkeypatched. Confirms we short-circuit.
+        monkeypatch.setattr(
+            mod.http.server,
+            "HTTPServer",
+            lambda *a, **kw: (_ for _ in ()).throw(AssertionError("listener should not be used")),
+        )
+
+        import argparse as _argparse
+
+        args = _argparse.Namespace(code="abc123", no_listener=False)
+        rc = mod.cmd_auth(args)
+        assert rc == 0
+        assert called == {"code": "abc123", "redirect_uri": mod.OOB_REDIRECT_URI}
+
+    def test_no_listener_flag_prompts_for_code(self, monkeypatch, capsys):
+        mod = self._import_script()
+        monkeypatch.setenv("GCAL_CLIENT_ID", "cid")
+        monkeypatch.setenv("GCAL_CLIENT_SECRET", "secret")
+
+        called = {}
+
+        def _fake_exchange(code, redirect_uri):
+            called["code"] = code
+            called["redirect_uri"] = redirect_uri
+            return {"refresh_token": "r", "access_token": "a", "expires_at": 1}
+
+        monkeypatch.setattr(mod.auth, "exchange_code_for_tokens", _fake_exchange)
+        monkeypatch.setattr("builtins.input", lambda _prompt="": "pasted-code")
+
+        import argparse as _argparse
+
+        args = _argparse.Namespace(code=None, no_listener=True)
+        rc = mod.cmd_auth(args)
+        assert rc == 0
+        assert called == {"code": "pasted-code", "redirect_uri": mod.OOB_REDIRECT_URI}
+        # The printed URL must carry the OOB redirect_uri (URL-encoded).
+        out = capsys.readouterr().out
+        assert "urn%3Aietf%3Awg%3Aoauth%3A2.0%3Aoob" in out

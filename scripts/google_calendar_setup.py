@@ -2,7 +2,9 @@
 
 Subcommands:
     auth        Walk through OAuth via a one-shot loopback HTTP listener,
-                store tokens in the configured backend.
+                store tokens in the configured backend. Pass --no-listener
+                (or --code <code>) to use the OOB paste-code flow inside a
+                container shell where the loopback redirect can't work.
     status      Show env, tokens, calendar metadata, sync state.
     sync        Push plan.md weekly table to the PRE Training calendar.
     purge       Delete every pre_managed event in [today-365d, today+365d].
@@ -26,6 +28,8 @@ production verification is overkill for a single-user app.
 
 Usage:
     ./venv/bin/python scripts/google_calendar_setup.py auth
+    ./venv/bin/python scripts/google_calendar_setup.py auth --no-listener
+    ./venv/bin/python scripts/google_calendar_setup.py auth --code "<code>"
     ./venv/bin/python scripts/google_calendar_setup.py status
     ./venv/bin/python scripts/google_calendar_setup.py sync --dry-run
     ./venv/bin/python scripts/google_calendar_setup.py sync
@@ -42,6 +46,7 @@ import time
 import urllib.parse
 import webbrowser
 from pathlib import Path
+from typing import Optional
 from urllib.parse import urlencode
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -57,6 +62,11 @@ from google_calendar import auth, client, sync  # noqa: E402
 LOOPBACK_HOST = "127.0.0.1"
 LOOPBACK_PORT = 8765
 REDIRECT_URI = f"http://{LOOPBACK_HOST}:{LOOPBACK_PORT}/"
+# OOB ("out of band") redirect: Google shows the code on a page and the user
+# pastes it into the terminal. Used by the --no-listener / --code flow for
+# container shells (e.g. `railway shell`) where the loopback redirect can't
+# work because the browser runs on the laptop, not the container.
+OOB_REDIRECT_URI = "urn:ietf:wg:oauth:2.0:oob"
 SCOPE = "https://www.googleapis.com/auth/calendar.events"
 AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 
@@ -116,17 +126,15 @@ class _OAuthHandler(http.server.BaseHTTPRequestHandler):
         pass
 
 
-def cmd_auth(_: argparse.Namespace) -> int:
-    cid = os.getenv("GCAL_CLIENT_ID")
-    secret = os.getenv("GCAL_CLIENT_SECRET")
-    if not cid or not secret:
-        print("GCAL_CLIENT_ID and GCAL_CLIENT_SECRET must be set in .env", file=sys.stderr)
-        return 1
+def _build_auth_url(client_id: str, redirect_uri: str, state_token: str) -> str:
+    """Build the Google OAuth authorize URL.
 
-    state_token = secrets.token_urlsafe(24)
+    Factored out so the OOB / loopback redirect_uri branch can be unit-tested
+    without standing up an HTTP server or doing any network I/O.
+    """
     params = {
-        "client_id": cid,
-        "redirect_uri": REDIRECT_URI,
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
         "response_type": "code",
         "scope": SCOPE,
         "access_type": "offline",
@@ -136,7 +144,80 @@ def cmd_auth(_: argparse.Namespace) -> int:
         "prompt": "consent",
         "state": state_token,
     }
-    url = f"{AUTH_URL}?{urlencode(params)}"
+    return f"{AUTH_URL}?{urlencode(params)}"
+
+
+def _exchange_and_report(code: str, redirect_uri: str) -> int:
+    """Exchange `code` for tokens and print a result line. Shared by both flows."""
+    try:
+        auth.exchange_code_for_tokens(code, redirect_uri)
+    except Exception as e:
+        print(f"\nAuth failed: {e}", file=sys.stderr)
+        print(
+            "\nCommon causes:\n"
+            "  - GCAL_CLIENT_SECRET is wrong\n"
+            "  - The OAuth client in GCP is not type 'Desktop app'\n"
+            "  - You revoked the app at https://myaccount.google.com/permissions\n"
+            "    but Google didn't return a refresh_token (re-run; prompt=consent\n"
+            "    forces it but the consent screen must actually appear)\n"
+            "  - The code was already used or expired (single-use, short TTL)",
+            file=sys.stderr,
+        )
+        return 1
+    print(f"\n✓ Wrote tokens to {auth._backend()} backend.")
+    return 0
+
+
+def _cmd_auth_oob(provided_code: Optional[str]) -> int:
+    """Non-listener flow for non-interactive container shells.
+
+    Uses the OOB redirect_uri so Google displays the code on a page the user
+    can copy. We either accept `--code` directly or prompt via input(). No
+    HTTP listener is bound — works inside `railway shell` etc.
+    """
+    cid = os.getenv("GCAL_CLIENT_ID")
+    secret = os.getenv("GCAL_CLIENT_SECRET")
+    if not cid or not secret:
+        print("GCAL_CLIENT_ID and GCAL_CLIENT_SECRET must be set in .env", file=sys.stderr)
+        return 1
+
+    if provided_code:
+        return _exchange_and_report(provided_code, OOB_REDIRECT_URI)
+
+    state_token = secrets.token_urlsafe(24)
+    url = _build_auth_url(cid, OOB_REDIRECT_URI, state_token)
+    print(
+        f"\nBackend: {auth._backend()}\n\n"
+        "1. Open this URL in your browser and authorize:\n\n"
+        f"   {url}\n\n"
+        "2. Google will display the authorization code. Copy it.\n"
+    )
+    try:
+        code = input("Paste code: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print("\nAborted.", file=sys.stderr)
+        return 1
+    if not code:
+        print("No code provided.", file=sys.stderr)
+        return 1
+    return _exchange_and_report(code, OOB_REDIRECT_URI)
+
+
+def cmd_auth(args: argparse.Namespace) -> int:
+    # Container/non-interactive shells: skip the loopback listener entirely.
+    # Using `--code` implies `--no-listener` since the listener serves no
+    # purpose when the code is already in hand.
+    if getattr(args, "code", None) or getattr(args, "no_listener", False):
+        return _cmd_auth_oob(getattr(args, "code", None))
+
+    cid = os.getenv("GCAL_CLIENT_ID")
+    secret = os.getenv("GCAL_CLIENT_SECRET")
+    if not cid or not secret:
+        print("GCAL_CLIENT_ID and GCAL_CLIENT_SECRET must be set in .env", file=sys.stderr)
+        return 1
+
+    state_token = secrets.token_urlsafe(24)
+    url = _build_auth_url(cid, REDIRECT_URI, state_token)
 
     try:
         server = http.server.HTTPServer((LOOPBACK_HOST, LOOPBACK_PORT), _OAuthHandler)
@@ -187,23 +268,7 @@ def cmd_auth(_: argparse.Namespace) -> int:
         print("No code in callback.", file=sys.stderr)
         return 1
 
-    try:
-        auth.exchange_code_for_tokens(code, REDIRECT_URI)
-    except Exception as e:
-        print(f"\nAuth failed: {e}", file=sys.stderr)
-        print(
-            "\nCommon causes:\n"
-            "  - GCAL_CLIENT_SECRET is wrong\n"
-            "  - The OAuth client in GCP is not type 'Desktop app'\n"
-            "  - You revoked the app at https://myaccount.google.com/permissions\n"
-            "    but Google didn't return a refresh_token (re-run; prompt=consent\n"
-            "    forces it but the consent screen must actually appear)",
-            file=sys.stderr,
-        )
-        return 1
-
-    print(f"\n✓ Wrote tokens to {auth._backend()} backend.")
-    return 0
+    return _exchange_and_report(code, REDIRECT_URI)
 
 
 # ---------- status ----------
@@ -380,7 +445,24 @@ def cmd_purge(args: argparse.Namespace) -> int:
 def main() -> int:
     p = argparse.ArgumentParser(description="Google Calendar integration setup + diagnostics")
     sub = p.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("auth", help="OAuth via loopback listener").set_defaults(func=cmd_auth)
+    auth_p = sub.add_parser(
+        "auth",
+        help="OAuth via loopback listener (default) or OOB paste-code flow (--no-listener / --code)",
+    )
+    auth_p.add_argument(
+        "--code",
+        help="Pre-obtained authorization code (OOB flow). Skips listener and prompt; exchanges immediately.",
+    )
+    auth_p.add_argument(
+        "--no-listener",
+        action="store_true",
+        help=(
+            "Skip the loopback HTTP listener. Prints an OOB authorize URL "
+            "and prompts for the code. Use inside container shells (e.g. "
+            "`railway shell`) where the loopback redirect can't work."
+        ),
+    )
+    auth_p.set_defaults(func=cmd_auth)
     sub.add_parser("status", help="Show env / tokens / calendar / sync state").set_defaults(func=cmd_status)
 
     sync_p = sub.add_parser("sync", help="Push plan.md table to the calendar")
