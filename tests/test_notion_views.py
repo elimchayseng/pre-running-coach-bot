@@ -101,16 +101,19 @@ class TestSpecsMatchIssue:
         assert names == ["Calendar", "This week", "By status", "Recent completed"]
 
     def test_journal_view_names(self):
+        # "By tag" dropped — see notion/views.py header note.
         names = [s.name for s in JOURNAL_VIEWS]
-        assert names == ["Today", "Recent", "By tag", "Sleep < 6h"]
+        assert names == ["Today", "Recent", "Sleep < 6h"]
 
     def test_plan_changes_view_names(self):
+        # "By action" dropped — see notion/views.py header note.
         names = [s.name for s in PLAN_CHANGES_VIEWS]
-        assert names == ["All", "This week", "By action"]
+        assert names == ["All", "This week"]
 
     def test_reviews_view_names(self):
+        # "By status" dropped — see notion/views.py header note.
         names = [s.name for s in REVIEWS_VIEWS]
-        assert names == ["All", "Pending", "This week", "By status"]
+        assert names == ["All", "Pending", "This week"]
 
     def test_reviews_pending_is_status_empty(self):
         pending = next(s for s in REVIEWS_VIEWS if s.name == "Pending")
@@ -252,10 +255,11 @@ class TestCreateViewsAggregate:
 
 
 class TestListViews:
-    """Lightweight check that the client's list_views uses GET against the
-    database views endpoint. Full HTTP-layer coverage lives in test_notion.py."""
+    """The list endpoint is two-stage: GET /views?database_id=X returns
+    ``{object, id}`` only, then we fetch each view individually to populate
+    the name/type/configuration the bootstrap needs for dedupe."""
 
-    def test_list_views_hits_get_databases_id_views(self, monkeypatch):
+    def test_list_views_fans_out_per_view(self, monkeypatch):
         from notion.client import NotionClient
 
         monkeypatch.setenv("NOTION_TOKEN", "ntn_test")
@@ -268,20 +272,35 @@ class TestListViews:
             content = b"{}"
             headers: dict = {}
 
+            def __init__(self, body: dict):
+                self._body = body
+
             def json(self):
-                return {"results": [{"name": "Calendar"}], "has_more": False}
+                return self._body
 
         class _Session:
             def request(self, method, url, json=None, headers=None, timeout=None):
                 calls.append((method, url))
-                return _Resp()
+                if "?database_id=" in url:
+                    return _Resp(
+                        {
+                            "results": [{"object": "view", "id": "v1"}, {"object": "view", "id": "v2"}],
+                            "has_more": False,
+                        }
+                    )
+                # /views/:id
+                vid = url.rsplit("/", 1)[-1]
+                return _Resp({"object": "view", "id": vid, "name": f"name-{vid}", "type": "table"})
 
         c = NotionClient()
         c._session = _Session()
         out = c.list_views("db-abc")
-        assert out["results"][0]["name"] == "Calendar"
+        assert [v["name"] for v in out["results"]] == ["name-v1", "name-v2"]
+        # First call lists ids; subsequent calls fetch each view's full object.
         assert calls[0][0] == "GET"
-        assert calls[0][1].endswith("/databases/db-abc/views")
+        assert calls[0][1].endswith("/views?database_id=db-abc")
+        assert calls[1][1].endswith("/views/v1")
+        assert calls[2][1].endswith("/views/v2")
 
 
 # Sanity: the module imports cleanly and exposes the expected public API.
