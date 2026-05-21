@@ -101,6 +101,56 @@ class TestSessionProperties:
         assert props["Strava ID"] == {"number": None}
 
 
+class TestSessionTitle:
+    """Title regimes by status (issue #45): planned uses the prescribed text
+    verbatim; completed/off-plan synthesize from actual miles + type so the
+    title reflects what happened, not what was planned. No date prefix in
+    either case — that lives on the Date property and on the Calendar cell."""
+
+    def _title_of(self, row):
+        props = mirror._session_properties(row, "sid:5")
+        return props["Title"]["title"][0]["text"]["content"]
+
+    def test_planned_uses_prescribed_text(self):
+        assert self._title_of(_row()) == "Easy 8mi"
+
+    def test_planned_without_prescribed_falls_back_to_type(self):
+        assert self._title_of(_row(prescribed_workout=None)) == "easy"
+
+    def test_planned_without_prescribed_or_type_falls_back_to_session(self):
+        assert self._title_of(_row(prescribed_workout=None, type=None)) == "session"
+
+    def test_completed_uses_actual_miles_and_type(self):
+        data = json.dumps({"miles": 8.1})
+        assert self._title_of(_row(status="completed", data=data)) == "8.1 mi (easy)"
+
+    def test_completed_drops_trailing_zero_decimal(self):
+        data = json.dumps({"miles": 6.0})
+        assert self._title_of(_row(status="completed", data=data)) == "6 mi (easy)"
+
+    def test_off_plan_also_uses_actual_miles(self):
+        data = json.dumps({"miles": 3.27})
+        assert self._title_of(_row(status="off-plan", type="easy", data=data)) == "3.3 mi (easy)"
+
+    def test_completed_without_miles_falls_back_to_prescribed(self):
+        # Strength / cross have no miles; title should still be useful.
+        row = _row(status="completed", type="strength", prescribed_workout="30min strength")
+        assert self._title_of(row) == "30min strength"
+
+    def test_completed_with_zero_miles_falls_back_to_prescribed(self):
+        data = json.dumps({"miles": 0})
+        assert self._title_of(_row(status="completed", data=data)) == "Easy 8mi"
+
+    def test_missed_uses_prescribed_text(self):
+        # Missed sessions still show what was planned, not a synthesized "0 mi".
+        assert self._title_of(_row(status="missed")) == "Easy 8mi"
+
+    def test_no_date_prefix(self):
+        # Regression: ensure the 2026-05-16 date string never leaks into the title.
+        title = self._title_of(_row())
+        assert "2026-" not in title, f"date prefix leaked into title: {title!r}"
+
+
 # ---------------- upsert ----------------
 
 
