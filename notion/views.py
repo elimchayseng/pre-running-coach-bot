@@ -142,6 +142,20 @@ SESSIONS_VIEWS: list[ViewSpec] = [
 ]
 
 
+# NOTE on dropped specs (post-1B.5 live verification):
+# Three board specs from the original 15-view set were dropped after the live
+# /v1/views POSTs revealed they couldn't be made to render correctly:
+#   - JOURNAL "By tag" — Notion silently swapped the multi_select Tags group_by
+#     to the first single_select it found (Stress). Multi-select board grouping
+#     is not supported by /v1/views on 2026-03-11.
+#   - PLAN_CHANGES "By action" — board created with configuration:null. Tried 4
+#     payload shapes (string, object, typed-object, explicit property_id);
+#     all produced null config. Strongly correlates with the DB having a
+#     relation property, but root cause unconfirmed.
+#   - REVIEWS "By status" — same failure mode as PLAN_CHANGES "By action".
+# If Notion fixes /v1/views to honor these payloads, re-add the specs.
+
+
 JOURNAL_VIEWS: list[ViewSpec] = [
     # The issue notes "today" may not be a supported smart-filter; we ship
     # past_week as the documented closest fit. If Notion later exposes a
@@ -158,13 +172,6 @@ JOURNAL_VIEWS: list[ViewSpec] = [
         name="Recent",
         view_type="table",
         sorts=[_sort("Date", "descending")],
-    ),
-    ViewSpec(
-        name="By tag",
-        view_type="board",
-        extra={"board": {"group_by": "Tags"}},
-        speculative=True,
-        notes="Multi-select board grouping on `Tags` not fully documented; may require a different extra payload.",
     ),
     ViewSpec(
         name="Sleep < 6h",
@@ -189,13 +196,6 @@ PLAN_CHANGES_VIEWS: list[ViewSpec] = [
         speculative=True,
         notes="Relative-date smart-filter operator 'this_week' assumed identical to /v1/data_sources query filters.",
     ),
-    ViewSpec(
-        name="By action",
-        view_type="board",
-        extra={"board": {"group_by": "Action"}},
-        speculative=True,
-        notes="board.group_by exact payload shape (string vs object) not fully documented for /v1/views.",
-    ),
 ]
 
 
@@ -218,13 +218,6 @@ REVIEWS_VIEWS: list[ViewSpec] = [
         sorts=[_sort("Date", "ascending")],
         speculative=True,
         notes="Relative-date smart-filter operator 'this_week' assumed identical to /v1/data_sources query filters.",
-    ),
-    ViewSpec(
-        name="By status",
-        view_type="board",
-        extra={"board": {"group_by": "Status"}},
-        speculative=True,
-        notes="board.group_by exact payload shape (string vs object) not fully documented for /v1/views.",
     ),
 ]
 

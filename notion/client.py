@@ -220,26 +220,31 @@ class NotionClient:
         return self._request("POST", "/views", payload)
 
     def list_views(self, database_id: str) -> dict:
-        """GET /databases/:id/views — list views on a database.
+        """GET /views?database_id=:id — list views on a database.
 
-        Used by the views bootstrap to skip specs that already exist (matched
-        on ``name``). Paginates if Notion ever returns more than one page; in
-        practice each mirror DB has only a handful of views so a single page
-        is the realistic case.
+        Two-stage because Notion's list endpoint only returns ``{object, id}``
+        per result. The bootstrap dedupes on ``name``, so we fetch each view
+        individually (``GET /views/:id``) to populate the full object. A
+        mirror DB has ~5 views; the per-view fetches are well under Notion's
+        3 req/s limit, and the bootstrap runs manually off the request path.
         """
-        results: list = []
+        ids: list[str] = []
         cursor: Optional[str] = None
         for _ in range(20):
-            path = f"/databases/{database_id}/views"
+            path = f"/views?database_id={database_id}"
             if cursor:
-                path = f"{path}?start_cursor={cursor}"
+                path = f"{path}&start_cursor={cursor}"
             page = self._request("GET", path)
-            results.extend(page.get("results", []))
+            for v in page.get("results", []):
+                vid = v.get("id")
+                if vid:
+                    ids.append(vid)
             if not page.get("has_more"):
                 break
             cursor = page.get("next_cursor")
             if not cursor:
                 break
+        results = [self._request("GET", f"/views/{vid}") for vid in ids]
         return {"results": results}
 
 

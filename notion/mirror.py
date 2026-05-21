@@ -153,14 +153,37 @@ def _review_properties(row: dict, source_key: str, session_page_id: Optional[str
     }
 
 
+def _session_title(row: dict, data: dict) -> str:
+    """Title for a Sessions Notion page.
+
+    Two regimes by status:
+      - completed / off-plan with actual miles → ``"{miles} mi ({type})"``
+        (e.g. ``"8.1 mi (easy)"``). Synthesized from the structured actuals
+        so the title reflects what actually happened, not what was planned.
+      - everything else → the ``prescribed_workout`` text verbatim (e.g.
+        ``"Easy 8mi"``), falling back to ``type`` then ``"session"``.
+
+    The date deliberately isn't in the title: the Date property carries it
+    structurally and the Calendar view shows it on the cell. Matches the
+    Google Calendar event-summary convention so the same session reads
+    consistently across surfaces (issue #45).
+    """
+    status = row.get("status")
+    miles = data.get("miles")
+    sess_type = row.get("type")
+    if status in ("completed", "off-plan") and isinstance(miles, (int, float)) and miles > 0:
+        miles_str = f"{round(miles, 1):g}"
+        return f"{miles_str} mi ({sess_type})" if sess_type else f"{miles_str} mi"
+    return row.get("prescribed_workout") or sess_type or "session"
+
+
 def _session_properties(row: dict, source_key: str) -> dict:
     """Map a SQLite sessions row to PRE Sessions Notion properties."""
     data = _session_data(row)
     details = data.get("details") or {}
-    label = row.get("prescribed_workout") or row.get("type") or "session"
     sid = details.get("strava_id")
     props = {
-        "Title": _title(f"{row['date']} — {label}"),
+        "Title": _title(_session_title(row, data)),
         "Date": {"date": {"start": row["date"]}},
         "Slot": _select(row.get("slot")),
         "Status": _select(row.get("status")),
