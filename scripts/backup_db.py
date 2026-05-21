@@ -1,20 +1,25 @@
-"""Daily backup of coach.db to a state-snapshot git branch.
+"""Manual snapshot of coach.db to a state-snapshot git branch.
 
-Run from a Railway scheduled job once a day. Uses ``sqlite3 .backup`` (online
-backup API — safe to run while the bot is writing) to produce a consistent
-snapshot, then commits and pushes the dump to GitHub on a dedicated branch.
+Run via ``railway ssh --service web`` (see docs/backups.md for the alias).
+Uses ``sqlite3 .backup`` (online backup API — safe to run while the bot is
+writing) to produce a consistent snapshot, then commits and pushes the dump
+to GitHub on a dedicated branch. Idempotent: a byte-identical snapshot is
+detected via ``git diff --cached --quiet`` and skipped without a new commit.
 
 Required env vars:
     DATABASE_PATH          path to the live coach.db (e.g. /app/data/coach.db)
     GITHUB_BACKUP_TOKEN    a fine-scoped PAT or deploy token with write access
-                           to GITHUB_REPO. We never log this.
+                           to GITHUB_REPO. We never log this — ``_redact()``
+                           strips it from every subprocess invocation and any
+                           captured stderr/stdout.
     GITHUB_REPO            "owner/repo", e.g. "elimchayseng/pre-running-coach-bot"
     BACKUP_BRANCH          (optional) branch name; default "state-snapshot"
     BACKUP_FORMAT          (optional) "binary" (default, faster restore) or
                            "sql" (text dump, human-diffable)
 
-Restoring: clone the repo, check out the snapshot branch, copy coach.db to the
-Railway volume (or apply coach.sql via ``sqlite3 fresh.db < coach.sql``).
+Restoring: see docs/backups.md "Restore procedure" — the snapshot file lands
+on the volume via ``railway shell`` + base64 paste (or ``railway run`` with
+the file in the working directory), then is copied onto /app/data/coach.db.
 """
 
 from __future__ import annotations

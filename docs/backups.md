@@ -1,8 +1,8 @@
 # Backups runbook
 
-Operational reference for the daily SQLite backup job. The bot's authoritative state lives in a single SQLite file (`$DATABASE_PATH`, default `state/coach.db`) on a Railway persistent volume. The volume survives deploys and restarts but is single-region with no point-in-time recovery and no versioned history — a volume failure or accidental deletion would wipe everything.
+Operational reference for the SQLite backup playbook. The bot's authoritative state lives in a single SQLite file (`$DATABASE_PATH`, default `state/coach.db`) on a Railway persistent volume. The volume survives deploys and restarts but is single-region with no point-in-time recovery and no versioned history — a volume failure or accidental deletion would wipe everything.
 
-[`scripts/backup_db.py`](../scripts/backup_db.py) snapshots the DB using SQLite's [online-backup API](https://www.sqlite.org/backup.html) (safe while the bot is writing) and pushes the result to a dedicated `state-snapshot` branch on GitHub. Run it daily from a Railway scheduled job for versioned, off-site backups at zero infra cost.
+[`scripts/backup_db.py`](../scripts/backup_db.py) snapshots the DB using SQLite's [online-backup API](https://www.sqlite.org/backup.html) (safe while the bot is writing) and pushes the result to a dedicated `state-snapshot` branch on GitHub. **Backups are manual.** Railway's volume model is single-attach, so a separate cron service can't read the volume; the script runs inside the web service container via `railway ssh` on whatever cadence you commit to.
 
 ## Prerequisites
 
@@ -12,51 +12,76 @@ Create the token at <https://github.com/settings/personal-access-tokens/new>:
 
 - **Repository access**: *Only select repositories* → this repo only.
 - **Repository permissions** → **Contents**: *Read and write* (nothing else).
-- **Expiration**: pick something you're comfortable rotating (90 days is reasonable).
+- **Expiration**: pick something you're comfortable rotating (1 year is reasonable; calendar-remind yourself).
 
-Copy the token once — GitHub won't show it again. Treat it like any other secret.
+Copy the token once — GitHub won't show it again. Stash it in 1Password / Notes / wherever you keep secrets.
 
-### 2. Railway persistent volume
+### 2. Railway CLI
 
-The job must mount the same `coach-state` volume the web service writes to, otherwise it'll snapshot an empty DB. See the [README → Deployment](../README.md#deployment) for the volume setup; the backup job needs the volume mounted at the same path as the web service (default `/app/data`).
+```bash
+brew install railwayapp/railway/railway   # skip if installed
+railway login                              # browser-based auth
+railway link                               # select this project
+```
+
+Verify SSH into the web service works:
+
+```bash
+railway ssh --service web "ls -la /app/data/coach.db"
+```
+
+Should print the DB file with a non-zero size. If the service isn't named `web`, find the actual name in the Railway dashboard.
+
+### 3. Shell alias (recommended)
+
+So you don't retype env vars every time. Append to `~/.zshrc` (or your shell's rc file):
+
+```bash
+export PRE_BACKUP_PAT='github_pat_...paste-here...'
+alias pre-backup='railway ssh --service web "DATABASE_PATH=/app/data/coach.db GITHUB_BACKUP_TOKEN=$PRE_BACKUP_PAT GITHUB_REPO=elimchayseng/pre-running-coach-bot python scripts/backup_db.py"'
+```
+
+`source ~/.zshrc` to pick it up.
 
 ## Env vars
 
 | Var | Required? | Notes |
 |---|---|---|
-| `DATABASE_PATH` | yes | Path to the live `coach.db` on the mounted volume (e.g. `/app/data/coach.db`). |
+| `DATABASE_PATH` | yes | Path to the live `coach.db` on the mounted volume. Inside the container: `/app/data/coach.db`. |
 | `GITHUB_BACKUP_TOKEN` | yes | The fine-grained PAT from step 1. Never logged — `_redact()` strips it from any subprocess output. |
 | `GITHUB_REPO` | yes | `owner/repo`, e.g. `elimchayseng/pre-running-coach-bot`. |
 | `BACKUP_BRANCH` | no | Branch to push snapshots to. Defaults to `state-snapshot`. |
 | `BACKUP_FORMAT` | no | `binary` (default — fast restore, opaque diffs) or `sql` (human-diffable text dump via `iterdump()`). |
 
-## Railway scheduled job
+## Taking a snapshot
 
-1. In the Railway project, create a new scheduled job (Settings → New Service → Cron Job).
-2. **Schedule**: `0 11 * * *` — 11:00 UTC daily. Pick a low-traffic hour for the bot; backups are fast (seconds) but they hold a read lock during the copy.
-3. **Start command**: `python scripts/backup_db.py`
-4. **Mount the `coach-state` volume** at `/app/data` (same mount as the web service).
-5. **Env vars**: the three required ones above. Optional `BACKUP_BRANCH` / `BACKUP_FORMAT` if you want non-defaults.
-6. Trigger it manually once via Railway's UI and confirm a commit appears on the `state-snapshot` branch with `coach.db` (or `coach.sql`). The log line on success looks like `snapshot 2026-05-20T11-00-00Z pushed to elimchayseng/pre-running-coach-bot on branch state-snapshot`.
+With the alias set up:
+
+```bash
+pre-backup
+```
+
+Or the long-form, runnable from anywhere:
+
+```bash
+railway ssh --service web "DATABASE_PATH=/app/data/coach.db GITHUB_BACKUP_TOKEN='<paste-PAT>' GITHUB_REPO=elimchayseng/pre-running-coach-bot python scripts/backup_db.py"
+```
+
+Expected output: `snapshot 2026-05-20T... pushed to elimchayseng/pre-running-coach-bot on branch state-snapshot`. If the DB hasn't changed since the last run, you'll see `no changes since last snapshot; skipping commit` — that's the idempotency guard, not an error.
+
+**Verify** by visiting <https://github.com/elimchayseng/pre-running-coach-bot/tree/state-snapshot>. Latest commit timestamp should match "just now" and the tree should contain `coach.db`.
+
+## When to run it
+
+- **Mandatory**: before any schema migration, column drop, or bulk `UPDATE` / `DELETE` against prod.
+- **Hygiene**: pick a weekly cadence (e.g. Sunday evenings) and calendar-remind yourself. Manual is only as reliable as your discipline.
+- **Ad hoc**: after manually backfilling data you'd hate to re-enter.
 
 ## Idempotency and exit codes
 
 - If today's snapshot is byte-identical to the last one already on the branch, the job logs `no changes since last snapshot; skipping commit` and exits 0 without pushing — safe to re-run.
 - Missing env vars, a missing DB file, or an invalid `BACKUP_FORMAT` exit with code 2 *before* any network I/O.
-- Any clone/push failure raises `CalledProcessError` and propagates a non-zero exit. Configure Railway to alert on non-zero cron exits.
-
-## Manual trigger (from your laptop)
-
-Useful before destructive operations (e.g. running migrations against prod):
-
-```bash
-DATABASE_PATH=/path/to/local-or-pulled/coach.db \
-GITHUB_BACKUP_TOKEN=ghp_... \
-GITHUB_REPO=elimchayseng/pre-running-coach-bot \
-python scripts/backup_db.py
-```
-
-To pull prod's DB down first, use `./scripts/state_pull.sh -o /tmp/prod-coach.db` and point `DATABASE_PATH` at that.
+- Any clone/push failure raises `CalledProcessError` and propagates a non-zero exit.
 
 ## Restore procedure
 
@@ -122,6 +147,19 @@ sqlite3 /app/data/coach.db < /tmp/coach.sql
 
 Then exit the shell and restart the web service from Railway's UI so gunicorn re-opens the DB and the schema migrations in `gunicorn.conf.py:on_starting` re-run idempotently against the restored data.
 
+## What this protects against
+
+- Railway volume loss or corruption.
+- Bad schema migration that scrambles the live DB.
+- Accidental `DELETE` / `UPDATE` on prod.
+- Single-region Railway outage — the GitHub copy is independent of Railway's storage layer.
+
+## What this does NOT protect against
+
+- **Forgetting to run it.** Manual is only as reliable as your discipline; the longer between runs, the more recent data you'd lose in a recovery.
+- Notion being out of sync with the snapshot timestamp. Notion is best-effort one-way; not authoritative.
+- GitHub itself being inaccessible at restore time. Rare but real — a global GitHub outage would block restore.
+
 ## Log safety
 
-`_redact()` substitutes `x-access-token:[REDACTED]@` for the PAT-bearing clone URL in every logged command and any captured `stderr`/`stdout` from `git`. Cron logs (Railway's job-run history, log forwarders, error trackers) are safe to share verbatim for debugging — the token never lands in a log line.
+`_redact()` substitutes `x-access-token:[REDACTED]@` for the PAT-bearing clone URL in every logged command and any captured `stderr`/`stdout` from `git`. Logs are safe to share verbatim for debugging — the token never lands in a log line.
