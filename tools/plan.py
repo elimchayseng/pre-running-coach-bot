@@ -76,11 +76,14 @@ SCHEMAS = [
                 "when summarizing the week's progress so you can render a "
                 "check (✅) for completed days, an hourglass (⏳) for today "
                 "or future days, and a cross (❌) for past days that were "
-                "missed. A day is 'completed' when a logged session type "
-                "matches the prescription kind (run / cross_train / "
-                "strength). Off-plan logs are returned in `off_plan_actuals` "
-                "so you can mention them without claiming the prescription "
-                "was met."
+                "missed. A day is 'completed' when every slot's completion "
+                "flag in `sessions[]` is true. On single-session days the "
+                "day-level `actuals` / `off_plan_actuals` summarize logs at "
+                "the day level (matched vs not). On multi-session days those "
+                "two lists are empty — iterate `sessions[]` for per-slot "
+                "`completed` + `actual` instead, since day-level aggregation "
+                "can't distinguish a wrong-type upload from a correct one "
+                "against a different slot's kind."
             ),
             "parameters": {
                 "type": "object",
@@ -218,20 +221,25 @@ def _get_week_status(args: dict, state) -> dict:
             view["actual"] = _summarize_session(data) if data and view["completed"] else None
             sessions_for_day.append(view)
 
-        # All sessions (any status) on the date, including off-plan rows
-        # and wrong-type matches against single-slot prescriptions.
-        all_logged = state.sessions_on_date(d)
         # Day-level legacy fields: primary slot view + aggregated actuals.
+        # On multi-session days the day-level classification mis-buckets
+        # cross-kind uploads (e.g. AM=easy + PM=strength: a strength upload
+        # that correctly closes the PM slot would be classified off-plan
+        # against the primary slot's "run" kind). The per-slot ``sessions[]``
+        # carries the right per-slot truth — we leave the day-level lists
+        # empty there and rely on the LLM tool description to direct
+        # callers to ``sessions[]``.
         primary = sessions_for_day[0] if sessions_for_day else {}
         primary_kind = primary.get("prescription_kind")
         actuals: list[dict] = []
         off_plan_actuals: list[dict] = []
-        for s in all_logged:
-            t = str(s.get("type") or "")
-            if primary_kind and _log_matches_prescription(primary_kind, t):
-                actuals.append(_summarize_session(s))
-            else:
-                off_plan_actuals.append(_summarize_session(s))
+        if n <= 1:
+            for s in state.sessions_on_date(d):
+                t = str(s.get("type") or "")
+                if primary_kind and _log_matches_prescription(primary_kind, t):
+                    actuals.append(_summarize_session(s))
+                else:
+                    off_plan_actuals.append(_summarize_session(s))
 
         days_out.append(
             {

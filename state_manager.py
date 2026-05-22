@@ -307,11 +307,17 @@ class StateManager:
         into ``plan_meta``. Planned rows are replaced wholesale; completed /
         missed / off-plan rows are never touched. Used to apply a post-activity
         review proposal verbatim.
+
+        Raises ``ValueError`` if a new (date, slot) assignment would collide
+        with an existing completed / missed / off-plan row — a slot's history
+        is anchored once written and the parser is not allowed to reuse the
+        ordinal for a different prescription (issue #46 W5).
         """
         rows = plan_markdown.parse_plan_rows(new_plan_md)
         details = plan_markdown.parse_workout_details(new_plan_md)
         meta = plan_markdown.build_plan_meta(new_plan_md)
         with self._conn() as conn:
+            _validate_new_slots_against_history(conn, rows)
             before_rows = [
                 _row_dict(r)
                 for r in conn.execute(
@@ -438,6 +444,7 @@ class StateManager:
         if not all("slot" in r for r in rows):
             plan_markdown.assign_slot_ordinals(rows)
         with self._conn() as conn:
+            _validate_new_slots_against_history(conn, rows)
             before_rows = [
                 _row_dict(r)
                 for r in conn.execute(
@@ -1054,6 +1061,44 @@ def _deep_merge(dst: dict, src: dict) -> None:
             _deep_merge(dst[k], v)
         else:
             dst[k] = v
+
+
+def _validate_new_slots_against_history(conn: sqlite3.Connection, new_rows: list[dict]) -> None:
+    """Raise ValueError if a new (date, slot) collides with non-planned history.
+
+    Once a slot has logged actuals — status in {completed, missed, off-plan} —
+    that ordinal is anchored to its historical prescription. The plan parser
+    is not allowed to reassign the same ordinal to a different workout: the
+    Notion page, GCal event, and changelog all reference the (date, slot)
+    key, so silently overwriting would scramble cross-surface state. The
+    parser-side equivalent of issue #46 W5: surface a clear error instead.
+
+    NULL-slot rows are exempt (single-session legacy shape; UNIQUE(date,slot)
+    treats them as distinct in SQLite anyway).
+    """
+    by_date: dict[str, set] = {}
+    for r in new_rows:
+        slot = r.get("slot")
+        if slot is None:
+            continue
+        by_date.setdefault(r["date"], set()).add(slot)
+    if not by_date:
+        return
+    dates = list(by_date.keys())
+    placeholders = ",".join("?" * len(dates))
+    existing = conn.execute(
+        f"SELECT date, slot, status FROM sessions "
+        f"WHERE date IN ({placeholders}) AND status != 'planned' AND slot IS NOT NULL",
+        tuple(dates),
+    ).fetchall()
+    for row in existing:
+        claimed = by_date.get(row["date"], set())
+        if row["slot"] in claimed:
+            raise ValueError(
+                f"cannot reassign slot {row['slot']!r} on {row['date']}: an existing "
+                f"{row['status']} session already owns that ordinal. Edit it via "
+                f"update_workout or restructure with the historical slot preserved."
+            )
 
 
 def _is_rest_day(workout: str) -> bool:

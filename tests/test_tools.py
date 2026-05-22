@@ -680,6 +680,39 @@ class TestMultiSessionTools:
         # Day-level: not yet complete since PM is still planned.
         assert wed["completed"] is False
 
+    def test_get_week_status_multi_session_drops_day_level_actuals(self, two_a_day_state, monkeypatch):
+        """On multi-session days, day-level actuals/off_plan_actuals are empty:
+        per-slot kind classification can't be reliably aggregated at the day
+        level. Callers iterate `sessions[]` for per-slot truth instead."""
+        monkeypatch.setattr("tools.plan.today_local", lambda: date(2026, 5, 27))
+        # AM easy upload + PM workout upload — both correctly close their slots.
+        two_a_day_state.append_session(
+            {
+                "date": "2026-05-27",
+                "type": "easy",
+                "miles": 5.0,
+                "start_local": "2026-05-27T07:00:00Z",
+                "details": {"strava_id": 10},
+            }
+        )
+        two_a_day_state.append_session(
+            {
+                "date": "2026-05-27",
+                "type": "workout",
+                "miles": 4.5,
+                "start_local": "2026-05-27T18:00:00Z",
+                "details": {"strava_id": 11},
+            }
+        )
+        out = execute_tool("get_week_status", {"week_offset": 0}, two_a_day_state)
+        wed = next(d for d in out["days"] if d["date"] == "2026-05-27")
+        assert wed["total_slots"] == 2
+        assert wed["actuals"] == []
+        assert wed["off_plan_actuals"] == []
+        # Truth is in sessions[]
+        assert all(s["completed"] for s in wed["sessions"])
+        assert wed["completed"] is True
+
 
 class TestTwoADaySingleAccessors:
     """The legacy singular accessors stay usable but surface multi-session

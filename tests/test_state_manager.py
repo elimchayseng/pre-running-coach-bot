@@ -448,6 +448,49 @@ class TestSlotPersistence:
         assert by_date[("2026-05-27", "2")] == 2
         assert by_date[("2026-05-28", None)] == 1
 
+    def test_update_plan_rejects_slot_reuse_over_completed_row(self, state):
+        """W5 guard: rewriting the plan must not reassign an ordinal that a
+        non-planned (completed / missed / off-plan) row already owns."""
+        state.update_plan(PLAN_WITH_TWO_A_DAY, "seed")
+        # Close Wed slot=2 by routing a PM-time activity to the PM slot.
+        state.reconcile_strava_activity(
+            {
+                "date": "2026-05-27",
+                "type": "workout",
+                "start_local": "2026-05-27T18:00:00Z",
+                "details": {"strava_id": 4242},
+            }
+        )
+        # Re-apply the same plan: parser assigns slot "2" again, conflicting
+        # with the completed PM row.
+        with pytest.raises(ValueError, match="cannot reassign slot '2' on 2026-05-27"):
+            state.update_plan(PLAN_WITH_TWO_A_DAY, "rewrite same plan")
+
+    def test_update_plan_clean_reapply_when_no_history(self, state):
+        """W5 guard does not fire on conflict-free re-apply."""
+        state.update_plan(PLAN_WITH_TWO_A_DAY, "seed")
+        state.update_plan(PLAN_WITH_TWO_A_DAY, "idempotent re-apply")
+        rows = state._rows("status = 'planned' AND date = '2026-05-27'", ())
+        assert [r["slot"] for r in rows] == ["1", "2"]
+
+    def test_replace_week_table_rejects_slot_reuse_over_completed_row(self, state):
+        """W5 guard applies to replace_week_table too."""
+        state.update_plan(PLAN_WITH_TWO_A_DAY, "seed")
+        state.reconcile_strava_activity(
+            {
+                "date": "2026-05-27",
+                "type": "workout",
+                "start_local": "2026-05-27T18:00:00Z",
+                "details": {"strava_id": 7777},
+            }
+        )
+        new_rows = [
+            {"day": "Wed", "date": "2026-05-27", "workout": "AM new", "pace_target": "Z2", "notes": ""},
+            {"day": "Wed", "date": "2026-05-27", "workout": "PM new", "pace_target": "Z2", "notes": ""},
+        ]
+        with pytest.raises(ValueError, match="cannot reassign slot '2' on 2026-05-27"):
+            state.replace_week_table(new_rows, "swap PM")
+
 
 class TestSlotAwareStravaMatching:
     """reconcile_strava_activity routes Strava uploads to the right slot
