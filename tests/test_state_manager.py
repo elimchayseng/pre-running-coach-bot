@@ -7,7 +7,12 @@ from pathlib import Path
 
 import pytest
 
-from state_manager import StateManager
+from state_manager import (
+    StateManager,
+    slot_bucket_center,
+    slot_display_label,
+    slot_time_bucket,
+)
 
 ATHLETE_YAML = """\
 name: TestRunner
@@ -45,6 +50,50 @@ def state_dir(tmp_path: Path, monkeypatch) -> Path:
 @pytest.fixture
 def state(state_dir: Path) -> StateManager:
     return StateManager(state_dir)
+
+
+class TestSlotHelpers:
+    """slot_time_bucket / slot_bucket_center / slot_display_label — shared by GCal + Strava."""
+
+    def test_single_session_returns_no_bucket(self):
+        assert slot_time_bucket(None, 1) is None
+        assert slot_bucket_center(None, 1) is None
+        assert slot_display_label(None, 1) == ""
+
+    def test_two_a_day_uses_am_pm_layout(self):
+        assert slot_time_bucket("1", 2) == (6.0, 7.5)
+        assert slot_time_bucket("2", 2) == (17.5, 19.0)
+        assert slot_display_label("1", 2) == "AM"
+        assert slot_display_label("2", 2) == "PM"
+
+    def test_three_a_day_uses_morning_midday_evening(self):
+        assert slot_time_bucket("1", 3) == (6.0, 7.5)
+        assert slot_time_bucket("2", 3) == (12.0, 13.0)
+        assert slot_time_bucket("3", 3) == (17.5, 19.0)
+        assert slot_display_label("2", 3) == "2/3"
+
+    def test_four_a_day_uses_four_buckets(self):
+        assert slot_time_bucket("1", 4) == (6.0, 7.5)
+        assert slot_time_bucket("4", 4) == (18.0, 19.0)
+
+    def test_five_plus_spreads_linearly(self):
+        """5+ sessions distribute evenly between centers 6.5 and 19.5."""
+        first = slot_time_bucket("1", 5)
+        last = slot_time_bucket("5", 5)
+        assert first == (6.0, 7.0)
+        assert last == (19.0, 20.0)
+        mid = slot_time_bucket("3", 5)
+        assert mid == (12.5, 13.5)  # center 13.0 is the midpoint of 6.5↔19.5
+
+    def test_bucket_center_is_midpoint(self):
+        assert slot_bucket_center("1", 2) == 6.75
+        assert slot_bucket_center("2", 2) == 18.25
+
+    def test_invalid_slot_returns_none(self):
+        assert slot_time_bucket("abc", 2) is None
+        assert slot_time_bucket("0", 2) is None
+        assert slot_time_bucket("3", 2) is None  # idx > total
+        assert slot_display_label("abc", 2) == ""
 
 
 def _seed_athlete(state: StateManager, yaml_text: str = ATHLETE_YAML) -> None:
@@ -316,6 +365,230 @@ class TestReplaceWeekTable:
         state.update_plan(PLAN_WITH_DETAIL, "seed")
         with pytest.raises(ValueError, match="rows must be non-empty"):
             state.replace_week_table([], "x")
+
+    def test_duplicate_date_rows_persist_as_two_a_day(self, state):
+        state.update_plan(PLAN_WITH_WEEK, "seed")
+        new_rows = [
+            {"day": "Wed", "date": "2026-05-27", "workout": "5mi easy AM", "pace_target": "Z2", "notes": ""},
+            {"day": "Wed", "date": "2026-05-27", "workout": "6x400 PM", "pace_target": "5K", "notes": ""},
+            {"day": "Thu", "date": "2026-05-28", "workout": "8mi long", "pace_target": "Z2", "notes": ""},
+        ]
+        state.replace_week_table(new_rows, "add two-a-day")
+        with state._conn() as c:
+            wed = c.execute(
+                "SELECT slot, prescribed_workout FROM sessions WHERE date = ? ORDER BY slot",
+                ("2026-05-27",),
+            ).fetchall()
+            thu = c.execute(
+                "SELECT slot FROM sessions WHERE date = ?", ("2026-05-28",)
+            ).fetchone()
+        assert [r["slot"] for r in wed] == ["1", "2"]
+        assert wed[0]["prescribed_workout"] == "5mi easy AM"
+        assert wed[1]["prescribed_workout"] == "6x400 PM"
+        assert thu["slot"] is None
+
+
+PLAN_WITH_TWO_A_DAY = """\
+# Plan
+
+## This Week (2026-05-25 → 2026-05-31)
+
+| Day | Date | Workout | Pace target | Notes |
+|-----|------|---------|-------------|-------|
+| Mon | 2026-05-25 | Easy 4mi | 8:45 | base |
+| Wed | 2026-05-27 | 5mi easy (AM) | Z2 | |
+| Wed | 2026-05-27 | 6x400 @ 5K (PM) | reps | quality |
+| Thu | 2026-05-28 | 8mi long | Z2 | |
+"""
+
+
+class TestSlotPersistence:
+    """update_plan + replace_week_table must persist slot ordinals end-to-end."""
+
+    def test_update_plan_assigns_slots_for_two_a_day(self, state):
+        state.update_plan(PLAN_WITH_TWO_A_DAY, "seed two-a-day")
+        with state._conn() as c:
+            rows = c.execute(
+                "SELECT date, slot, prescribed_workout FROM sessions "
+                "WHERE status = 'planned' ORDER BY date, slot, id"
+            ).fetchall()
+        # Mon and Thu are single-session → slot=None; Wed has two slots "1","2".
+        by_date = {(r["date"], r["slot"]): r["prescribed_workout"] for r in rows}
+        assert by_date[("2026-05-25", None)] == "Easy 4mi"
+        assert by_date[("2026-05-27", "1")] == "5mi easy (AM)"
+        assert by_date[("2026-05-27", "2")] == "6x400 @ 5K (PM)"
+        assert by_date[("2026-05-28", None)] == "8mi long"
+
+    def test_unique_date_slot_blocks_third_row(self, state):
+        """UNIQUE(date, slot) rejects a third row sharing slot with an existing one."""
+        state.update_plan(PLAN_WITH_TWO_A_DAY, "seed")
+        with state._conn() as c, pytest.raises(sqlite3.IntegrityError):
+            c.execute(
+                "INSERT INTO sessions (date, slot, status, prescribed_workout) "
+                "VALUES ('2026-05-27', '1', 'planned', 'duplicate slot 1')"
+            )
+
+    def test_round_trip_render_then_parse_preserves_slots(self, state):
+        from plan_markdown import parse_plan_rows, render_week_table
+
+        state.update_plan(PLAN_WITH_TWO_A_DAY, "seed")
+        rows = state.get_prescription_rows(date(2026, 5, 25), date(2026, 5, 31))
+        # Render rows back to markdown then re-parse.
+        md = render_week_table([dict(r) for r in rows])
+        reparsed = parse_plan_rows(md)
+        wed = [r for r in reparsed if r["date"] == "2026-05-27"]
+        assert [r["slot"] for r in wed] == ["1", "2"]
+
+    def test_stamp_total_slots_on_date_annotates_rows(self, state):
+        """The mirror notifier annotates each row with the date's slot count."""
+        state.update_plan(PLAN_WITH_TWO_A_DAY, "seed")
+        rows = state._rows("status = 'planned'", ())
+        state._stamp_total_slots_on_date(rows)
+        by_date = {(r["date"], r["slot"]): r.get("total_slots_on_date") for r in rows}
+        # Mon (single) and Thu (single) → 1; Wed (two-a-day) → 2 for both slots.
+        assert by_date[("2026-05-25", None)] == 1
+        assert by_date[("2026-05-27", "1")] == 2
+        assert by_date[("2026-05-27", "2")] == 2
+        assert by_date[("2026-05-28", None)] == 1
+
+
+class TestSlotAwareStravaMatching:
+    """reconcile_strava_activity routes Strava uploads to the right slot
+    via the activity's start_local hour (W1: out-of-order arrivals; W2:
+    same-type two-a-days; W9: bucket-boundary edge cases)."""
+
+    def _seed_two_a_day(self, state, plan=PLAN_WITH_TWO_A_DAY):
+        state.update_plan(plan, "seed")
+
+    def test_am_activity_closes_am_slot(self, state):
+        self._seed_two_a_day(state)
+        result = state.reconcile_strava_activity({
+            "date": "2026-05-27",
+            "type": "easy",
+            "start_local": "2026-05-27T06:45:00Z",
+            "details": {"strava_id": 1001},
+        })
+        assert result["matched"] is True
+        row = state._rows("id = ?", (result["row_id"],))[0]
+        assert row["slot"] == "1"
+
+    def test_pm_activity_closes_pm_slot(self, state):
+        self._seed_two_a_day(state)
+        result = state.reconcile_strava_activity({
+            "date": "2026-05-27",
+            "type": "workout",
+            "start_local": "2026-05-27T18:00:00Z",
+            "details": {"strava_id": 2002},
+        })
+        assert result["matched"] is True
+        row = state._rows("id = ?", (result["row_id"],))[0]
+        assert row["slot"] == "2"
+
+    def test_out_of_order_pm_then_am_routes_correctly(self, state):
+        """W1: PM webhook fires before AM webhook; each routes to its time bucket."""
+        self._seed_two_a_day(state)
+        # PM arrives first.
+        pm = state.reconcile_strava_activity({
+            "date": "2026-05-27",
+            "type": "workout",
+            "start_local": "2026-05-27T18:00:00Z",
+            "details": {"strava_id": 9001},
+        })
+        pm_row = state._rows("id = ?", (pm["row_id"],))[0]
+        assert pm_row["slot"] == "2"
+        # AM arrives later and lands in slot 1, not appended after PM.
+        am = state.reconcile_strava_activity({
+            "date": "2026-05-27",
+            "type": "easy",
+            "start_local": "2026-05-27T07:00:00Z",
+            "details": {"strava_id": 9002},
+        })
+        am_row = state._rows("id = ?", (am["row_id"],))[0]
+        assert am_row["slot"] == "1"
+        # Both slots completed, neither is off-plan.
+        all_rows = state._rows("date = ?", ("2026-05-27",))
+        statuses = sorted((r["slot"], r["status"]) for r in all_rows)
+        assert statuses == [("1", "completed"), ("2", "completed")]
+
+    def test_same_type_two_a_day_split_by_time(self, state):
+        """W2: two easy runs (AM + PM) — slot proximity disambiguates."""
+        # Two-a-day where BOTH planned slots are type=easy.
+        plan = """\
+# Plan
+
+## This Week (2026-05-25 → 2026-05-31)
+
+| Day | Date | Workout | Pace target | Notes |
+|-----|------|---------|-------------|-------|
+| Wed | 2026-05-27 | Easy 4mi (AM) | Z2 | |
+| Wed | 2026-05-27 | Easy 4mi (PM) | Z2 | |
+"""
+        state.update_plan(plan, "seed")
+        morning = state.reconcile_strava_activity({
+            "date": "2026-05-27",
+            "type": "easy",
+            "start_local": "2026-05-27T07:00:00Z",
+            "details": {"strava_id": 1},
+        })
+        evening = state.reconcile_strava_activity({
+            "date": "2026-05-27",
+            "type": "easy",
+            "start_local": "2026-05-27T18:30:00Z",
+            "details": {"strava_id": 2},
+        })
+        m_row = state._rows("id = ?", (morning["row_id"],))[0]
+        e_row = state._rows("id = ?", (evening["row_id"],))[0]
+        assert m_row["slot"] == "1"
+        assert e_row["slot"] == "2"
+
+    def test_missing_start_local_falls_back_to_type_match(self, state):
+        """Legacy entries without start_local still match by type."""
+        self._seed_two_a_day(state)
+        result = state.reconcile_strava_activity({
+            "date": "2026-05-27",
+            "type": "workout",
+            "details": {"strava_id": 3},
+        })
+        # PM slot has workout-typed prescription; type-only match picks slot 2.
+        row = state._rows("id = ?", (result["row_id"],))[0]
+        assert row["slot"] == "2"
+
+    def test_single_session_day_loose_match_still_works(self, state):
+        """Single-session days (slot=NULL) bypass the bucket logic."""
+        state.update_plan(PLAN_WITH_WEEK, "seed")
+        # 2026-04-28 has one planned row (slot=NULL); type "run" matches via single-row fallback.
+        result = state.reconcile_strava_activity({
+            "date": "2026-04-28",
+            "type": "run",
+            "start_local": "2026-04-28T19:30:00Z",
+            "details": {"strava_id": 11},
+        })
+        assert result["matched"] is True
+
+    def test_bucket_boundary_straddle_picks_nearest(self, state):
+        """W9: activity at 11:30 on a 3-session day prefers slot 2 (center 12:30)
+        over slot 1 (center 6:45)."""
+        plan = """\
+# Plan
+
+## This Week (2026-05-25 → 2026-05-31)
+
+| Day | Date | Workout | Pace target | Notes |
+|-----|------|---------|-------------|-------|
+| Wed | 2026-05-27 | Easy 4mi (AM) | Z2 | |
+| Wed | 2026-05-27 | Mobility (midday) | - | |
+| Wed | 2026-05-27 | 6x400 (PM) | reps | |
+"""
+        state.update_plan(plan, "seed")
+        # Activity at 11:30 — closer to slot 2 (12:30) than slot 1 (6:45).
+        result = state.reconcile_strava_activity({
+            "date": "2026-05-27",
+            "type": "easy",
+            "start_local": "2026-05-27T11:30:00Z",
+            "details": {"strava_id": 42},
+        })
+        row = state._rows("id = ?", (result["row_id"],))[0]
+        assert row["slot"] == "2"
 
 
 # ---------------- sessions / log ----------------

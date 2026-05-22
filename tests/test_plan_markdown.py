@@ -3,6 +3,7 @@
 import pytest
 
 from plan_markdown import (
+    assign_slot_ordinals,
     build_plan_meta,
     infer_workout_type,
     parse_plan_rows,
@@ -54,6 +55,60 @@ class TestParsePlanRows:
     def test_skips_non_iso_date(self):
         text = "| Day | Date | Workout | Pace target | Notes |\n| Sat | 5/9 | Easy 8mi | x | y |\n"
         assert parse_plan_rows(text) == []
+
+    def test_single_session_dates_get_null_slot(self):
+        rows = parse_plan_rows(PLAN)
+        # Every date in PLAN appears once → slot is None on every row.
+        assert all(r["slot"] is None for r in rows)
+
+    def test_two_a_day_assigns_am_pm_ordinals(self):
+        text = (
+            "| Day | Date | Workout | Pace target | Notes |\n"
+            "|-----|------|---------|-------------|-------|\n"
+            "| Wed | 2026-05-27 | 5mi easy (AM) | Z2 | base |\n"
+            "| Wed | 2026-05-27 | 6x400 @ 5K (PM) | reps | quality |\n"
+            "| Thu | 2026-05-28 | 8mi long | Z2 | |\n"
+        )
+        rows = parse_plan_rows(text)
+        # Two-a-day Wednesday gets slots "1"/"2" in source order; Thursday stays NULL.
+        wed = [r for r in rows if r["date"] == "2026-05-27"]
+        thu = [r for r in rows if r["date"] == "2026-05-28"]
+        assert [r["slot"] for r in wed] == ["1", "2"]
+        assert wed[0]["workout"] == "5mi easy (AM)"
+        assert wed[1]["workout"] == "6x400 @ 5K (PM)"
+        assert thu[0]["slot"] is None
+
+    def test_three_a_day_assigns_three_ordinals(self):
+        text = (
+            "| Day | Date | Workout | Pace target | Notes |\n"
+            "|-----|------|---------|-------------|-------|\n"
+            "| Wed | 2026-05-27 | AM easy | Z2 | |\n"
+            "| Wed | 2026-05-27 | Midday mobility | - | |\n"
+            "| Wed | 2026-05-27 | PM 6x400 | reps | |\n"
+        )
+        rows = parse_plan_rows(text)
+        assert [r["slot"] for r in rows] == ["1", "2", "3"]
+
+
+class TestAssignSlotOrdinals:
+    def test_idempotent_on_single_dates(self):
+        rows = [{"date": "2026-05-27", "workout": "x"}]
+        out = assign_slot_ordinals(rows)
+        assert out[0]["slot"] is None
+
+    def test_duplicates_get_string_ordinals(self):
+        rows = [
+            {"date": "2026-05-27", "workout": "AM"},
+            {"date": "2026-05-27", "workout": "PM"},
+        ]
+        out = assign_slot_ordinals(rows)
+        assert [r["slot"] for r in out] == ["1", "2"]
+
+    def test_mutates_in_place_and_returns_same_list(self):
+        rows = [{"date": "2026-05-27", "workout": "x"}]
+        out = assign_slot_ordinals(rows)
+        assert out is rows
+        assert rows[0]["slot"] is None
 
 
 class TestParseWorkoutDetails:
