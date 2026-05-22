@@ -29,15 +29,14 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import re
 import threading
 from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
-import os
-
-from temporal_context import today_local
 from state_manager import slot_display_label, slot_time_bucket
+from temporal_context import today_local
 
 logger = logging.getLogger("pre_coach.gcal.sync")
 
@@ -51,6 +50,7 @@ def _user_tz_name() -> str:
     missing config.
     """
     return os.getenv("USER_TIMEZONE") or "UTC"
+
 
 # Serializes every load → mutate → save against ``gcal_sync_state``. Two
 # writers exist today: ``sync_plan`` (often invoked from the auto-sync
@@ -681,7 +681,8 @@ def mark_complete(state, log_date) -> dict:
         # and was later retagged to match a prescription leaves an orphan
         # precomplete event behind — delete it now.
         stale_offplan = [
-            eid for eid, entry in list(sync_state.items())
+            eid
+            for eid, entry in list(sync_state.items())
             if isinstance(entry, dict)
             and entry.get("off_plan")
             and eid.startswith("precomplete" + log_date.isoformat().replace("-", ""))
@@ -924,8 +925,7 @@ def reconcile_completion(state, days_back: int = 14) -> dict:
         # check the legacy id; multi-session check each slot.
         same_date_rows = [r for r in rows if r["date"] == row["date"]]
         all_marked = bool(same_date_rows) and all(
-            sync_state.get(_event_id(r["date"], r.get("slot")), {}).get("completed")
-            for r in same_date_rows
+            sync_state.get(_event_id(r["date"], r.get("slot")), {}).get("completed") for r in same_date_rows
         )
         if all_marked:
             already_complete.append(row["date"])

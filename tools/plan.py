@@ -213,9 +213,7 @@ def _get_week_status(args: dict, state) -> dict:
             data = _row_json(r)
             log_type = str(data.get("type") or "") if data else ""
             view["completed"] = (
-                r.get("status") == "completed"
-                and bool(kind)
-                and _log_matches_prescription(kind, log_type)
+                r.get("status") == "completed" and bool(kind) and _log_matches_prescription(kind, log_type)
             )
             view["actual"] = _summarize_session(data) if data and view["completed"] else None
             sessions_for_day.append(view)
@@ -235,27 +233,29 @@ def _get_week_status(args: dict, state) -> dict:
             else:
                 off_plan_actuals.append(_summarize_session(s))
 
-        days_out.append({
-            "date": d.isoformat(),
-            "day_name": d.strftime("%A"),
-            "workout": primary.get("workout", ""),
-            "pace_target": primary.get("pace_target", ""),
-            "notes": primary.get("notes", ""),
-            "detail_md": primary.get("detail_md", ""),
-            "status": primary.get("status"),
-            "is_rest_day": primary.get("is_rest_day", False),
-            "found": bool(prescription_rows),
-            "slot": primary.get("slot"),
-            "slot_label": primary.get("slot_label", ""),
-            "total_slots": n,
-            "sessions": sessions_for_day,
-            "prescription_kind": primary_kind,
-            "completed": bool(prescription_rows) and all(s["completed"] for s in sessions_for_day),
-            "is_past": d < today,
-            "is_today": d == today,
-            "actuals": actuals,
-            "off_plan_actuals": off_plan_actuals,
-        })
+        days_out.append(
+            {
+                "date": d.isoformat(),
+                "day_name": d.strftime("%A"),
+                "workout": primary.get("workout", ""),
+                "pace_target": primary.get("pace_target", ""),
+                "notes": primary.get("notes", ""),
+                "detail_md": primary.get("detail_md", ""),
+                "status": primary.get("status"),
+                "is_rest_day": primary.get("is_rest_day", False),
+                "found": bool(prescription_rows),
+                "slot": primary.get("slot"),
+                "slot_label": primary.get("slot_label", ""),
+                "total_slots": n,
+                "sessions": sessions_for_day,
+                "prescription_kind": primary_kind,
+                "completed": bool(prescription_rows) and all(s["completed"] for s in sessions_for_day),
+                "is_past": d < today,
+                "is_today": d == today,
+                "actuals": actuals,
+                "off_plan_actuals": off_plan_actuals,
+            }
+        )
 
     return {
         "week_start": target_monday.isoformat(),
@@ -273,6 +273,7 @@ def _row_json(row: dict) -> dict:
     if isinstance(raw, dict):
         return raw
     import json
+
     try:
         return json.loads(raw)
     except (TypeError, json.JSONDecodeError):

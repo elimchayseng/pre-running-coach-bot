@@ -379,9 +379,7 @@ class TestReplaceWeekTable:
                 "SELECT slot, prescribed_workout FROM sessions WHERE date = ? ORDER BY slot",
                 ("2026-05-27",),
             ).fetchall()
-            thu = c.execute(
-                "SELECT slot FROM sessions WHERE date = ?", ("2026-05-28",)
-            ).fetchone()
+            thu = c.execute("SELECT slot FROM sessions WHERE date = ?", ("2026-05-28",)).fetchone()
         assert [r["slot"] for r in wed] == ["1", "2"]
         assert wed[0]["prescribed_workout"] == "5mi easy AM"
         assert wed[1]["prescribed_workout"] == "6x400 PM"
@@ -409,8 +407,7 @@ class TestSlotPersistence:
         state.update_plan(PLAN_WITH_TWO_A_DAY, "seed two-a-day")
         with state._conn() as c:
             rows = c.execute(
-                "SELECT date, slot, prescribed_workout FROM sessions "
-                "WHERE status = 'planned' ORDER BY date, slot, id"
+                "SELECT date, slot, prescribed_workout FROM sessions WHERE status = 'planned' ORDER BY date, slot, id"
             ).fetchall()
         # Mon and Thu are single-session → slot=None; Wed has two slots "1","2".
         by_date = {(r["date"], r["slot"]): r["prescribed_workout"] for r in rows}
@@ -462,24 +459,28 @@ class TestSlotAwareStravaMatching:
 
     def test_am_activity_closes_am_slot(self, state):
         self._seed_two_a_day(state)
-        result = state.reconcile_strava_activity({
-            "date": "2026-05-27",
-            "type": "easy",
-            "start_local": "2026-05-27T06:45:00Z",
-            "details": {"strava_id": 1001},
-        })
+        result = state.reconcile_strava_activity(
+            {
+                "date": "2026-05-27",
+                "type": "easy",
+                "start_local": "2026-05-27T06:45:00Z",
+                "details": {"strava_id": 1001},
+            }
+        )
         assert result["matched"] is True
         row = state._rows("id = ?", (result["row_id"],))[0]
         assert row["slot"] == "1"
 
     def test_pm_activity_closes_pm_slot(self, state):
         self._seed_two_a_day(state)
-        result = state.reconcile_strava_activity({
-            "date": "2026-05-27",
-            "type": "workout",
-            "start_local": "2026-05-27T18:00:00Z",
-            "details": {"strava_id": 2002},
-        })
+        result = state.reconcile_strava_activity(
+            {
+                "date": "2026-05-27",
+                "type": "workout",
+                "start_local": "2026-05-27T18:00:00Z",
+                "details": {"strava_id": 2002},
+            }
+        )
         assert result["matched"] is True
         row = state._rows("id = ?", (result["row_id"],))[0]
         assert row["slot"] == "2"
@@ -488,21 +489,25 @@ class TestSlotAwareStravaMatching:
         """W1: PM webhook fires before AM webhook; each routes to its time bucket."""
         self._seed_two_a_day(state)
         # PM arrives first.
-        pm = state.reconcile_strava_activity({
-            "date": "2026-05-27",
-            "type": "workout",
-            "start_local": "2026-05-27T18:00:00Z",
-            "details": {"strava_id": 9001},
-        })
+        pm = state.reconcile_strava_activity(
+            {
+                "date": "2026-05-27",
+                "type": "workout",
+                "start_local": "2026-05-27T18:00:00Z",
+                "details": {"strava_id": 9001},
+            }
+        )
         pm_row = state._rows("id = ?", (pm["row_id"],))[0]
         assert pm_row["slot"] == "2"
         # AM arrives later and lands in slot 1, not appended after PM.
-        am = state.reconcile_strava_activity({
-            "date": "2026-05-27",
-            "type": "easy",
-            "start_local": "2026-05-27T07:00:00Z",
-            "details": {"strava_id": 9002},
-        })
+        am = state.reconcile_strava_activity(
+            {
+                "date": "2026-05-27",
+                "type": "easy",
+                "start_local": "2026-05-27T07:00:00Z",
+                "details": {"strava_id": 9002},
+            }
+        )
         am_row = state._rows("id = ?", (am["row_id"],))[0]
         assert am_row["slot"] == "1"
         # Both slots completed, neither is off-plan.
@@ -524,18 +529,22 @@ class TestSlotAwareStravaMatching:
 | Wed | 2026-05-27 | Easy 4mi (PM) | Z2 | |
 """
         state.update_plan(plan, "seed")
-        morning = state.reconcile_strava_activity({
-            "date": "2026-05-27",
-            "type": "easy",
-            "start_local": "2026-05-27T07:00:00Z",
-            "details": {"strava_id": 1},
-        })
-        evening = state.reconcile_strava_activity({
-            "date": "2026-05-27",
-            "type": "easy",
-            "start_local": "2026-05-27T18:30:00Z",
-            "details": {"strava_id": 2},
-        })
+        morning = state.reconcile_strava_activity(
+            {
+                "date": "2026-05-27",
+                "type": "easy",
+                "start_local": "2026-05-27T07:00:00Z",
+                "details": {"strava_id": 1},
+            }
+        )
+        evening = state.reconcile_strava_activity(
+            {
+                "date": "2026-05-27",
+                "type": "easy",
+                "start_local": "2026-05-27T18:30:00Z",
+                "details": {"strava_id": 2},
+            }
+        )
         m_row = state._rows("id = ?", (morning["row_id"],))[0]
         e_row = state._rows("id = ?", (evening["row_id"],))[0]
         assert m_row["slot"] == "1"
@@ -544,11 +553,13 @@ class TestSlotAwareStravaMatching:
     def test_missing_start_local_falls_back_to_type_match(self, state):
         """Legacy entries without start_local still match by type."""
         self._seed_two_a_day(state)
-        result = state.reconcile_strava_activity({
-            "date": "2026-05-27",
-            "type": "workout",
-            "details": {"strava_id": 3},
-        })
+        result = state.reconcile_strava_activity(
+            {
+                "date": "2026-05-27",
+                "type": "workout",
+                "details": {"strava_id": 3},
+            }
+        )
         # PM slot has workout-typed prescription; type-only match picks slot 2.
         row = state._rows("id = ?", (result["row_id"],))[0]
         assert row["slot"] == "2"
@@ -557,12 +568,14 @@ class TestSlotAwareStravaMatching:
         """Single-session days (slot=NULL) bypass the bucket logic."""
         state.update_plan(PLAN_WITH_WEEK, "seed")
         # 2026-04-28 has one planned row (slot=NULL); type "run" matches via single-row fallback.
-        result = state.reconcile_strava_activity({
-            "date": "2026-04-28",
-            "type": "run",
-            "start_local": "2026-04-28T19:30:00Z",
-            "details": {"strava_id": 11},
-        })
+        result = state.reconcile_strava_activity(
+            {
+                "date": "2026-04-28",
+                "type": "run",
+                "start_local": "2026-04-28T19:30:00Z",
+                "details": {"strava_id": 11},
+            }
+        )
         assert result["matched"] is True
 
     def test_bucket_boundary_straddle_picks_nearest(self, state):
@@ -581,12 +594,14 @@ class TestSlotAwareStravaMatching:
 """
         state.update_plan(plan, "seed")
         # Activity at 11:30 — closer to slot 2 (12:30) than slot 1 (6:45).
-        result = state.reconcile_strava_activity({
-            "date": "2026-05-27",
-            "type": "easy",
-            "start_local": "2026-05-27T11:30:00Z",
-            "details": {"strava_id": 42},
-        })
+        result = state.reconcile_strava_activity(
+            {
+                "date": "2026-05-27",
+                "type": "easy",
+                "start_local": "2026-05-27T11:30:00Z",
+                "details": {"strava_id": 42},
+            }
+        )
         row = state._rows("id = ?", (result["row_id"],))[0]
         assert row["slot"] == "2"
 

@@ -922,7 +922,7 @@ class _SlotStateStub(_StateStub):
 
     def _rows(self) -> list[dict]:
         # Override to attach slot ordinals from the parser.
-        from plan_markdown import parse_plan_rows, parse_workout_details, infer_workout_type
+        from plan_markdown import infer_workout_type, parse_plan_rows, parse_workout_details
 
         details = parse_workout_details(self._plan)
         return [
@@ -962,10 +962,7 @@ class TestEventIdSlotSuffix:
         # Slot suffix when set.
         assert sync._completion_event_id("2026-05-27", slot="2") == "precomplete20260527s2"
         # Disambiguator strips non [a-v0-9] chars.
-        assert (
-            sync._completion_event_id("2026-05-27", slot="2", disambiguator="12345")
-            == "precomplete20260527s2x12345"
-        )
+        assert sync._completion_event_id("2026-05-27", slot="2", disambiguator="12345") == "precomplete20260527s2x12345"
 
     def test_date_from_event_id_tolerates_slot_suffix(self):
         from datetime import date as _date
@@ -987,9 +984,7 @@ class TestTwoADayPayload:
             "notes": "",
             "slot": "1",
         }
-        payload, _ = sync._build_event_payload(
-            row, sync._event_id(row["date"], "1"), total_slots=2
-        )
+        payload, _ = sync._build_event_payload(row, sync._event_id(row["date"], "1"), total_slots=2)
         # AM slot (slot 1 of 2) → 06:00–07:30 timed.
         assert "dateTime" in payload["start"]
         assert payload["start"]["dateTime"] == "2026-05-27T06:00:00"
@@ -1004,9 +999,7 @@ class TestTwoADayPayload:
             "notes": "",
             "slot": "2",
         }
-        payload, _ = sync._build_event_payload(
-            row, sync._event_id(row["date"], "2"), total_slots=2
-        )
+        payload, _ = sync._build_event_payload(row, sync._event_id(row["date"], "2"), total_slots=2)
         assert payload["start"]["dateTime"] == "2026-05-27T17:30:00"
         assert payload["end"]["dateTime"] == "2026-05-27T19:00:00"
         assert payload["summary"].startswith("[PM] ")
@@ -1019,9 +1012,7 @@ class TestTwoADayPayload:
             "notes": "",
             "slot": "2",
         }
-        payload, _ = sync._build_event_payload(
-            row, sync._event_id(row["date"], "2"), total_slots=3
-        )
+        payload, _ = sync._build_event_payload(row, sync._event_id(row["date"], "2"), total_slots=3)
         assert payload["summary"].startswith("[2/3] ")
 
     def test_single_session_stays_all_day(self):
@@ -1200,15 +1191,25 @@ class TestSlotAwareMarkComplete:
         self._wire(monkeypatch, patches, inserts)
         rows = [
             {
-                "id": 10, "date": "2026-05-27", "slot": "1", "status": "completed",
-                "prescribed_workout": "Easy 5mi AM", "prescribed_pace": "Z2",
-                "prescribed_notes": "", "detail_md": None,
+                "id": 10,
+                "date": "2026-05-27",
+                "slot": "1",
+                "status": "completed",
+                "prescribed_workout": "Easy 5mi AM",
+                "prescribed_pace": "Z2",
+                "prescribed_notes": "",
+                "detail_md": None,
                 "data": '{"type":"easy","miles":5.0,"details":{"strava_id":111}}',
             },
             {
-                "id": 11, "date": "2026-05-27", "slot": "2", "status": "completed",
-                "prescribed_workout": "6x400 PM", "prescribed_pace": "reps",
-                "prescribed_notes": "", "detail_md": None,
+                "id": 11,
+                "date": "2026-05-27",
+                "slot": "2",
+                "status": "completed",
+                "prescribed_workout": "6x400 PM",
+                "prescribed_pace": "reps",
+                "prescribed_notes": "",
+                "detail_md": None,
                 "data": '{"type":"workout","miles":4.5,"details":{"strava_id":222}}',
             },
         ]
@@ -1230,15 +1231,25 @@ class TestSlotAwareMarkComplete:
         self._wire(monkeypatch, patches, inserts)
         rows = [
             {
-                "id": 50, "date": "2026-05-27", "slot": None, "status": "off-plan",
-                "prescribed_workout": None, "prescribed_pace": None,
-                "prescribed_notes": None, "detail_md": None,
+                "id": 50,
+                "date": "2026-05-27",
+                "slot": None,
+                "status": "off-plan",
+                "prescribed_workout": None,
+                "prescribed_pace": None,
+                "prescribed_notes": None,
+                "detail_md": None,
                 "data": '{"type":"easy","miles":3.0,"details":{"strava_id":111}}',
             },
             {
-                "id": 51, "date": "2026-05-27", "slot": None, "status": "off-plan",
-                "prescribed_workout": None, "prescribed_pace": None,
-                "prescribed_notes": None, "detail_md": None,
+                "id": 51,
+                "date": "2026-05-27",
+                "slot": None,
+                "status": "off-plan",
+                "prescribed_workout": None,
+                "prescribed_pace": None,
+                "prescribed_notes": None,
+                "detail_md": None,
                 "data": '{"type":"easy","miles":4.0,"details":{"strava_id":222}}',
             },
         ]
@@ -1255,9 +1266,14 @@ class TestSlotAwareMarkComplete:
         self._wire(monkeypatch, patches, inserts)
         rows = [
             {
-                "id": 10, "date": "2026-05-09", "slot": None, "status": "completed",
-                "prescribed_workout": "Easy 8mi", "prescribed_pace": "8:30",
-                "prescribed_notes": "", "detail_md": None,
+                "id": 10,
+                "date": "2026-05-09",
+                "slot": None,
+                "status": "completed",
+                "prescribed_workout": "Easy 8mi",
+                "prescribed_pace": "8:30",
+                "prescribed_notes": "",
+                "detail_md": None,
                 "data": '{"type":"easy","miles":8.1,"details":{"strava_id":555}}',
             },
         ]

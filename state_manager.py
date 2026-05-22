@@ -72,6 +72,7 @@ _REST_PATTERNS = ("off", "rest", "no run", "no running")
 # Google Calendar event payload, Strava activity matching, and Notion title
 # formatting — so the three surfaces stay in lockstep.
 
+
 def slot_time_bucket(slot: Optional[str], total_slots: int) -> Optional[tuple[float, float]]:
     """Return (start_hour, end_hour) in local time for a multi-session slot.
 
@@ -660,9 +661,7 @@ class StateManager:
                 (sdate,),
             ).fetchall()
             total_slots = sum(1 for r in planned if r["slot"] is not None)
-            match = _pick_planned_match(
-                stype, planned, activity_hour=activity_hour, total_slots=total_slots or None
-            )
+            match = _pick_planned_match(stype, planned, activity_hour=activity_hour, total_slots=total_slots or None)
             if match is not None:
                 before_row = _row_dict(conn.execute("SELECT * FROM sessions WHERE id = ?", (match["id"],)).fetchone())
                 conn.execute(

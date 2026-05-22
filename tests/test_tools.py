@@ -660,13 +660,15 @@ class TestMultiSessionTools:
         """Closing the AM slot via Strava upload completes only that slot;
         the PM slot remains planned."""
         monkeypatch.setattr("tools.plan.today_local", lambda: date(2026, 5, 27))
-        two_a_day_state.append_session({
-            "date": "2026-05-27",
-            "type": "easy",
-            "miles": 5.0,
-            "start_local": "2026-05-27T07:00:00Z",
-            "details": {"strava_id": 1},
-        })
+        two_a_day_state.append_session(
+            {
+                "date": "2026-05-27",
+                "type": "easy",
+                "miles": 5.0,
+                "start_local": "2026-05-27T07:00:00Z",
+                "details": {"strava_id": 1},
+            }
+        )
         out = execute_tool("get_week_status", {"week_offset": 0}, two_a_day_state)
         wed = next(d for d in out["days"] if d["date"] == "2026-05-27")
         assert wed["total_slots"] == 2
