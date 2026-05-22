@@ -600,6 +600,119 @@ class TestPlanTools:
         assert tue["off_plan_actuals"][0]["type"] == "strength"
 
 
+# Two-a-day plan used to exercise multi-session callers.
+TWO_A_DAY_PLAN = """\
+# Plan
+
+## This Week
+
+| Day | Date | Workout | Pace target | Notes |
+|-----|------|---------|-------------|-------|
+| Wed | 2026-05-27 | Easy 5mi (AM) | Z2 | base |
+| Wed | 2026-05-27 | 6x400 @ 5K (PM) | reps | quality |
+| Thu | 2026-05-28 | 8mi long | Z2 | |
+"""
+
+
+class TestMultiSessionTools:
+    """LLM tool surfaces must expose every slot on multi-session days."""
+
+    @pytest.fixture
+    def two_a_day_state(self, state_dir):
+        s = StateManager(state_dir)
+        with s._conn() as c:
+            c.execute("INSERT INTO athlete (id, yaml_text) VALUES (1, ?)", (ATHLETE_YAML,))
+        s.update_plan(TWO_A_DAY_PLAN, "seed")
+        return s
+
+    def test_get_todays_workout_exposes_all_slots(self, two_a_day_state):
+        out = execute_tool("get_todays_workout", {"date": "2026-05-27"}, two_a_day_state)
+        assert out["found"] is True
+        assert out["total_slots"] == 2
+        assert len(out["sessions"]) == 2
+        slots = sorted((s["slot"], s["slot_label"], s["workout"]) for s in out["sessions"])
+        assert slots == [
+            ("1", "AM", "Easy 5mi (AM)"),
+            ("2", "PM", "6x400 @ 5K (PM)"),
+        ]
+        # Legacy fields populated from primary (slot 1).
+        assert out["workout"] == "Easy 5mi (AM)"
+        assert out["slot_label"] == "AM"
+
+    def test_get_todays_workout_single_session_unchanged(self, two_a_day_state):
+        out = execute_tool("get_todays_workout", {"date": "2026-05-28"}, two_a_day_state)
+        assert out["found"] is True
+        assert out["total_slots"] == 1
+        assert out["sessions"][0]["slot"] is None
+        assert out["sessions"][0]["slot_label"] == ""
+        assert out["workout"] == "8mi long"
+
+    def test_get_week_plan_includes_sessions_per_day(self, two_a_day_state, monkeypatch):
+        monkeypatch.setattr("tools.plan.today_local", lambda: date(2026, 5, 27))
+        out = execute_tool("get_week_plan", {"week_offset": 0}, two_a_day_state)
+        wed = next(d for d in out["days"] if d["date"] == "2026-05-27")
+        assert wed["total_slots"] == 2
+        assert len(wed["sessions"]) == 2
+        thu = next(d for d in out["days"] if d["date"] == "2026-05-28")
+        assert thu["total_slots"] == 1
+
+    def test_get_week_status_per_slot_completion(self, two_a_day_state, monkeypatch):
+        """Closing the AM slot via Strava upload completes only that slot;
+        the PM slot remains planned."""
+        monkeypatch.setattr("tools.plan.today_local", lambda: date(2026, 5, 27))
+        two_a_day_state.append_session({
+            "date": "2026-05-27",
+            "type": "easy",
+            "miles": 5.0,
+            "start_local": "2026-05-27T07:00:00Z",
+            "details": {"strava_id": 1},
+        })
+        out = execute_tool("get_week_status", {"week_offset": 0}, two_a_day_state)
+        wed = next(d for d in out["days"] if d["date"] == "2026-05-27")
+        assert wed["total_slots"] == 2
+        # Per-slot completion
+        am = next(s for s in wed["sessions"] if s["slot"] == "1")
+        pm = next(s for s in wed["sessions"] if s["slot"] == "2")
+        assert am["completed"] is True
+        assert pm["completed"] is False
+        # Day-level: not yet complete since PM is still planned.
+        assert wed["completed"] is False
+
+
+class TestTwoADaySingleAccessors:
+    """The legacy singular accessors stay usable but surface multi-session
+    context via the new fields."""
+
+    @pytest.fixture
+    def two_a_day_state(self, state_dir):
+        s = StateManager(state_dir)
+        with s._conn() as c:
+            c.execute("INSERT INTO athlete (id, yaml_text) VALUES (1, ?)", (ATHLETE_YAML,))
+        s.update_plan(TWO_A_DAY_PLAN, "seed")
+        return s
+
+    def test_get_todays_workout_returns_primary_slot_with_total_slots(self, two_a_day_state):
+        # State method (not the LLM tool): returns one dict for the primary slot.
+        w = two_a_day_state.get_todays_workout(date(2026, 5, 27))
+        assert w["found"] is True
+        assert w["workout"] == "Easy 5mi (AM)"
+        assert w["slot"] == "1"
+        assert w["total_slots"] == 2
+        assert w["slot_label"] == "AM"
+
+    def test_get_todays_workouts_returns_all_slots(self, two_a_day_state):
+        ws = two_a_day_state.get_todays_workouts(date(2026, 5, 27))
+        assert len(ws) == 2
+        assert ws[0]["slot"] == "1"
+        assert ws[1]["slot"] == "2"
+        assert ws[0]["total_slots"] == 2
+        assert ws[1]["total_slots"] == 2
+
+    def test_get_workout_rows_orders_by_slot(self, two_a_day_state):
+        rows = two_a_day_state.get_workout_rows(date(2026, 5, 27))
+        assert [r["slot"] for r in rows] == ["1", "2"]
+
+
 # ------------- fitness helpers -------------
 
 

@@ -48,25 +48,31 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def today_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Fast path: today's prescribed workout straight from plan.md, no LLM."""
+    """Fast path: today's prescribed workout straight from plan.md, no LLM.
+    Renders every slot on multi-session days, prefixed with [AM]/[PM] or [k/N]."""
     state = _get_state()
     today = today_local()
-    w = state.get_todays_workout(today)
-    if not w["found"]:
+    workouts = state.get_todays_workouts(today)
+    if not workouts:
         await update.message.reply_text(
             f"No workout prescribed for {today.isoformat()}. Send a message and I'll fill it in."
         )
         return
-    if w["is_rest_day"]:
-        text = f"{today.strftime('%a %b %d')}: rest day. {w['notes']}".strip()
-    else:
+    header = today.strftime("%a %b %d")
+    blocks: list[str] = []
+    for w in workouts:
+        prefix = f"[{w['slot_label']}] " if w["slot_label"] else ""
+        if w["is_rest_day"]:
+            blocks.append(f"{prefix}rest day. {w['notes']}".strip())
+            continue
         lines = [
-            f"{today.strftime('%a %b %d')}: {w['workout']}",
+            f"{prefix}{w['workout']}",
             f"Pace: {w['pace_target']}" if w["pace_target"] and w["pace_target"] != "—" else None,
             w["notes"] or None,
         ]
-        text = "\n".join(line for line in lines if line)
-    await update.message.reply_text(text)
+        blocks.append("\n".join(line for line in lines if line))
+    body = "\n\n".join(blocks)
+    await update.message.reply_text(f"{header}:\n{body}" if len(workouts) > 1 else f"{header}: {body}")
 
 
 async def plan_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

@@ -25,11 +25,14 @@ SCHEMAS = [
         "function": {
             "name": "get_todays_workout",
             "description": (
-                "Get the prescribed workout for a date. Returns "
-                "{date, day_name, workout, pace_target, notes, status, "
-                "is_rest_day, found}. Use this before answering any "
-                "'what's my workout' question — it reads the prescription "
-                "row for the date directly."
+                "Get the prescribed workout(s) for a date. Returns "
+                "{date, day_name, found, total_slots, sessions: [...]}. "
+                "On multi-session days (two-a-days, three-a-days) the "
+                "`sessions` list has one entry per slot, each with its own "
+                "workout/pace_target/notes/status/slot/slot_label/is_rest_day. "
+                "`slot_label` is 'AM'/'PM' for 2 sessions and 'k/N' for 3+. "
+                "Always iterate `sessions` rather than assuming one — render "
+                "every slot the user has planned."
             ),
             "parameters": {
                 "type": "object",
@@ -123,7 +126,7 @@ def _get_today(args: dict, state) -> dict:
 
 def _get_todays_workout(args: dict, state) -> dict:
     target = _parse_date(args.get("date")) or today_local()
-    return state.get_todays_workout(target)
+    return _day_summary(state, target)
 
 
 def _get_week_plan(args: dict, state) -> dict:
@@ -131,32 +134,62 @@ def _get_week_plan(args: dict, state) -> dict:
     today = today_local()
     monday = today - timedelta(days=today.weekday())
     target_monday = monday + timedelta(weeks=offset)
-    rows = []
-    for i in range(7):
-        d = target_monday + timedelta(days=i)
-        row = state.get_todays_workout(d)
-        rows.append(row)
     return {
         "week_start": target_monday.isoformat(),
         "week_offset": offset,
-        "days": rows,
+        "days": [_day_summary(state, target_monday + timedelta(days=i)) for i in range(7)],
+    }
+
+
+def _day_summary(state, target_date) -> dict:
+    """Day view used by both get_todays_workout and get_week_plan.
+
+    Hybrid shape: day-level legacy fields populated from the primary slot
+    (so existing prompts that reference ``workout`` / ``pace_target`` keep
+    working) plus ``sessions[]`` listing every slot for multi-session days.
+    """
+    sessions = state.get_todays_workouts(target_date)
+    primary = sessions[0] if sessions else {}
+    return {
+        "date": target_date.isoformat(),
+        "day_name": target_date.strftime("%A"),
+        "workout": primary.get("workout", ""),
+        "pace_target": primary.get("pace_target", ""),
+        "notes": primary.get("notes", ""),
+        "detail_md": primary.get("detail_md", ""),
+        "status": primary.get("status"),
+        "is_rest_day": primary.get("is_rest_day", False),
+        "found": bool(sessions),
+        "slot": primary.get("slot"),
+        "slot_label": primary.get("slot_label", ""),
+        "total_slots": len(sessions),
+        "sessions": sessions,
     }
 
 
 def _get_week_status(args: dict, state) -> dict:
-    """Join the week's prescriptions with completion data from log.jsonl.
+    """Join the week's prescriptions with completion data.
 
-    For each day, classify the prescription kind, partition the day's logged
-    sessions into matched vs off-plan, and surface a `completed` boolean +
-    short `actuals` / `off_plan_actuals` summaries the agent can render.
+    Hybrid shape so day-level summaries (rendered by the agent for week
+    overviews) keep their legacy fields AND multi-session days expose every
+    slot's status individually:
+
+    Per day:
+      - Legacy day-level fields (workout, pace_target, notes,
+        prescription_kind, completed, actuals, off_plan_actuals) describe
+        the day's PRIMARY slot. Type-strict completion check via
+        `_log_matches_prescription` so a wrong-type Strava upload that
+        reconcile loose-matched to a single-planned row is still counted
+        as off-plan here.
+      - `sessions[]` holds one entry per slot for multi-session days,
+        each with its own `slot`, `slot_label`, `prescription_kind`,
+        `completed` flags. Single-session days have a 1-element list.
     """
-    # Imported lazily to avoid a circular import: tools/plan -> google_calendar
-    # -> tools/state -> tools/plan via tool dispatch. mark_complete itself
-    # isn't called here; we only reuse its classification helpers.
     from google_calendar.sync import (
         _log_matches_prescription,
         _prescription_kind,
     )
+    from state_manager import _workout_dict_from_row
 
     offset = int(args.get("week_offset", 0))
     today = today_local()
@@ -166,28 +199,63 @@ def _get_week_status(args: dict, state) -> dict:
     days_out: list[dict] = []
     for i in range(7):
         d = target_monday + timedelta(days=i)
-        row = state.get_todays_workout(d)
-        kind = _prescription_kind(row.get("workout") or "") if row.get("found") else None
-        sessions = state.sessions_on_date(d)
-        matched: list[dict] = []
-        off_plan: list[dict] = []
-        for s in sessions:
-            t = str(s.get("type", ""))
-            if row.get("found") and _log_matches_prescription(kind, t):
-                matched.append(s)
+        prescription_rows = state.get_workout_rows(d)
+        n = len(prescription_rows)
+        sessions_for_day: list[dict] = []
+        for r in prescription_rows:
+            view = _workout_dict_from_row(r, total_slots=n, date_override=d)
+            kind = _prescription_kind(r.get("prescribed_workout") or "")
+            view["prescription_kind"] = kind
+            # Per-slot completion: row status AND the logged type must
+            # actually satisfy the prescription kind. Reconcile's loose
+            # single-row fallback can mark a wrong-type strength activity
+            # as completed against an easy slot — guard against that.
+            data = _row_json(r)
+            log_type = str(data.get("type") or "") if data else ""
+            view["completed"] = (
+                r.get("status") == "completed"
+                and bool(kind)
+                and _log_matches_prescription(kind, log_type)
+            )
+            view["actual"] = _summarize_session(data) if data and view["completed"] else None
+            sessions_for_day.append(view)
+
+        # All sessions (any status) on the date, including off-plan rows
+        # and wrong-type matches against single-slot prescriptions.
+        all_logged = state.sessions_on_date(d)
+        # Day-level legacy fields: primary slot view + aggregated actuals.
+        primary = sessions_for_day[0] if sessions_for_day else {}
+        primary_kind = primary.get("prescription_kind")
+        actuals: list[dict] = []
+        off_plan_actuals: list[dict] = []
+        for s in all_logged:
+            t = str(s.get("type") or "")
+            if primary_kind and _log_matches_prescription(primary_kind, t):
+                actuals.append(_summarize_session(s))
             else:
-                off_plan.append(s)
-        days_out.append(
-            {
-                **row,
-                "prescription_kind": kind,
-                "completed": bool(matched),
-                "is_past": d < today,
-                "is_today": d == today,
-                "actuals": [_summarize_session(s) for s in matched],
-                "off_plan_actuals": [_summarize_session(s) for s in off_plan],
-            }
-        )
+                off_plan_actuals.append(_summarize_session(s))
+
+        days_out.append({
+            "date": d.isoformat(),
+            "day_name": d.strftime("%A"),
+            "workout": primary.get("workout", ""),
+            "pace_target": primary.get("pace_target", ""),
+            "notes": primary.get("notes", ""),
+            "detail_md": primary.get("detail_md", ""),
+            "status": primary.get("status"),
+            "is_rest_day": primary.get("is_rest_day", False),
+            "found": bool(prescription_rows),
+            "slot": primary.get("slot"),
+            "slot_label": primary.get("slot_label", ""),
+            "total_slots": n,
+            "sessions": sessions_for_day,
+            "prescription_kind": primary_kind,
+            "completed": bool(prescription_rows) and all(s["completed"] for s in sessions_for_day),
+            "is_past": d < today,
+            "is_today": d == today,
+            "actuals": actuals,
+            "off_plan_actuals": off_plan_actuals,
+        })
 
     return {
         "week_start": target_monday.isoformat(),
@@ -195,6 +263,20 @@ def _get_week_status(args: dict, state) -> dict:
         "today": today.isoformat(),
         "days": days_out,
     }
+
+
+def _row_json(row: dict) -> dict:
+    """Best-effort parse of a sessions row's ``data`` JSON to a dict."""
+    raw = row.get("data")
+    if not raw:
+        return {}
+    if isinstance(raw, dict):
+        return raw
+    import json
+    try:
+        return json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        return {}
 
 
 def _summarize_session(entry: dict) -> dict:
