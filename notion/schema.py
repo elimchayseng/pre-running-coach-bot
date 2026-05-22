@@ -61,10 +61,15 @@ def _relation(data_source_id: str) -> dict:
 # ---------- database property schemas ----------
 
 # Sessions — one row per workout, mirroring the unified `sessions` table.
+# Slot stores the ordinal ("1", "2", "3", ...) of a session within its date.
+# Single-session days carry slot=NULL → property left empty. Notion auto-
+# creates new select options when an unseen value is written, so existing
+# data sources tagged with legacy "am"/"pm" options keep working — the
+# next mirror write simply adds "1"/"2"/etc. on the fly.
 SESSIONS_PROPERTIES: dict = {
     "Title": {"title": {}},
     "Date": {"date": {}},
-    "Slot": _select("am", "pm"),
+    "Slot": _select("1", "2", "3", "4", "5"),
     "Status": _select("planned", "completed", "missed", "off-plan"),
     "Type": _select("easy", "workout", "long", "race", "cross", "strength", "rest"),
     "Prescribed": {"rich_text": {}},

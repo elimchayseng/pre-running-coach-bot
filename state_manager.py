@@ -64,6 +64,92 @@ _RUN_LIKE = {"run", "easy", "workout", "long", "long_run", "race", "strides", "r
 _REST_PATTERNS = ("off", "rest", "no run", "no running")
 
 
+# ---------- multi-session-per-day slot helpers ----------
+#
+# When a date has N>1 planned sessions, each row gets a string ordinal slot
+# ("1", "2", ...) assigned at parse time. Single-session days stay slot=NULL.
+# The bucket/label helpers below are the single source of truth used by
+# Google Calendar event payload, Strava activity matching, and Notion title
+# formatting — so the three surfaces stay in lockstep.
+
+
+def slot_time_bucket(slot: Optional[str], total_slots: int) -> Optional[tuple[float, float]]:
+    """Return (start_hour, end_hour) in local time for a multi-session slot.
+
+    Returns None when the date is single-session (caller emits an all-day
+    event / matches loosely on type). Hours are floats so 06:00–07:30 is
+    (6.0, 7.5); split into HH:MM at the boundary with ``divmod(h*60, 60)``.
+
+    Canonical layout:
+        2 slots: 06:00–07:30, 17:30–19:00
+        3 slots: 06:00–07:30, 12:00–13:00, 17:30–19:00
+        4 slots: 06:00–07:30, 10:00–11:00, 14:00–15:00, 18:00–19:00
+        5+ slots: linearly distributed across 06:30–19:30 centers, 1h each
+    """
+    if total_slots <= 1 or slot is None:
+        return None
+    try:
+        idx = int(slot)
+    except (ValueError, TypeError):
+        return None
+    if idx < 1 or idx > total_slots:
+        return None
+    if total_slots == 2:
+        return [(6.0, 7.5), (17.5, 19.0)][idx - 1]
+    if total_slots == 3:
+        return [(6.0, 7.5), (12.0, 13.0), (17.5, 19.0)][idx - 1]
+    if total_slots == 4:
+        return [(6.0, 7.5), (10.0, 11.0), (14.0, 15.0), (18.0, 19.0)][idx - 1]
+    # 5+ slots: spread 1-hour windows evenly. First center at 6.5h, last at
+    # 19.5h — matches the AM/PM endpoints used for 2/3/4 above.
+    first_center, last_center = 6.5, 19.5
+    center = first_center + (last_center - first_center) * (idx - 1) / (total_slots - 1)
+    return (center - 0.5, center + 0.5)
+
+
+def slot_bucket_center(slot: Optional[str], total_slots: int) -> Optional[float]:
+    """Midpoint hour of the slot's bucket, used by the Strava matcher."""
+    bucket = slot_time_bucket(slot, total_slots)
+    return None if bucket is None else (bucket[0] + bucket[1]) / 2
+
+
+def _hour_from_start_local(start_local: Optional[str]) -> Optional[float]:
+    """Pull a local-clock-time hour float from an ISO ``start_local`` field.
+
+    Accepts "2026-05-12T06:32:00Z" or "2026-05-12T06:32:00" (Strava emits
+    the Z suffix on ``start_date_local`` despite the value being a local
+    clock-time). Returns None for missing / malformed input so the matcher
+    falls back to type-only logic.
+    """
+    if not start_local or "T" not in start_local:
+        return None
+    time_part = start_local.split("T", 1)[1].rstrip("Z")
+    parts = time_part.split(":")
+    if len(parts) < 2:
+        return None
+    try:
+        h = int(parts[0])
+        m = int(parts[1])
+    except ValueError:
+        return None
+    if not (0 <= h <= 23 and 0 <= m <= 59):
+        return None
+    return h + m / 60.0
+
+
+def slot_display_label(slot: Optional[str], total_slots: int) -> str:
+    """User-facing label: '' for single, 'AM'/'PM' for two-a-day, 'k/N' for 3+."""
+    if total_slots <= 1 or slot is None:
+        return ""
+    try:
+        idx = int(slot)
+    except (ValueError, TypeError):
+        return ""
+    if total_slots == 2:
+        return "AM" if idx == 1 else "PM"
+    return f"{idx}/{total_slots}"
+
+
 class StateManager:
     """Reads and writes coach state, backed by SQLite."""
 
@@ -221,11 +307,17 @@ class StateManager:
         into ``plan_meta``. Planned rows are replaced wholesale; completed /
         missed / off-plan rows are never touched. Used to apply a post-activity
         review proposal verbatim.
+
+        Raises ``ValueError`` if a new (date, slot) assignment would collide
+        with an existing completed / missed / off-plan row — a slot's history
+        is anchored once written and the parser is not allowed to reuse the
+        ordinal for a different prescription (issue #46 W5).
         """
         rows = plan_markdown.parse_plan_rows(new_plan_md)
         details = plan_markdown.parse_workout_details(new_plan_md)
         meta = plan_markdown.build_plan_meta(new_plan_md)
         with self._conn() as conn:
+            _validate_new_slots_against_history(conn, rows)
             before_rows = [
                 _row_dict(r)
                 for r in conn.execute(
@@ -238,9 +330,10 @@ class StateManager:
                     "INSERT INTO sessions "
                     "(date, slot, status, type, prescribed_workout, prescribed_pace, "
                     " prescribed_notes, detail_md) "
-                    "VALUES (?, NULL, 'planned', ?, ?, ?, ?, ?)",
+                    "VALUES (?, ?, 'planned', ?, ?, ?, ?, ?)",
                     (
                         r["date"],
+                        r.get("slot"),
                         plan_markdown.infer_workout_type(r["workout"]),
                         r["workout"],
                         r["pace_target"],
@@ -345,7 +438,13 @@ class StateManager:
             if missing:
                 raise ValueError(f"row missing required keys {missing}: {r}")
         dates = sorted(r["date"] for r in rows)
+        # Caller may pass duplicate-date rows for two-a-days; stamp ordinal
+        # slots so the INSERT respects UNIQUE(date, slot). A caller that
+        # already populated `slot` (e.g. a future tool) is honored.
+        if not all("slot" in r for r in rows):
+            plan_markdown.assign_slot_ordinals(rows)
         with self._conn() as conn:
+            _validate_new_slots_against_history(conn, rows)
             before_rows = [
                 _row_dict(r)
                 for r in conn.execute(
@@ -367,9 +466,10 @@ class StateManager:
                 conn.execute(
                     "INSERT INTO sessions "
                     "(date, slot, status, type, prescribed_workout, prescribed_pace, prescribed_notes) "
-                    "VALUES (?, NULL, 'planned', ?, ?, ?, ?)",
+                    "VALUES (?, ?, 'planned', ?, ?, ?, ?)",
                     (
                         r["date"],
+                        r.get("slot"),
                         plan_markdown.infer_workout_type(r["workout"]),
                         r["workout"],
                         r["pace_target"],
@@ -421,50 +521,61 @@ class StateManager:
         return self._rows("date BETWEEN ? AND ?", (start.isoformat(), end.isoformat()))
 
     def get_workout_row(self, target: date) -> Optional[dict]:
-        """Return the prescription row for a date (planned preferred), or None."""
-        rows = self._rows(
-            "date = ? AND prescribed_workout IS NOT NULL",
-            (target.isoformat(),),
-        )
+        """Return the first prescription row for a date (planned preferred), or None.
+
+        On multi-session days this is slot 1 only — callers that need to render
+        every session should use :meth:`get_workout_rows`. Kept for backwards
+        compatibility with status checks, single-session UIs, and tests.
+        """
+        rows = self.get_workout_rows(target)
         if not rows:
             return None
         planned = [r for r in rows if r["status"] == "planned"]
         return planned[0] if planned else rows[0]
 
+    def get_workout_rows(self, target: date) -> list[dict]:
+        """Return every prescription row for a date, ordered by slot.
+
+        One row per session — empty list when the date has no prescription.
+        Use this anywhere a multi-session day must be surfaced in full (chat
+        bot summaries, LLM tools, post-activity reviews).
+        """
+        return self._rows(
+            "date = ? AND prescribed_workout IS NOT NULL",
+            (target.isoformat(),),
+        )
+
     def get_todays_workout(self, target_date: Optional[date] = None) -> dict:
         """Return the prescribed workout for a date.
 
+        Single-row view: returns the first slot. ``slot`` and ``total_slots``
+        are populated so callers can detect multi-session days and route to
+        :meth:`get_todays_workouts` when needed.
+
         Keys: date, day_name, workout, pace_target, notes, detail_md, status,
-        is_rest_day, found. ``found`` is False when no prescription row exists.
+        is_rest_day, found, slot, total_slots.
         """
         if target_date is None:
             target_date = date.today()
-        result = {
-            "date": target_date.isoformat(),
-            "day_name": target_date.strftime("%A"),
-            "workout": "",
-            "pace_target": "",
-            "notes": "",
-            "detail_md": "",
-            "status": None,
-            "is_rest_day": False,
-            "found": False,
-        }
-        row = self.get_workout_row(target_date)
-        if row is None:
+        rows = self.get_workout_rows(target_date)
+        result = _empty_workout(target_date)
+        if not rows:
             return result
-        result.update(
-            {
-                "workout": row["prescribed_workout"] or "",
-                "pace_target": row["prescribed_pace"] or "",
-                "notes": row["prescribed_notes"] or "",
-                "detail_md": row["detail_md"] or "",
-                "status": row["status"],
-                "found": True,
-                "is_rest_day": _is_rest_day(row["prescribed_workout"] or ""),
-            }
-        )
+        row = next((r for r in rows if r["status"] == "planned"), rows[0])
+        result.update(_workout_dict_from_row(row, total_slots=len(rows)))
         return result
+
+    def get_todays_workouts(self, target_date: Optional[date] = None) -> list[dict]:
+        """Return every prescribed workout for a date (one dict per slot).
+
+        Each entry carries the same shape as :meth:`get_todays_workout` plus
+        ``slot`` and ``total_slots``. Empty list when no prescription exists.
+        """
+        if target_date is None:
+            target_date = date.today()
+        rows = self.get_workout_rows(target_date)
+        n = len(rows)
+        return [_workout_dict_from_row(r, total_slots=n, date_override=target_date) for r in rows]
 
     def _rows(self, where: str, params: tuple) -> list[dict]:
         with self._conn() as conn:
@@ -483,6 +594,18 @@ class StateManager:
 
     def sessions_on_date(self, target: date) -> list[dict]:
         return self._session_data("date = ?", (target.isoformat(),))
+
+    def get_session_rows_on_date(self, target: date) -> list[dict]:
+        """Return every full session row (any status) for a date, ordered by slot.
+
+        Unlike ``sessions_on_date`` which returns only the ``data`` JSON of
+        logged entries, this returns the full row dicts (id, slot, status,
+        prescribed_*, data, detail_md, ...). Callers that need to mirror
+        per-slot calendar / Notion state — particularly mark_complete on
+        multi-session days — should use this so they can identify which slot
+        each entry belongs to.
+        """
+        return self._rows("date = ?", (target.isoformat(),))
 
     def _session_data(self, where: str, params: tuple) -> list[dict]:
         """Return the ``data`` JSON of logged (completed/off-plan) sessions."""
@@ -536,12 +659,16 @@ class StateManager:
         stype = session.get("type") or ""
         payload = json.dumps(session, ensure_ascii=False)
         change_entry: Optional[dict] = None
+        # Activity hour drives slot routing on multi-session days. Missing
+        # start_local (legacy entries) falls through to type-only matching.
+        activity_hour = _hour_from_start_local(session.get("start_local"))
         with self._conn() as conn:
             planned = conn.execute(
-                "SELECT id, type FROM sessions WHERE date = ? AND status = 'planned' ORDER BY slot, id",
+                "SELECT id, type, slot FROM sessions WHERE date = ? AND status = 'planned' ORDER BY slot, id",
                 (sdate,),
             ).fetchall()
-            match = _pick_planned_match(stype, planned)
+            total_slots = sum(1 for r in planned if r["slot"] is not None)
+            match = _pick_planned_match(stype, planned, activity_hour=activity_hour, total_slots=total_slots or None)
             if match is not None:
                 before_row = _row_dict(conn.execute("SELECT * FROM sessions WHERE id = ?", (match["id"],)).fetchone())
                 conn.execute(
@@ -592,16 +719,37 @@ class StateManager:
         """Best-effort: reflect written session rows into the Notion mirror.
 
         Lazy-imported and fully exception-swallowing — the mirror is optional
-        and a Notion problem must never break a SQLite write.
+        and a Notion problem must never break a SQLite write. Each row is
+        annotated in-place with ``total_slots_on_date`` (the count of
+        prescription rows sharing its date) so the mirror can format
+        multi-session titles correctly.
         """
         if not rows:
             return
+        self._stamp_total_slots_on_date(rows)
         try:
             from notion.mirror import mirror_sessions
 
             mirror_sessions(rows)
         except Exception:  # noqa: BLE001 — mirror failures never propagate
             pass
+
+    def _stamp_total_slots_on_date(self, rows: list[dict]) -> None:
+        """Annotate each row with the prescription-row count for its date."""
+        dates = {r["date"] for r in rows if r.get("date")}
+        if not dates:
+            return
+        placeholders = ",".join("?" * len(dates))
+        with self._conn() as conn:
+            result = conn.execute(
+                f"SELECT date, COUNT(*) AS n FROM sessions "
+                f"WHERE date IN ({placeholders}) AND prescribed_workout IS NOT NULL "
+                f"GROUP BY date",
+                tuple(dates),
+            ).fetchall()
+        counts = {r["date"]: r["n"] for r in result}
+        for row in rows:
+            row["total_slots_on_date"] = counts.get(row["date"], 0)
 
     def _notify_mirror_change(self, entry: Optional[dict]) -> None:
         """Best-effort mirror of one changelog entry to Notion Plan Changes."""
@@ -915,11 +1063,87 @@ def _deep_merge(dst: dict, src: dict) -> None:
             dst[k] = v
 
 
+def _validate_new_slots_against_history(conn: sqlite3.Connection, new_rows: list[dict]) -> None:
+    """Raise ValueError if a new (date, slot) collides with non-planned history.
+
+    Once a slot has logged actuals — status in {completed, missed, off-plan} —
+    that ordinal is anchored to its historical prescription. The plan parser
+    is not allowed to reassign the same ordinal to a different workout: the
+    Notion page, GCal event, and changelog all reference the (date, slot)
+    key, so silently overwriting would scramble cross-surface state. The
+    parser-side equivalent of issue #46 W5: surface a clear error instead.
+
+    NULL-slot rows are exempt (single-session legacy shape; UNIQUE(date,slot)
+    treats them as distinct in SQLite anyway).
+    """
+    by_date: dict[str, set] = {}
+    for r in new_rows:
+        slot = r.get("slot")
+        if slot is None:
+            continue
+        by_date.setdefault(r["date"], set()).add(slot)
+    if not by_date:
+        return
+    dates = list(by_date.keys())
+    placeholders = ",".join("?" * len(dates))
+    existing = conn.execute(
+        f"SELECT date, slot, status FROM sessions "
+        f"WHERE date IN ({placeholders}) AND status != 'planned' AND slot IS NOT NULL",
+        tuple(dates),
+    ).fetchall()
+    for row in existing:
+        claimed = by_date.get(row["date"], set())
+        if row["slot"] in claimed:
+            raise ValueError(
+                f"cannot reassign slot {row['slot']!r} on {row['date']}: an existing "
+                f"{row['status']} session already owns that ordinal. Edit it via "
+                f"update_workout or restructure with the historical slot preserved."
+            )
+
+
 def _is_rest_day(workout: str) -> bool:
     w = workout.strip().lower()
     if not w or w in {"-", "—"}:
         return True
     return any(w.startswith(p) for p in _REST_PATTERNS)
+
+
+def _empty_workout(target_date: date) -> dict:
+    """Default get_todays_workout response when no prescription row exists."""
+    return {
+        "date": target_date.isoformat(),
+        "day_name": target_date.strftime("%A"),
+        "workout": "",
+        "pace_target": "",
+        "notes": "",
+        "detail_md": "",
+        "status": None,
+        "is_rest_day": False,
+        "found": False,
+        "slot": None,
+        "total_slots": 0,
+        "slot_label": "",
+    }
+
+
+def _workout_dict_from_row(row: dict, total_slots: int, date_override: Optional[date] = None) -> dict:
+    """Project one sessions row into the get_todays_workout view shape."""
+    iso = row["date"]
+    d = date_override or date.fromisoformat(iso)
+    return {
+        "date": iso,
+        "day_name": d.strftime("%A"),
+        "workout": row.get("prescribed_workout") or "",
+        "pace_target": row.get("prescribed_pace") or "",
+        "notes": row.get("prescribed_notes") or "",
+        "detail_md": row.get("detail_md") or "",
+        "status": row.get("status"),
+        "is_rest_day": _is_rest_day(row.get("prescribed_workout") or ""),
+        "found": True,
+        "slot": row.get("slot"),
+        "total_slots": total_slots,
+        "slot_label": slot_display_label(row.get("slot"), total_slots),
+    }
 
 
 # ---------- change-body formatters (for the Plan Changes Notion mirror) ----------
@@ -993,18 +1217,53 @@ def _parse_review_row(row: dict) -> dict:
     return row
 
 
-def _pick_planned_match(activity_type: str, planned: list) -> Optional[Any]:
+def _pick_planned_match(
+    activity_type: str,
+    planned: list,
+    activity_hour: Optional[float] = None,
+    total_slots: Optional[int] = None,
+) -> Optional[Any]:
     """Choose which planned row a logged activity completes.
 
-    A single planned row on the date is claimed regardless of type. With
-    multiple, prefer an exact type match, then a same-bucket (run-like vs
-    other) match; no match → None (the activity is off-plan).
+    Single planned row → matched regardless of type (legacy behavior). With
+    multiple planned rows, prefer the slot whose time bucket is closest to
+    ``activity_hour``; type breaks ties (exact match, then run-like bucket).
+
+    Falls back to today's type-only logic when no hour is available
+    (e.g. older log entries without ``start_local``).
     """
     if not planned:
         return None
     if len(planned) == 1:
         return planned[0]
     at = (activity_type or "").strip().lower()
+
+    # Bucket-proximity: only when we know the activity's local hour AND the
+    # planned rows actually carry slot ordinals (multi-session days do).
+    if activity_hour is not None:
+        slotted = [r for r in planned if r["slot"] is not None]
+        if slotted:
+            n = total_slots if total_slots is not None else len(slotted)
+            scored = []
+            for row in slotted:
+                center = slot_bucket_center(row["slot"], n)
+                if center is None:
+                    continue
+                distance = abs(activity_hour - center)
+                # type-priority within ties: 0 = exact, 1 = run-like bucket, 2 = mismatch
+                row_type = (row["type"] or "").strip().lower()
+                if row_type == at:
+                    type_rank = 0
+                elif (row_type in _RUN_LIKE) == (at in _RUN_LIKE):
+                    type_rank = 1
+                else:
+                    type_rank = 2
+                scored.append((distance, type_rank, row))
+            if scored:
+                scored.sort(key=lambda x: (x[0], x[1]))
+                return scored[0][2]
+
+    # Legacy fallback: type-only matching.
     for row in planned:
         if (row["type"] or "").strip().lower() == at:
             return row

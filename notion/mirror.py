@@ -163,6 +163,12 @@ def _session_title(row: dict, data: dict) -> str:
       - everything else → the ``prescribed_workout`` text verbatim (e.g.
         ``"Easy 8mi"``), falling back to ``type`` then ``"session"``.
 
+    Multi-session days prefix the title with a slot label (``[AM]``, ``[PM]``,
+    or ``[k/N]`` for 3+ sessions) so the user can tell same-day sessions apart
+    in list/board views where Date alone is ambiguous. The total-slots count
+    is stamped onto the row as ``total_slots_on_date`` by the mirror's caller
+    (state_manager._notify_mirror) — missing means single-session, no prefix.
+
     The date deliberately isn't in the title: the Date property carries it
     structurally and the Calendar view shows it on the cell. Matches the
     Google Calendar event-summary convention so the same session reads
@@ -173,8 +179,36 @@ def _session_title(row: dict, data: dict) -> str:
     sess_type = row.get("type")
     if status in ("completed", "off-plan") and isinstance(miles, (int, float)) and miles > 0:
         miles_str = f"{round(miles, 1):g}"
-        return f"{miles_str} mi ({sess_type})" if sess_type else f"{miles_str} mi"
-    return row.get("prescribed_workout") or sess_type or "session"
+        base = f"{miles_str} mi ({sess_type})" if sess_type else f"{miles_str} mi"
+    else:
+        base = row.get("prescribed_workout") or sess_type or "session"
+    label = _slot_label_from_row(row)
+    return f"[{label}] {base}" if label else base
+
+
+def _slot_label_from_row(row: dict) -> str:
+    """Format the slot label for the row's title prefix.
+
+    Reads ``slot`` and ``total_slots_on_date`` from the row dict (the latter
+    is annotated by state_manager._notify_mirror before mirror_sessions is
+    called). Falls back to no label when total_slots is missing or 1.
+    """
+    slot = row.get("slot")
+    if not slot:
+        return ""
+    total = row.get("total_slots_on_date") or 0
+    try:
+        total = int(total)
+    except (TypeError, ValueError):
+        return ""
+    if total <= 1:
+        # Slot is set but we don't know the total — be conservative and skip
+        # the label rather than guessing AM/PM.
+        return ""
+    # Import lazily; mirror.py imports nothing from state_manager directly.
+    from state_manager import slot_display_label
+
+    return slot_display_label(slot, total)
 
 
 def _session_properties(row: dict, source_key: str) -> dict:

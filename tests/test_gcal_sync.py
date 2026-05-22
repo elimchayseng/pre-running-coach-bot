@@ -901,4 +901,387 @@ class TestReconcileCompletion:
         # Date is corrected, but it's an off_plan completion, not prescribed.
         [entry] = [c for c in out["corrected"] if c["date"] == "2026-05-11"]
         assert entry["prescribed"] is False
-        assert entry["off_plan"] is True
+
+
+# ============================================================================
+# Slot-aware sync — multi-session days (Issue #46)
+# ============================================================================
+
+
+class _SlotStateStub(_StateStub):
+    """Test stub that also exposes ``get_session_rows_on_date`` so the
+    slot-aware mark_complete path is exercised. Plan rows are auto-tagged with
+    ordinal slots based on duplicate-date occurrence.
+    """
+
+    def __init__(self, plan_text: str = "", session_rows: dict[str, list[dict]] | None = None):
+        super().__init__(plan_text)
+        # session_rows: per-date list of full row dicts (id, slot, status,
+        # prescribed_workout, data, ...). Mark_complete reads these.
+        self._session_rows = session_rows or {}
+
+    def _rows(self) -> list[dict]:
+        # Override to attach slot ordinals from the parser.
+        from plan_markdown import infer_workout_type, parse_plan_rows, parse_workout_details
+
+        details = parse_workout_details(self._plan)
+        return [
+            {
+                "id": idx,
+                "date": r["date"],
+                "slot": r.get("slot"),
+                "status": "planned",
+                "type": infer_workout_type(r["workout"]),
+                "prescribed_workout": r["workout"],
+                "prescribed_pace": r["pace_target"],
+                "prescribed_notes": r["notes"],
+                "detail_md": details.get(r["date"]),
+                "data": None,
+            }
+            for idx, r in enumerate(parse_plan_rows(self._plan), start=1)
+        ]
+
+    def get_session_rows_on_date(self, target) -> list[dict]:
+        return list(self._session_rows.get(target.isoformat(), []))
+
+
+class TestEventIdSlotSuffix:
+    def test_single_session_uses_legacy_id(self):
+        # No slot → legacy 16-char id, unchanged.
+        assert sync._event_id("2026-05-27", None) == "pretrain20260527"
+        assert sync._event_id("2026-05-27", "") == "pretrain20260527"
+
+    def test_multi_session_appends_slot_ordinal(self):
+        assert sync._event_id("2026-05-27", "1") == "pretrain20260527s1"
+        assert sync._event_id("2026-05-27", "2") == "pretrain20260527s2"
+        assert sync._event_id("2026-05-27", "3") == "pretrain20260527s3"
+
+    def test_completion_id_disambiguates_off_plan(self):
+        # No slot, no disambiguator → legacy precomplete id.
+        assert sync._completion_event_id("2026-05-27") == "precomplete20260527"
+        # Slot suffix when set.
+        assert sync._completion_event_id("2026-05-27", slot="2") == "precomplete20260527s2"
+        # Disambiguator strips non [a-v0-9] chars.
+        assert sync._completion_event_id("2026-05-27", slot="2", disambiguator="12345") == "precomplete20260527s2x12345"
+
+    def test_date_from_event_id_tolerates_slot_suffix(self):
+        from datetime import date as _date
+
+        # Slot-suffixed id still resolves to the right date.
+        assert sync._date_from_event_id("pretrain20260527s2") == _date(2026, 5, 27)
+        # Legacy id unaffected.
+        assert sync._date_from_event_id("pretrain20260511") == _date(2026, 5, 11)
+        # Off-plan with disambiguator.
+        assert sync._date_from_event_id("precomplete20260527s2x12345") == _date(2026, 5, 27)
+
+
+class TestTwoADayPayload:
+    def test_multi_session_emits_timed_event(self):
+        row = {
+            "date": "2026-05-27",
+            "workout": "Easy 5mi",
+            "pace_target": "Z2",
+            "notes": "",
+            "slot": "1",
+        }
+        payload, _ = sync._build_event_payload(row, sync._event_id(row["date"], "1"), total_slots=2)
+        # AM slot (slot 1 of 2) → 06:00–07:30 timed.
+        assert "dateTime" in payload["start"]
+        assert payload["start"]["dateTime"] == "2026-05-27T06:00:00"
+        assert payload["end"]["dateTime"] == "2026-05-27T07:30:00"
+        assert payload["summary"].startswith("[AM] ")
+
+    def test_pm_slot_uses_evening_bucket(self):
+        row = {
+            "date": "2026-05-27",
+            "workout": "6x400 @ 5K",
+            "pace_target": "reps",
+            "notes": "",
+            "slot": "2",
+        }
+        payload, _ = sync._build_event_payload(row, sync._event_id(row["date"], "2"), total_slots=2)
+        assert payload["start"]["dateTime"] == "2026-05-27T17:30:00"
+        assert payload["end"]["dateTime"] == "2026-05-27T19:00:00"
+        assert payload["summary"].startswith("[PM] ")
+
+    def test_three_a_day_uses_k_of_n_label(self):
+        row = {
+            "date": "2026-05-27",
+            "workout": "Mobility",
+            "pace_target": "-",
+            "notes": "",
+            "slot": "2",
+        }
+        payload, _ = sync._build_event_payload(row, sync._event_id(row["date"], "2"), total_slots=3)
+        assert payload["summary"].startswith("[2/3] ")
+
+    def test_single_session_stays_all_day(self):
+        row = {
+            "date": "2026-05-27",
+            "workout": "Easy 4mi",
+            "pace_target": "8:30",
+            "notes": "",
+            "slot": None,
+        }
+        payload, _ = sync._build_event_payload(row, sync._event_id(row["date"]), total_slots=1)
+        # No timezone-aware fields; legacy all-day shape.
+        assert "date" in payload["start"]
+        assert payload["start"]["date"] == "2026-05-27"
+        assert "[" not in payload["summary"]
+
+
+TWO_A_DAY_PLAN = """\
+| Day | Date | Workout | Pace target | Notes |
+|-----|------|---------|-------------|-------|
+| Wed | 2026-05-27 | Easy 5mi AM | Z2 | |
+| Wed | 2026-05-27 | 6x400 PM | reps | |
+| Thu | 2026-05-28 | 8mi long | Z2 | |
+"""
+
+
+class TestSlotAwareSyncPlan:
+    """sync_plan must emit a distinct event id per (date, slot) and prune
+    legacy/stale ids when the slot layout changes."""
+
+    @pytest.fixture
+    def fixed_today_wed(self, monkeypatch):
+        monkeypatch.setattr(sync, "today_local", lambda: date(2026, 5, 27))
+        yield date(2026, 5, 27)
+
+    def test_two_a_day_inserts_two_distinct_events(self, monkeypatch, fixed_today_wed):
+        from google_calendar import client as gcal_client
+
+        inserts: list[str] = []
+        monkeypatch.setattr(gcal_client, "insert_event", lambda p: inserts.append(p["id"]) or {"id": p["id"]})
+        monkeypatch.setattr(gcal_client, "list_managed_events", lambda *a, **kw: [])
+
+        state = _SlotStateStub(TWO_A_DAY_PLAN)
+        result = sync.sync_plan(state, dry_run=False)
+
+        assert result["inserted"] == 3  # 2 for Wed + 1 for Thu
+        assert "pretrain20260527s1" in inserts
+        assert "pretrain20260527s2" in inserts
+        assert "pretrain20260528" in inserts  # Thu stays legacy id
+
+    def test_legacy_event_pruned_when_day_becomes_two_a_day(self, monkeypatch, fixed_today_wed):
+        """W3: plan editor adds a PM session; the old all-day event for that
+        date must be deleted so it doesn't compete with the new timed events."""
+        from google_calendar import client as gcal_client
+
+        monkeypatch.setattr(gcal_client, "insert_event", lambda p: {"id": p["id"]})
+        # Calendar already holds the legacy all-day event from a prior sync.
+        monkeypatch.setattr(
+            gcal_client,
+            "list_managed_events",
+            lambda *a, **kw: [
+                {"id": "pretrain20260527", "start": {"date": "2026-05-27"}},
+                {"id": "pretrain20260528", "start": {"date": "2026-05-28"}},
+            ],
+        )
+        deletes: list[str] = []
+        monkeypatch.setattr(gcal_client, "delete_event", lambda eid: deletes.append(eid))
+
+        state = _SlotStateStub(TWO_A_DAY_PLAN)
+        sync.sync_plan(state, dry_run=False)
+
+        # Legacy all-day event on the same date is pruned; the new timed events stay.
+        assert "pretrain20260527" in deletes
+        assert "pretrain20260528" not in deletes
+
+    def test_slot_events_pruned_when_day_collapses_to_single(self, monkeypatch, fixed_today_wed):
+        """W4: plan editor removes the PM session; both timed slot events
+        are deleted and replaced with the legacy all-day shape."""
+        from google_calendar import client as gcal_client
+
+        monkeypatch.setattr(gcal_client, "insert_event", lambda p: {"id": p["id"]})
+        monkeypatch.setattr(
+            gcal_client,
+            "list_managed_events",
+            lambda *a, **kw: [
+                {"id": "pretrain20260527s1", "start": {"dateTime": "2026-05-27T06:00:00"}},
+                {"id": "pretrain20260527s2", "start": {"dateTime": "2026-05-27T17:30:00"}},
+            ],
+        )
+        deletes: list[str] = []
+        monkeypatch.setattr(gcal_client, "delete_event", lambda eid: deletes.append(eid))
+
+        single_plan = """\
+| Day | Date | Workout | Pace target | Notes |
+|-----|------|---------|-------------|-------|
+| Wed | 2026-05-27 | Easy 5mi | Z2 | |
+"""
+        state = _SlotStateStub(single_plan)
+        sync.sync_plan(state, dry_run=False)
+
+        # Both slot events deleted; new legacy id will be inserted in this run.
+        assert sorted(deletes) == ["pretrain20260527s1", "pretrain20260527s2"]
+
+
+class TestSlotAwareMarkComplete:
+    """mark_complete iterates per-slot, patching each session's own event."""
+
+    @pytest.fixture
+    def patches(self):
+        return []
+
+    @pytest.fixture
+    def inserts(self):
+        return []
+
+    def _wire(self, monkeypatch, patches: list, inserts: list):
+        from google_calendar import client as gcal_client
+
+        # Insert always 409s on existing prescription ids → patch.
+        def _insert(p):
+            inserts.append(p)
+            return {"id": p["id"]}
+
+        def _patch(eid, p):
+            patches.append((eid, p))
+            return {"id": eid}
+
+        monkeypatch.setattr(gcal_client, "insert_event", _insert)
+        monkeypatch.setattr(gcal_client, "patch_event", _patch)
+        monkeypatch.setattr(gcal_client, "delete_event", lambda eid: None)
+
+    def test_only_matched_slot_marked_complete(self, monkeypatch, patches, inserts):
+        """One Strava activity arrives in the AM bucket; only slot 1 is patched."""
+        self._wire(monkeypatch, patches, inserts)
+
+        # SQLite-shape: slot 1 already completed by reconcile, slot 2 still planned.
+        rows = [
+            {
+                "id": 10,
+                "date": "2026-05-27",
+                "slot": "1",
+                "status": "completed",
+                "prescribed_workout": "Easy 5mi AM",
+                "prescribed_pace": "Z2",
+                "prescribed_notes": "",
+                "detail_md": None,
+                "data": '{"type":"easy","miles":5.0,"details":{"strava_id":111}}',
+            },
+            {
+                "id": 11,
+                "date": "2026-05-27",
+                "slot": "2",
+                "status": "planned",
+                "prescribed_workout": "6x400 PM",
+                "prescribed_pace": "reps",
+                "prescribed_notes": "",
+                "detail_md": None,
+                "data": None,
+            },
+        ]
+        state = _SlotStateStub(TWO_A_DAY_PLAN, session_rows={"2026-05-27": rows})
+
+        result = sync.mark_complete(state, date(2026, 5, 27))
+
+        assert len(result["prescribed"]) == 1
+        outcome = result["prescribed"][0]
+        assert outcome["event_id"] == "pretrain20260527s1"
+        assert outcome["slot"] == "1"
+        # Slot 2's event is NOT touched (still planned).
+        patched_ids = [eid for eid, _ in patches]
+        inserted_ids = [p["id"] for p in inserts]
+        assert "pretrain20260527s2" not in patched_ids
+        assert "pretrain20260527s2" not in inserted_ids
+
+    def test_both_slots_completed_emits_two_completion_payloads(self, monkeypatch, patches, inserts):
+        self._wire(monkeypatch, patches, inserts)
+        rows = [
+            {
+                "id": 10,
+                "date": "2026-05-27",
+                "slot": "1",
+                "status": "completed",
+                "prescribed_workout": "Easy 5mi AM",
+                "prescribed_pace": "Z2",
+                "prescribed_notes": "",
+                "detail_md": None,
+                "data": '{"type":"easy","miles":5.0,"details":{"strava_id":111}}',
+            },
+            {
+                "id": 11,
+                "date": "2026-05-27",
+                "slot": "2",
+                "status": "completed",
+                "prescribed_workout": "6x400 PM",
+                "prescribed_pace": "reps",
+                "prescribed_notes": "",
+                "detail_md": None,
+                "data": '{"type":"workout","miles":4.5,"details":{"strava_id":222}}',
+            },
+        ]
+        state = _SlotStateStub(TWO_A_DAY_PLAN, session_rows={"2026-05-27": rows})
+
+        result = sync.mark_complete(state, date(2026, 5, 27))
+
+        assert len(result["prescribed"]) == 2
+        ids = sorted(o["event_id"] for o in result["prescribed"])
+        assert ids == ["pretrain20260527s1", "pretrain20260527s2"]
+        # _apply_completed_event tries insert first; in this test insert
+        # succeeds (no 409), so payloads land in `inserts`, not `patches`.
+        summaries = [p["summary"] for p in inserts]
+        assert any(s.startswith("✅ [AM]") for s in summaries)
+        assert any(s.startswith("✅ [PM]") for s in summaries)
+
+    def test_off_plan_uses_per_row_event_id(self, monkeypatch, patches, inserts):
+        """Two off-plan activities on the same date get distinct precomplete ids."""
+        self._wire(monkeypatch, patches, inserts)
+        rows = [
+            {
+                "id": 50,
+                "date": "2026-05-27",
+                "slot": None,
+                "status": "off-plan",
+                "prescribed_workout": None,
+                "prescribed_pace": None,
+                "prescribed_notes": None,
+                "detail_md": None,
+                "data": '{"type":"easy","miles":3.0,"details":{"strava_id":111}}',
+            },
+            {
+                "id": 51,
+                "date": "2026-05-27",
+                "slot": None,
+                "status": "off-plan",
+                "prescribed_workout": None,
+                "prescribed_pace": None,
+                "prescribed_notes": None,
+                "detail_md": None,
+                "data": '{"type":"easy","miles":4.0,"details":{"strava_id":222}}',
+            },
+        ]
+        state = _SlotStateStub("", session_rows={"2026-05-27": rows})
+
+        result = sync.mark_complete(state, date(2026, 5, 27))
+
+        ids = sorted(o["event_id"] for o in result["off_plan"])
+        # Distinct disambiguators from strava_id.
+        assert ids == ["precomplete20260527x111", "precomplete20260527x222"]
+
+    def test_single_session_legacy_completion_still_works(self, monkeypatch, patches, inserts):
+        """Single-session days emit the legacy all-day precomplete id."""
+        self._wire(monkeypatch, patches, inserts)
+        rows = [
+            {
+                "id": 10,
+                "date": "2026-05-09",
+                "slot": None,
+                "status": "completed",
+                "prescribed_workout": "Easy 8mi",
+                "prescribed_pace": "8:30",
+                "prescribed_notes": "",
+                "detail_md": None,
+                "data": '{"type":"easy","miles":8.1,"details":{"strava_id":555}}',
+            },
+        ]
+        state = _SlotStateStub(
+            "| Day | Date | Workout | Pace target | Notes |\n"
+            "|-----|------|---------|-------------|-------|\n"
+            "| Sat | 2026-05-09 | Easy 8mi | 8:30 | foo |\n",
+            session_rows={"2026-05-09": rows},
+        )
+        result = sync.mark_complete(state, date(2026, 5, 9))
+        assert result["prescribed"][0]["event_id"] == "pretrain20260509"

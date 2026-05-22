@@ -34,8 +34,14 @@ def parse_plan_rows(plan_text: str) -> list[dict]:
     Locked format: ``| Day | Date | Workout | Pace target | Notes |`` where
     Date is ISO YYYY-MM-DD. Header / separator / non-ISO rows are skipped, as
     are rows whose Workout cell is empty or a dash.
+
+    Two rows that share a Date denote a multi-session day. Each row carries a
+    ``slot`` field: NULL when the date appears exactly once, otherwise the
+    1-based ordinal (as a string: "1", "2", ...) of the row's occurrence within
+    that date. Order in the source markdown is preserved by the SQL UNIQUE
+    (date, slot) index and by every `ORDER BY date, slot, id` reader.
     """
-    out: list[dict] = []
+    raw: list[dict] = []
     for line in plan_text.splitlines():
         if "|" not in line:
             continue
@@ -52,7 +58,7 @@ def parse_plan_rows(plan_text: str) -> list[dict]:
         workout = parts[2].strip()
         if workout in {"", "-", "—"}:
             continue
-        out.append(
+        raw.append(
             {
                 "day_name": parts[0],
                 "date": date_cell,
@@ -61,7 +67,30 @@ def parse_plan_rows(plan_text: str) -> list[dict]:
                 "notes": parts[4],
             }
         )
-    return out
+    return assign_slot_ordinals(raw)
+
+
+def assign_slot_ordinals(rows: list[dict]) -> list[dict]:
+    """Stamp each row dict in-place with a ``slot`` field.
+
+    Rule: within a single date, the 1st occurrence gets ``slot=None``
+    if it's the only row, otherwise ``slot="1"``, ``"2"``, ... in source
+    order. Single-occurrence dates stay slot=None so the legacy single-
+    session storage shape (and Google Calendar all-day event id) is
+    preserved end-to-end.
+    """
+    counts: dict[str, int] = {}
+    for r in rows:
+        counts[r["date"]] = counts.get(r["date"], 0) + 1
+    seen: dict[str, int] = {}
+    for r in rows:
+        d = r["date"]
+        if counts[d] == 1:
+            r["slot"] = None
+        else:
+            seen[d] = seen.get(d, 0) + 1
+            r["slot"] = str(seen[d])
+    return rows
 
 
 def parse_workout_details(plan_text: str) -> dict[str, str]:

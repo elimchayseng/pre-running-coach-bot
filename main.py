@@ -69,17 +69,21 @@ def handle_command(cmd: str) -> bool:
     elif command == "/today":
         state = _get_state()
         today = today_local()
-        w = state.get_todays_workout(today)
-        if not w["found"]:
+        workouts = state.get_todays_workouts(today)
+        if not workouts:
             print_system(f"No workout prescribed for {today.isoformat()}.")
-        elif w["is_rest_day"]:
-            print_system(f"{today.strftime('%a %b %d')}: rest day. {w['notes']}".strip())
         else:
-            print_system(f"{today.strftime('%a %b %d')}: {w['workout']}")
-            if w["pace_target"] and w["pace_target"] != "—":
-                print_system(f"  Pace: {w['pace_target']}")
-            if w["notes"]:
-                print_system(f"  Notes: {w['notes']}")
+            print_system(f"{today.strftime('%a %b %d')}:")
+            for w in workouts:
+                prefix = f"[{w['slot_label']}] " if w["slot_label"] else ""
+                if w["is_rest_day"]:
+                    print_system(f"  {prefix}rest day. {w['notes']}".rstrip())
+                    continue
+                print_system(f"  {prefix}{w['workout']}")
+                if w["pace_target"] and w["pace_target"] != "—":
+                    print_system(f"    Pace: {w['pace_target']}")
+                if w["notes"]:
+                    print_system(f"    Notes: {w['notes']}")
 
     elif command == "/plan":
         plan = _get_state().render_plan()

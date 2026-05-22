@@ -150,6 +150,43 @@ class TestSessionTitle:
         title = self._title_of(_row())
         assert "2026-" not in title, f"date prefix leaked into title: {title!r}"
 
+    def test_two_a_day_prefixes_am_pm(self):
+        am = _row(slot="1", total_slots_on_date=2)
+        pm = _row(slot="2", total_slots_on_date=2, prescribed_workout="6x400 @ 5K")
+        assert self._title_of(am) == "[AM] Easy 8mi"
+        assert self._title_of(pm) == "[PM] 6x400 @ 5K"
+
+    def test_three_a_day_prefixes_k_of_n(self):
+        midday = _row(slot="2", total_slots_on_date=3, prescribed_workout="Mobility")
+        assert self._title_of(midday) == "[2/3] Mobility"
+
+    def test_slot_without_total_yields_no_prefix(self):
+        # Defensive: caller didn't stamp total_slots_on_date → don't guess.
+        row = _row(slot="1")
+        assert self._title_of(row) == "Easy 8mi"
+
+    def test_single_session_no_prefix(self):
+        # total_slots_on_date=1 → label is empty, base title preserved.
+        assert self._title_of(_row(total_slots_on_date=1)) == "Easy 8mi"
+
+    def test_completed_two_a_day_keeps_slot_prefix(self):
+        data = json.dumps({"miles": 5.0})
+        row = _row(status="completed", slot="1", total_slots_on_date=2, data=data)
+        assert self._title_of(row) == "[AM] 5 mi (easy)"
+
+
+class TestSessionPropertiesSlot:
+    """Slot select property writes the row's slot ordinal verbatim — Notion
+    auto-creates the option when an unseen value appears."""
+
+    def test_slot_select_carries_ordinal(self):
+        props = mirror._session_properties(_row(slot="1", total_slots_on_date=2), "sid:5")
+        assert props["Slot"] == {"select": {"name": "1"}}
+
+    def test_slot_none_clears_property(self):
+        props = mirror._session_properties(_row(slot=None), "sid:5")
+        assert props["Slot"] == {"select": None}
+
 
 # ---------------- upsert ----------------
 

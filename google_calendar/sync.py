@@ -29,14 +29,28 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import re
 import threading
 from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
+from state_manager import slot_display_label, slot_time_bucket
 from temporal_context import today_local
 
 logger = logging.getLogger("pre_coach.gcal.sync")
+
+
+def _user_tz_name() -> str:
+    """IANA timezone for timed events on multi-session days.
+
+    Google needs an IANA tz string with dateTime values — without it, the
+    event drifts as if UTC. Read from USER_TIMEZONE (the same env var
+    temporal_context uses); fall back to UTC so the call never blocks on
+    missing config.
+    """
+    return os.getenv("USER_TIMEZONE") or "UTC"
+
 
 # Serializes every load → mutate → save against ``gcal_sync_state``. Two
 # writers exist today: ``sync_plan`` (often invoked from the auto-sync
@@ -97,15 +111,29 @@ def sync_plan(state, dry_run: bool = False) -> dict:
         counts = {"inserted": 0, "patched": 0, "deleted": 0, "unchanged": 0}
         errors: list[dict] = []
         synced_dates: set[str] = set()
+        # Slot-aware prune needs the precise set of event ids we expect to
+        # see, not just dates — when a date flips between single-session and
+        # multi-session, the legacy id (or the slot-suffixed id) must drop
+        # off so the orphan gets deleted.
+        expected_event_ids: set[str] = set()
+
+        # Count prescription rows per date so each row knows the day's slot count.
+        rows_per_date: dict[str, int] = {}
+        for srow in rows:
+            rows_per_date[srow["date"]] = rows_per_date.get(srow["date"], 0) + 1
 
         from . import client
 
         for srow in rows:
             row = _plan_dict(srow)
-            event_id = _event_id(row["date"])
+            total_slots = rows_per_date.get(srow["date"], 1)
+            event_id = _event_id(row["date"], row.get("slot"))
             synced_dates.add(row["date"])
+            expected_event_ids.add(event_id)
             try:
-                payload, payload_hash = _build_event_payload(row, event_id, srow.get("detail_md"))
+                payload, payload_hash = _build_event_payload(
+                    row, event_id, srow.get("detail_md"), total_slots=total_slots
+                )
             except Exception as e:
                 errors.append({"date": row["date"], "error": f"payload_build: {e}"})
                 continue
@@ -160,10 +188,20 @@ def sync_plan(state, dry_run: bool = False) -> dict:
             managed = []
 
         for ev in managed:
-            ev_date = (ev.get("start") or {}).get("date")
+            ev_id = ev.get("id")
+            if not ev_id:
+                continue
+            ev_start = ev.get("start") or {}
+            # Multi-session days emit timed events (`dateTime`); single-session
+            # days stay all-day (`date`). Pull the calendar date from either.
+            ev_date = ev_start.get("date") or (ev_start.get("dateTime") or "")[:10]
             if not ev_date:
-                continue  # not an all-day event we manage
-            if ev_date in synced_dates:
+                continue
+            # An event whose id is in the expected set is a current prescription
+            # — keep it. Same-date events with stale ids (e.g. the legacy
+            # all-day `pretrain<YYYYMMDD>` lingering after a day flipped to
+            # two-a-day) drop through to deletion.
+            if ev_id in expected_event_ids:
                 continue
             # Preserve completed events even when their date is no longer in the
             # plan (off-plan precomplete events live on dates that have no plan
@@ -172,9 +210,13 @@ def sync_plan(state, dry_run: bool = False) -> dict:
             ev_private = (ev.get("extendedProperties") or {}).get("private") or {}
             if ev_private.get("pre_completed") == "1":
                 continue
-            ev_id = ev.get("id")
-            if not ev_id:
-                continue
+            # Date-not-synced check: if the date had NO prescription row this
+            # sync (a fully deleted day), drop the event even without an id
+            # match. The id-set check above handles the "date kept, slot
+            # layout changed" case.
+            if ev_date in synced_dates and ev_id not in expected_event_ids:
+                # Date is still synced but this id isn't — stale slot layout.
+                pass  # fall through to delete
             if dry_run:
                 logger.info("[dry-run] would_delete %s (%s)", ev_id, ev_date)
                 counts["deleted"] += 1
@@ -216,12 +258,13 @@ def sync_plan(state, dry_run: bool = False) -> dict:
 
 def _plan_dict(session_row: dict) -> dict:
     """Adapt a `sessions` row into the plan-row shape the event-payload
-    builders expect (date / workout / pace_target / notes)."""
+    builders expect (date / workout / pace_target / notes / slot)."""
     return {
         "date": session_row["date"],
         "workout": session_row.get("prescribed_workout") or "",
         "pace_target": session_row.get("prescribed_pace") or "",
         "notes": session_row.get("prescribed_notes") or "",
+        "slot": session_row.get("slot"),
     }
 
 
@@ -244,13 +287,16 @@ def _clamp_description(body: str) -> str:
 # ---------- event payload ----------
 
 
-def _event_id(iso_date: str) -> str:
-    """Deterministic id derived from the date.
+def _event_id(iso_date: str, slot: Optional[str] = None) -> str:
+    """Deterministic id derived from (date, slot).
 
     Google requires `[a-v0-9]+` and 5–1024 chars. "pretrain" + YYYYMMDD
-    yields a stable 16-char id that's trivially valid.
+    yields a stable 16-char id for single-session days; multi-session days
+    append `s<ordinal>` ("pretrain20260527s2"). Leaving slot=NULL preserves
+    the legacy single-session shape so historical events are not migrated.
     """
-    return "pretrain" + iso_date.replace("-", "")
+    base = "pretrain" + iso_date.replace("-", "")
+    return base if not slot else f"{base}s{slot}"
 
 
 def _strip_bold(s: str) -> str:
@@ -262,9 +308,19 @@ def _build_event_payload(
     row: dict,
     event_id: str,
     detail_body: Optional[str] = None,
+    total_slots: int = 1,
 ) -> tuple[dict, str]:
-    start = date.fromisoformat(row["date"])
-    end = start + timedelta(days=1)  # all-day events: end is exclusive
+    """Build the gcal event payload for one prescription row.
+
+    Single-session days (``total_slots <= 1`` or ``row['slot']`` empty) emit
+    an all-day event — unchanged from the legacy single-session behavior.
+    Multi-session days emit a timed event using the canonical slot time
+    bucket, prefixed in summary with ``[AM]``/``[PM]`` (2-a-day) or
+    ``[k/N]`` (3+).
+    """
+    start_date = date.fromisoformat(row["date"])
+    slot = row.get("slot")
+    bucket = slot_time_bucket(slot, total_slots) if total_slots > 1 else None
 
     body = (detail_body or "").strip()
     if body:
@@ -281,12 +337,28 @@ def _build_event_payload(
         parts.append("(synced by PRE)")
         description = "\n".join(parts)
 
+    summary = _strip_bold(row["workout"])
+    label = slot_display_label(slot, total_slots) if total_slots > 1 else ""
+    if label:
+        summary = f"[{label}] {summary}"
+
+    if bucket is not None:
+        start_dt = _hour_float_to_datetime(start_date, bucket[0])
+        end_dt = _hour_float_to_datetime(start_date, bucket[1])
+        tz = _user_tz_name()
+        start_field = {"dateTime": start_dt, "timeZone": tz}
+        end_field = {"dateTime": end_dt, "timeZone": tz}
+    else:
+        end_date = start_date + timedelta(days=1)  # all-day: end exclusive
+        start_field = {"date": start_date.isoformat()}
+        end_field = {"date": end_date.isoformat()}
+
     payload = {
         "id": event_id,
-        "summary": _strip_bold(row["workout"]),
+        "summary": summary,
         "description": description,
-        "start": {"date": start.isoformat()},
-        "end": {"date": end.isoformat()},
+        "start": start_field,
+        "end": end_field,
         "extendedProperties": {
             "private": {"pre_managed": "1"},
         },
@@ -297,6 +369,13 @@ def _build_event_payload(
     payload_hash = hashlib.sha1(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
     payload["extendedProperties"]["private"]["pre_plan_hash"] = payload_hash
     return payload, payload_hash
+
+
+def _hour_float_to_datetime(d: date, hour: float) -> str:
+    """Format a (date, hour-float) pair as gcal's expected `YYYY-MM-DDTHH:MM:SS`."""
+    total_minutes = int(round(hour * 60))
+    hh, mm = divmod(total_minutes, 60)
+    return f"{d.isoformat()}T{hh:02d}:{mm:02d}:00"
 
 
 # ---------- completion (mark_complete) ----------
@@ -310,14 +389,32 @@ _RUN_LOG_TYPES = {"run", "easy", "long_run", "workout", "race", "strides", "retu
 _COMPLETED_COLOR_ID = "8"
 
 
-def _completion_event_id(iso_date: str) -> str:
+def _completion_event_id(
+    iso_date: str,
+    slot: Optional[str] = None,
+    disambiguator: Optional[str] = None,
+) -> str:
     """Off-plan completion event id (separate from the prescription event).
 
     Used when the user logs activity that doesn't satisfy the day's
     prescription — the prescription event stays untouched, the off-plan
     activity gets its own marked-complete event on the same day.
+
+    Multi-session days append ``s<slot>`` so multiple off-plan completions
+    on one date don't collide. ``disambiguator`` (e.g. a Strava activity
+    id) further disambiguates when several off-plan rows share the same
+    NULL slot — letters-only suffix per gcal's ``[a-v0-9]+`` rule.
     """
-    return "precomplete" + iso_date.replace("-", "")
+    base = "precomplete" + iso_date.replace("-", "")
+    if slot:
+        base = f"{base}s{slot}"
+    if disambiguator:
+        # gcal ids accept [a-v0-9]+; strip everything else so a strava_id like
+        # "12345" or a row id "r42" stays a valid id.
+        clean = "".join(ch for ch in str(disambiguator).lower() if ch.isdigit() or ("a" <= ch <= "v"))
+        if clean:
+            base = f"{base}x{clean}"
+    return base
 
 
 def _prescription_kind(workout_cell: str) -> Optional[str]:
@@ -394,6 +491,8 @@ def _build_completed_payload(
     plan_detail_body: Optional[str],
     entries: list[dict],
     log_date: date,
+    slot: Optional[str] = None,
+    total_slots: int = 1,
 ) -> dict:
     """Build an insert/patch payload representing a completed event.
 
@@ -401,6 +500,10 @@ def _build_completed_payload(
     prescribed event), then `--- Completed ---`, then one bullet per logged
     session. The full block is rebuilt from `entries` each call — idempotent
     under repeated mark_complete invocations.
+
+    Multi-session days get a timed event (start/end from the slot's bucket)
+    and a slot label prefix on the summary. Single-session days stay
+    all-day with the legacy summary shape.
     """
     if plan_row:
         workout_text = plan_row["workout"]
@@ -426,14 +529,26 @@ def _build_completed_payload(
     full_desc = prescription_desc + "\n\n" + actuals_block if prescription_desc else actuals_block
     full_desc = _clamp_description(full_desc) + "\n\n(marked complete by PRE)"
 
-    summary = "✅ " + _strip_bold(workout_text)
-    end = log_date + timedelta(days=1)
+    label = slot_display_label(slot, total_slots) if total_slots > 1 else ""
+    base_summary = _strip_bold(workout_text)
+    summary = f"✅ [{label}] {base_summary}" if label else f"✅ {base_summary}"
+
+    bucket = slot_time_bucket(slot, total_slots) if total_slots > 1 else None
+    if bucket is not None:
+        tz = _user_tz_name()
+        start_field = {"dateTime": _hour_float_to_datetime(log_date, bucket[0]), "timeZone": tz}
+        end_field = {"dateTime": _hour_float_to_datetime(log_date, bucket[1]), "timeZone": tz}
+    else:
+        end = log_date + timedelta(days=1)
+        start_field = {"date": log_date.isoformat()}
+        end_field = {"date": end.isoformat()}
+
     return {
         "id": event_id,
         "summary": summary,
         "description": full_desc,
-        "start": {"date": log_date.isoformat()},
-        "end": {"date": end.isoformat()},
+        "start": start_field,
+        "end": end_field,
         "colorId": _COMPLETED_COLOR_ID,
         "extendedProperties": {
             "private": {
@@ -447,26 +562,168 @@ def _build_completed_payload(
 def mark_complete(state, log_date) -> dict:
     """Reflect the day's logged sessions onto the calendar.
 
-    Idempotent. Called from the log-write paths (Strava webhook +
-    log_session tool) after each session is appended to log.jsonl.
+    Idempotent. Called from the log-write paths (Strava webhook + log_session
+    tool) after each session is appended. Source-of-truth-aware: instead of
+    re-classifying entries by type, it reads the ``sessions`` rows directly
+    and trusts the slot/status the reconcile layer already wrote.
 
-    - Entries whose type satisfies the day's prescription patch the prescribed
-      event (`pretrain<YYYYMMDD>`) with a ✅ summary, graphite color, and an
-      aggregated actuals block.
-    - Entries that don't satisfy the prescription (or any entries when no plan
-      row exists for the date) are aggregated into a separate
-      `precomplete<YYYYMMDD>` event so the prescribed row's completion state
-      is never falsified.
+    For each row on the date:
+      - status=completed + has a prescription → patch the prescribed event
+        for ``(date, slot)`` with ✅ summary, graphite color, actuals block.
+      - status=off-plan → emit a per-row precomplete event, disambiguated by
+        slot (if set) and the activity's strava_id / row id (so multiple
+        off-plan rows on one day don't collide).
 
-    Returns a small dict summarizing what was updated. Errors are captured
-    inline rather than raised — callers run this best-effort from background
-    threads where a gcal hiccup shouldn't break the log-write path.
+    Falls back to the legacy aggregated path when the StateManager doesn't
+    expose ``get_session_rows_on_date`` (older test stubs).
     """
     if isinstance(log_date, str):
         log_date = date.fromisoformat(log_date)
 
-    entries = state.sessions_on_date(log_date)
     result: dict = {"ok": True, "log_date": log_date.isoformat()}
+
+    # Legacy callers (test stubs) without the slot-aware method: fall back
+    # so the existing single-session test fleet keeps working unchanged.
+    if not hasattr(state, "get_session_rows_on_date"):
+        return _mark_complete_legacy(state, log_date, result)
+
+    rows = state.get_session_rows_on_date(log_date)
+    if not rows:
+        result["noop"] = True
+        result["reason"] = "no session rows for date"
+        return result
+
+    prescription_rows = [r for r in rows if r.get("prescribed_workout")]
+    total_slots = sum(1 for r in prescription_rows if r.get("slot"))
+    # On a single-session day every prescription row has slot=NULL → total_slots
+    # stays 0 and the bucket helpers produce all-day events (legacy shape).
+
+    completed_rows = [r for r in rows if r["status"] == "completed" and r.get("prescribed_workout")]
+    off_plan_rows = [r for r in rows if r["status"] == "off-plan"]
+    # A completed row without a prescription (impossible in normal flow but
+    # defensive): treat it as off-plan visually.
+    for r in rows:
+        if r["status"] == "completed" and not r.get("prescribed_workout"):
+            off_plan_rows.append(r)
+
+    logger.info(
+        "mark_complete %s: %d prescribed-complete, %d off-plan (total_slots=%d)",
+        log_date.isoformat(),
+        len(completed_rows),
+        len(off_plan_rows),
+        total_slots,
+    )
+
+    from . import client
+
+    result["prescribed"] = []
+    result["off_plan"] = []
+    expected_offplan_ids: set[str] = set()
+
+    with _SYNC_STATE_LOCK:
+        sync_state = _load_sync_state(state)
+
+        for row in completed_rows:
+            slot = row.get("slot")
+            event_id = _event_id(log_date.isoformat(), slot)
+            data = _row_data(row)
+            entries = [data] if data else []
+            payload = _build_completed_payload(
+                event_id,
+                _plan_dict(row),
+                row.get("detail_md"),
+                entries,
+                log_date,
+                slot=slot,
+                total_slots=total_slots,
+            )
+            outcome = _apply_completed_event(client, event_id, payload)
+            outcome["slot"] = slot
+            result["prescribed"].append(outcome)
+            if outcome.get("action") in {"inserted", "patched"}:
+                sync_state[event_id] = {
+                    **(sync_state.get(event_id) or {}),
+                    "completed": True,
+                    "last_completed_at": _now_iso(),
+                }
+
+        for row in off_plan_rows:
+            slot = row.get("slot")
+            data = _row_data(row)
+            strava_id = (data.get("details") or {}).get("strava_id") if data else None
+            disambiguator = str(strava_id) if strava_id else f"r{row['id']}"
+            event_id = _completion_event_id(log_date.isoformat(), slot=slot, disambiguator=disambiguator)
+            expected_offplan_ids.add(event_id)
+            entries = [data] if data else []
+            payload = _build_completed_payload(
+                event_id,
+                None,
+                None,
+                entries,
+                log_date,
+                slot=slot,
+                total_slots=total_slots,
+            )
+            outcome = _apply_completed_event(client, event_id, payload)
+            outcome["slot"] = slot
+            outcome["strava_id"] = strava_id
+            result["off_plan"].append(outcome)
+            if outcome.get("action") in {"inserted", "patched"}:
+                sync_state[event_id] = {
+                    **(sync_state.get(event_id) or {}),
+                    "completed": True,
+                    "off_plan": True,
+                    "last_completed_at": _now_iso(),
+                }
+
+        # Clean up stale off-plan events on this date that we no longer
+        # expect. A Strava activity that initially classified as off-plan
+        # and was later retagged to match a prescription leaves an orphan
+        # precomplete event behind — delete it now.
+        stale_offplan = [
+            eid
+            for eid, entry in list(sync_state.items())
+            if isinstance(entry, dict)
+            and entry.get("off_plan")
+            and eid.startswith("precomplete" + log_date.isoformat().replace("-", ""))
+            and eid not in expected_offplan_ids
+        ]
+        for eid in stale_offplan:
+            try:
+                client.delete_event(eid)
+                sync_state.pop(eid, None)
+                logger.info("Deleted stale off-plan event %s", eid)
+            except Exception as e:
+                logger.warning("Failed to delete stale off-plan event %s: %s", eid, e)
+
+        try:
+            _write_sync_state(state, sync_state)
+        except Exception as e:
+            result["sync_state_error"] = f"{type(e).__name__}: {e}"
+
+    return result
+
+
+def _row_data(row: dict) -> dict:
+    """Parse a sessions row's ``data`` JSON to dict; empty dict on miss / fail."""
+    raw = row.get("data")
+    if not raw:
+        return {}
+    if isinstance(raw, dict):
+        return raw
+    try:
+        return json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        return {}
+
+
+def _mark_complete_legacy(state, log_date: date, result: dict) -> dict:
+    """Pre-slot mark_complete path retained for test stubs that don't expose
+    ``get_session_rows_on_date``. Same behavior as before the slot refactor:
+    aggregate per-date matching vs off-plan via type heuristics, emit one
+    prescribed event + one precomplete event per date.
+    """
+    entries = state.sessions_on_date(log_date)
     if not entries:
         result["noop"] = True
         result["reason"] = "no log entries for date"
@@ -488,7 +745,7 @@ def mark_complete(state, log_date) -> dict:
             off_plan.append(e)
 
     logger.info(
-        "mark_complete %s: %d matching, %d off_plan (prescription_kind=%s)",
+        "mark_complete %s [legacy]: %d matching, %d off_plan (prescription_kind=%s)",
         log_date.isoformat(),
         len(matching),
         len(off_plan),
@@ -500,9 +757,6 @@ def mark_complete(state, log_date) -> dict:
     prescribed_id = _event_id(log_date.isoformat())
     offplan_id = _completion_event_id(log_date.isoformat())
 
-    # Hold the lock across load → mutate → save so a concurrent
-    # ``sync_plan`` (or another ``mark_complete``) can't read between
-    # our load and save and stomp our completion bits.
     with _SYNC_STATE_LOCK:
         sync_state = _load_sync_state(state)
 
@@ -510,10 +764,6 @@ def mark_complete(state, log_date) -> dict:
             payload = _build_completed_payload(prescribed_id, plan_row, plan_detail, matching, log_date)
             outcome = _apply_completed_event(client, prescribed_id, payload)
             result["prescribed"] = outcome
-            # Only stamp the completion sentinel when gcal actually accepted
-            # the write — see #31. Setting completed=True on an error poisoned
-            # sync state and made reconcile permanently skip the date even
-            # after the underlying gcal issue (e.g. expired token) was fixed.
             if outcome.get("action") in {"inserted", "patched"}:
                 sync_state[prescribed_id] = {
                     **(sync_state.get(prescribed_id) or {}),
@@ -532,22 +782,14 @@ def mark_complete(state, log_date) -> dict:
                     "off_plan": True,
                     "last_completed_at": _now_iso(),
                 }
-        else:
-            # No off-plan entries this call. If a precomplete event lingers from a
-            # previous call that mis-classified the same activity (Strava commonly
-            # fires create with a generic sport then update with the proper type
-            # — the first call partitions to off_plan, the second flips matching),
-            # clean it up so the user doesn't end up with a duplicate ✅ event on
-            # the same day.
-            if offplan_id in sync_state:
-                try:
-                    client.delete_event(offplan_id)
-                    sync_state.pop(offplan_id, None)
-                    result["off_plan_cleanup"] = "deleted"
-                    logger.info("Deleted stale off-plan event %s", offplan_id)
-                except Exception as e:
-                    result["off_plan_cleanup_error"] = f"{type(e).__name__}: {e}"
-                    logger.warning("Failed to delete stale off-plan event %s: %s", offplan_id, e)
+        elif offplan_id in sync_state:
+            try:
+                client.delete_event(offplan_id)
+                sync_state.pop(offplan_id, None)
+                result["off_plan_cleanup"] = "deleted"
+                logger.info("Deleted stale off-plan event %s", offplan_id)
+            except Exception as e:
+                result["off_plan_cleanup_error"] = f"{type(e).__name__}: {e}"
 
         try:
             _write_sync_state(state, sync_state)
@@ -662,6 +904,9 @@ def reconcile_completion(state, days_back: int = 14) -> dict:
     already_complete: list[str] = []
     errors: list[dict] = []
 
+    # Dedupe by date+slot since each slot's completion is tracked separately,
+    # but only fire mark_complete once per date (it iterates all slots).
+    dates_seen: set[str] = set()
     for row in rows:
         try:
             d = date.fromisoformat(row["date"])
@@ -669,11 +914,20 @@ def reconcile_completion(state, days_back: int = 14) -> dict:
             continue
         if not (cutoff <= d <= today):
             continue
+        if row["date"] in dates_seen:
+            continue
+        dates_seen.add(row["date"])
         if not state.sessions_on_date(d):
             skipped.append(row["date"])
             continue
-        prescribed_id = _event_id(row["date"])
-        if sync_state.get(prescribed_id, {}).get("completed"):
+        # Date is "already complete" only if every prescription slot on the
+        # date already has a completed sync state entry. Single-session days
+        # check the legacy id; multi-session check each slot.
+        same_date_rows = [r for r in rows if r["date"] == row["date"]]
+        all_marked = bool(same_date_rows) and all(
+            sync_state.get(_event_id(r["date"], r.get("slot")), {}).get("completed") for r in same_date_rows
+        )
+        if all_marked:
             already_complete.append(row["date"])
             continue
         try:
@@ -681,7 +935,6 @@ def reconcile_completion(state, days_back: int = 14) -> dict:
             corrected.append(
                 {
                     "date": row["date"],
-                    "kind": outcome.get("prescription_kind"),
                     "prescribed": bool(outcome.get("prescribed")),
                     "off_plan": bool(outcome.get("off_plan")),
                 }
@@ -728,10 +981,14 @@ def _find_orphan_completions(state, cutoff: date, today: date) -> list[dict]:
 
 
 def _date_from_event_id(event_id: str) -> Optional[date]:
-    """Parse YYYYMMDD suffix from pretrain/precomplete event IDs."""
+    """Parse YYYYMMDD prefix from pretrain/precomplete event IDs.
+
+    Tolerates the slot suffix (``s1``, ``s2``, ...) and the off-plan
+    disambiguator (``x12345``) by reading just the leading 8 digits.
+    """
     for prefix in ("pretrain", "precomplete"):
         if event_id.startswith(prefix):
-            digits = event_id[len(prefix) :]
+            digits = event_id[len(prefix) : len(prefix) + 8]
             if len(digits) == 8 and digits.isdigit():
                 try:
                     return date(int(digits[:4]), int(digits[4:6]), int(digits[6:8]))

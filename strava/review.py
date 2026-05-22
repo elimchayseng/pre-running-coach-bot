@@ -90,10 +90,27 @@ def _build_messages(entry: dict, state: StateManager) -> list[dict]:
     """Build the [system, user] message list for the review call."""
     activity_date_str = entry.get("date")
     target_date = _safe_parse_date(activity_date_str) or today_local()
-    planned = state.get_todays_workout(target_date)
+    # On multi-session days, surface every planned slot so the LLM sees the
+    # full day's design — and flag which slot this activity closed via its
+    # strava_id, so the review compares against the right prescription.
+    planned_sessions = state.get_todays_workouts(target_date)
+    sid = (entry.get("details") or {}).get("strava_id")
+    matched_slot: Optional[str] = None
+    if sid is not None:
+        all_rows = state.get_session_rows_on_date(target_date) if hasattr(state, "get_session_rows_on_date") else []
+        for r in all_rows:
+            row_sid = None
+            raw = r.get("data")
+            if raw:
+                try:
+                    row_sid = (json.loads(raw) if isinstance(raw, str) else raw).get("details", {}).get("strava_id")
+                except (TypeError, json.JSONDecodeError):
+                    row_sid = None
+            if row_sid == sid:
+                matched_slot = r.get("slot")
+                break
     recent = state.get_recent_sessions(days=14, today=target_date)
     # Drop the just-logged entry from "recent" so the model isn't confused.
-    sid = (entry.get("details") or {}).get("strava_id")
     if sid is not None:
         recent = [r for r in recent if (r.get("details") or {}).get("strava_id") != sid]
     athlete = state.load_athlete()
@@ -133,7 +150,12 @@ def _build_messages(entry: dict, state: StateManager) -> list[dict]:
         {
             "today": today_local().isoformat(),
             "activity": _trim_entry(entry),
-            "planned_for_activity_date": planned,
+            "planned_for_activity_date": {
+                "total_slots": len(planned_sessions),
+                "sessions": planned_sessions,
+                # Which slot the activity actually closed (None for single-session days).
+                "matched_slot": matched_slot,
+            },
             "recent_sessions_last_14_days": recent,
             "athlete": athlete,
             "current_plan_md": plan_md,
