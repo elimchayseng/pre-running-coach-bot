@@ -122,7 +122,8 @@ SESSIONS_VIEWS: list[ViewSpec] = [
         name="This week",
         view_type="table",
         filter_=_date_this_week("Date"),
-        sorts=[_sort("Date", "ascending")],
+        # Secondary sort on Slot keeps AM above PM on two-a-day rows.
+        sorts=[_sort("Date", "ascending"), _sort("Slot", "ascending")],
         speculative=True,
         notes="Relative-date smart-filter operator 'this_week' assumed identical to /v1/data_sources query filters.",
     ),
@@ -137,7 +138,7 @@ SESSIONS_VIEWS: list[ViewSpec] = [
         name="Recent completed",
         view_type="table",
         filter_=_select_equals("Status", "completed"),
-        sorts=[_sort("Date", "descending")],
+        sorts=[_sort("Date", "descending"), _sort("Slot", "ascending")],
     ),
 ]
 
