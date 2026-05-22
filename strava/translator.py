@@ -246,11 +246,16 @@ def activity_to_log_entry(activity: dict, hr_zones: Optional[dict] = None) -> di
     # start_date_local is "2026-05-12T06:32:00Z"-style. Slice for date.
     start = activity.get("start_date_local") or activity.get("start_date") or ""
     date_str = start[:10] if start else ""
+    # The full local timestamp drives slot routing on multi-session days
+    # (state_manager._pick_planned_match reads the hour from this field).
+    start_local = start if len(start) > 10 else ""
 
     entry: dict = {
         "date": date_str,
         "type": entry_type,
     }
+    if start_local:
+        entry["start_local"] = start_local
     if miles is not None:
         entry["miles"] = miles
     if pace is not None:
