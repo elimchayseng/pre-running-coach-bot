@@ -319,7 +319,10 @@ SCHEMAS = [
             "description": (
                 "Get all logged sessions in a date range. Use for trend "
                 "questions ('how does my mileage compare to last month') or to "
-                "verify what was actually run before adjusting the plan."
+                "verify what was actually run before adjusting the plan. "
+                "When a row carries a ``reflection`` field, it's the athlete's "
+                "own post-run note (typed into Notion) — treat it as primary "
+                "context, not metadata."
             ),
             "parameters": {
                 "type": "object",

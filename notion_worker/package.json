@@ -1,0 +1,20 @@
+{
+  "name": "pre-reflection-sync",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Notion Worker that bridges Reflection-property edits on the PRE Sessions database back into the PRE coach's SQLite store via the Railway PUT /sessions/<id>/reflection endpoint.",
+  "main": "src/worker.ts",
+  "scripts": {
+    "build": "tsc --noEmit",
+    "deploy": "ntn workers deploy",
+    "secrets:set": "echo 'Run: ntn workers secrets set NOTION_TOKEN <value>; ntn workers secrets set RAILWAY_BASE_URL <value>; ntn workers secrets set WORKER_BRIDGE_SECRET <value>'",
+    "webhooks:list": "ntn workers webhooks list"
+  },
+  "dependencies": {
+    "@notionhq/workers": "^0.1.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0",
+    "@types/node": "^20.0.0"
+  }
+}

@@ -100,6 +100,23 @@ class TestSessionProperties:
         assert props["Strava URL"] == {"url": None}
         assert props["Strava ID"] == {"number": None}
 
+    def test_omits_reflection_property(self):
+        """Contract: Reflection is athlete-owned and the mirror NEVER patches it.
+
+        Notion PATCH semantics only update properties named in the payload —
+        omission preserves whatever the athlete typed in Notion. The Worker
+        bridge (`notion_worker/src/worker.ts`) is the single writer for this
+        field. Regressing this contract would cause every Strava upload to
+        silently overwrite the athlete's notes; this test is the trip-wire.
+        """
+        data = json.dumps({"miles": 6.0, "notes": "coach-side note from data.notes"})
+        row = _row(status="completed", data=data)
+        # Even when a hypothetical row carries a stray reflection field, the
+        # mirror's property builder still omits it.
+        row["reflection"] = "athlete typed this in Notion"
+        props = mirror._session_properties(row, "sid:5")
+        assert "Reflection" not in props
+
 
 class TestSessionTitle:
     """Title regimes by status (issue #45): planned uses the prescribed text

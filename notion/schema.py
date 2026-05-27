@@ -81,6 +81,11 @@ SESSIONS_PROPERTIES: dict = {
     "Strava ID": {"number": {"format": "number"}},
     "Strava URL": {"url": {}},
     "Coach notes": {"rich_text": {}},
+    # Athlete-owned. The Notion Worker watches edits on this property and
+    # syncs the text back to SQLite via the Railway bridge endpoint. The
+    # Python mirror NEVER writes this property — see
+    # ``notion/mirror._session_properties`` for the omission contract.
+    "Reflection": {"rich_text": {}},
     SOURCE_KEY: {"rich_text": {}},
 }
 

@@ -212,7 +212,17 @@ def _slot_label_from_row(row: dict) -> str:
 
 
 def _session_properties(row: dict, source_key: str) -> dict:
-    """Map a SQLite sessions row to PRE Sessions Notion properties."""
+    """Map a SQLite sessions row to PRE Sessions Notion properties.
+
+    Contract — ``Reflection`` is athlete-owned and intentionally absent from
+    this dict. Notion's PATCH semantics only touch properties named in the
+    payload (omission = preservation), so a mirror upsert never clobbers a
+    Reflection value typed in Notion. The Worker
+    (``notion_worker/src/worker.ts``) is the single writer that observes
+    Reflection edits and flows them back to SQLite via the Railway bridge.
+    Adding Reflection here would create an echo loop and silently overwrite
+    athlete-typed text — don't do it.
+    """
     data = _session_data(row)
     details = data.get("details") or {}
     sid = details.get("strava_id")
