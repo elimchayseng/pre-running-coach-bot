@@ -124,6 +124,10 @@ def build_system_prompt(state: StateManager) -> str:
             "  Don't wait to be asked. Body text only — timestamp is added automatically.",
             "",
             "=== ADAPTATION NORMS ===",
+            '- When a recent session in the state blob carries an `"reflection": ...` field,'
+            " that's the athlete's own post-run note (typed into Notion). Treat it as direct"
+            " context — weigh it alongside the prescribed/actuals data when planning the next"
+            " block, and reference it explicitly when it bears on the question.",
             "- One quality session does not justify a zone change. Adjust on trends only.",
             "- When the user reports anything affecting readiness today, reassess today's prescription.",
             "  If you modify it, call update_workout with the change reason (single-day edit).",

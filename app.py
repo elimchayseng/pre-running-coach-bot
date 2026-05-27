@@ -152,6 +152,54 @@ def strava_webhook_event():
     return jsonify({"status": "ok"}), 200
 
 
+@app.route("/sessions/<int:session_id>/reflection", methods=["PUT"])
+def put_session_reflection(session_id: int):
+    """Bridge endpoint: the Notion Worker calls this when the athlete edits a
+    Reflection property on a PRE Sessions page in Notion.
+
+    Auth: ``Authorization: Bearer <WORKER_BRIDGE_SECRET>``. The same secret is
+    configured on the Worker via ``ntn workers secrets set
+    WORKER_BRIDGE_SECRET``. Without ``WORKER_BRIDGE_SECRET`` set on Railway,
+    the endpoint refuses every request — no unauthenticated fallback.
+
+    Body: ``{"reflection": "text"}`` or ``{"reflection": null}``. Empty /
+    whitespace-only strings normalize to NULL (clears the cell). Returns 200
+    with the new state, 404 when no session matches the id, 400 on malformed
+    body, 401/403 on bad auth.
+
+    Architecture: ``docs/notion-workers-architecture.md``.
+    """
+    expected = os.getenv("WORKER_BRIDGE_SECRET")
+    if not expected:
+        logger.warning("Reflection bridge called but WORKER_BRIDGE_SECRET is unset")
+        return jsonify({"status": "forbidden"}), 403
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer ") or auth[len("Bearer ") :] != expected:
+        logger.warning("Reflection bridge rejected: invalid bearer token")
+        return jsonify({"status": "forbidden"}), 403
+
+    payload = request.get_json(force=True, silent=True)
+    if not isinstance(payload, dict) or "reflection" not in payload:
+        return jsonify({"status": "bad_request", "error": "missing 'reflection' field"}), 400
+    raw = payload["reflection"]
+    if raw is not None and not isinstance(raw, str):
+        return jsonify({"status": "bad_request", "error": "'reflection' must be string or null"}), 400
+
+    from state_manager import StateManager
+
+    state = StateManager()
+    updated = state.set_session_reflection(session_id, raw)
+    logger.info(
+        "reflection bridge: session_id=%s len=%s updated=%s",
+        session_id,
+        len(raw) if isinstance(raw, str) else 0,
+        updated,
+    )
+    if not updated:
+        return jsonify({"status": "not_found", "session_id": session_id}), 404
+    return jsonify({"status": "ok", "session_id": session_id, "reflection": (raw or None)}), 200
+
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
     """Handle incoming Telegram webhook updates.

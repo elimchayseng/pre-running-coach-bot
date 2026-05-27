@@ -46,11 +46,13 @@ _yaml.indent(mapping=2, sequence=4, offset=2)
 SCHEMA_PATH = Path(__file__).resolve().parent / "state" / "schema.sql"
 
 # Current schema version. v4 was the Phase 1A cutover (unified `sessions`
-# table, `plan_meta`); v5 adds the `reviews` table for Phase 1B.4.
-# scripts/cutover_to_unified_sessions.py handles v3→v4; v4→v5 is purely
-# additive (CREATE TABLE IF NOT EXISTS) and lands the next time _ensure_schema
-# re-runs schema.sql against a unified DB.
-CURRENT_SCHEMA_VERSION = 5
+# table, `plan_meta`); v5 adds the `reviews` table for Phase 1B.4; v6 adds
+# the `sessions.reflection` column for the Notion-Workers bidirectional
+# sync (athlete-owned post-run notes; see docs/notion-workers-architecture.md).
+# scripts/cutover_to_unified_sessions.py handles v3→v4; v4→v5 / v5→v6 are
+# additive and land the next time _ensure_schema runs (v6 uses an
+# ALTER TABLE … ADD COLUMN guarded by a PRAGMA table_info check).
+CURRENT_SCHEMA_VERSION = 6
 
 _JOURNAL_HEADER = "# Journal\n\nAppend-only freeform notes. Newest entries at the bottom.\n"
 
@@ -214,6 +216,14 @@ class StateManager:
             # table. schema.sql's unified-shape DDL (the date+status index)
             # would fail, so we don't apply it. scripts/cutover_to_unified_
             # sessions.py owns that migration.
+            if unified:
+                # v5 → v6: additive ALTER TABLE for the athlete-owned reflection
+                # column. SQLite's CREATE TABLE IF NOT EXISTS in schema.sql is a
+                # no-op when the table already exists, so a column added after
+                # the table was first created has to come in via ALTER TABLE.
+                cols = {r[1] for r in conn.execute("PRAGMA table_info(sessions)")}
+                if "reflection" not in cols:
+                    conn.execute("ALTER TABLE sessions ADD COLUMN reflection TEXT DEFAULT NULL")
             conn.execute(
                 "INSERT OR IGNORE INTO schema_version (version) VALUES (?)",
                 (CURRENT_SCHEMA_VERSION if unified else 3,),
@@ -608,18 +618,28 @@ class StateManager:
         return self._rows("date = ?", (target.isoformat(),))
 
     def _session_data(self, where: str, params: tuple) -> list[dict]:
-        """Return the ``data`` JSON of logged (completed/off-plan) sessions."""
+        """Return the ``data`` JSON of logged (completed/off-plan) sessions.
+
+        When the row carries an athlete-owned ``reflection`` (post-run note
+        synced back from Notion via the Worker bridge), it's injected into
+        the returned dict under the ``reflection`` key so the coach prompt
+        and the ``get_sessions`` tool see it alongside the actuals without
+        a second query.
+        """
         with self._conn() as conn:
             rows = conn.execute(
-                f"SELECT data FROM sessions WHERE {where} AND data IS NOT NULL ORDER BY date, slot, id",
+                f"SELECT data, reflection FROM sessions WHERE {where} AND data IS NOT NULL ORDER BY date, slot, id",
                 params,
             ).fetchall()
         out: list[dict] = []
         for r in rows:
             try:
-                out.append(json.loads(r["data"]))
+                entry = json.loads(r["data"])
             except (json.JSONDecodeError, TypeError):
                 continue
+            if r["reflection"]:
+                entry["reflection"] = r["reflection"]
+            out.append(entry)
         return out
 
     def existing_strava_ids(self) -> set[int]:
@@ -694,6 +714,27 @@ class StateManager:
         self._notify_mirror(self._rows("id = ?", (result["row_id"],)))
         self._notify_mirror_change(change_entry)  # None when the activity went off-plan
         return result
+
+    def set_session_reflection(self, session_id: int, text: Optional[str]) -> bool:
+        """Write the athlete-owned reflection text for one session row.
+
+        Returns True when a row was updated. Called by the Railway bridge
+        endpoint (``PUT /sessions/<id>/reflection``) on behalf of the Notion
+        Worker. ``text`` of None / "" clears the column. The Notion mirror
+        never writes the Reflection property back — see
+        ``notion/mirror._session_properties`` for the contract — so a
+        ``_notify_mirror`` here cannot cause an echo loop.
+        """
+        normalized: Optional[str] = (text or "").strip() or None
+        with self._conn() as conn:
+            cur = conn.execute(
+                "UPDATE sessions SET reflection = ?, updated_at = datetime('now') WHERE id = ?",
+                (normalized, session_id),
+            )
+            updated = cur.rowcount > 0
+        if updated:
+            self._notify_mirror(self._rows("id = ?", (session_id,)))
+        return updated
 
     def update_session_by_strava_id(self, activity_id: int, new_entry: dict) -> bool:
         """Replace the actuals of the row carrying ``details.strava_id``.

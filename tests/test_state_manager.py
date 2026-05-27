@@ -1102,3 +1102,84 @@ class TestWriterChangeBody:
         assert "## Prescribed" in body and "## Actuals" in body
         assert "Easy 4mi" in body  # prescribed
         assert "miles: 4.1" in body and "strava_id: 99" in body  # actuals
+
+
+def _insert_completed_session(state: StateManager, sdate: str, miles: float = 5) -> int:
+    """Insert a completed session row and return its id."""
+    payload = json.dumps({"date": sdate, "type": "easy", "miles": miles, "notes": ""})
+    with state._conn() as c:
+        cur = c.execute(
+            "INSERT INTO sessions (date, slot, status, type, data, completed_at) "
+            "VALUES (?, NULL, 'completed', 'easy', ?, datetime('now'))",
+            (sdate, payload),
+        )
+        return cur.lastrowid
+
+
+class TestSetSessionReflection:
+    """Athlete-owned reflection column, written by the Worker bridge endpoint."""
+
+    def test_writes_text_to_column(self, state):
+        sid = _insert_completed_session(state, "2026-05-20")
+        ok = state.set_session_reflection(sid, "ran out of water at mile 8")
+        assert ok is True
+        with state._conn() as c:
+            row = c.execute("SELECT reflection FROM sessions WHERE id = ?", (sid,)).fetchone()
+        assert row["reflection"] == "ran out of water at mile 8"
+
+    def test_null_clears_column(self, state):
+        sid = _insert_completed_session(state, "2026-05-20")
+        state.set_session_reflection(sid, "first try")
+        assert state.set_session_reflection(sid, None) is True
+        with state._conn() as c:
+            row = c.execute("SELECT reflection FROM sessions WHERE id = ?", (sid,)).fetchone()
+        assert row["reflection"] is None
+
+    def test_empty_string_normalizes_to_null(self, state):
+        sid = _insert_completed_session(state, "2026-05-20")
+        state.set_session_reflection(sid, "draft")
+        assert state.set_session_reflection(sid, "   ") is True
+        with state._conn() as c:
+            row = c.execute("SELECT reflection FROM sessions WHERE id = ?", (sid,)).fetchone()
+        assert row["reflection"] is None
+
+    def test_unknown_id_returns_false(self, state):
+        assert state.set_session_reflection(999_999, "no such row") is False
+
+    def test_reflection_surfaces_in_get_recent_sessions(self, state):
+        sid = _insert_completed_session(state, date.today().isoformat())
+        state.set_session_reflection(sid, "felt strong on the hills")
+        recent = state.get_recent_sessions(days=7, today=date.today())
+        assert any(e.get("reflection") == "felt strong on the hills" for e in recent)
+
+    def test_reflection_absent_when_null(self, state):
+        _insert_completed_session(state, date.today().isoformat())
+        recent = state.get_recent_sessions(days=7, today=date.today())
+        # No reflection key when column is NULL — keeps the prompt blob lean.
+        assert all("reflection" not in e for e in recent)
+
+
+class TestSchemaV6Migration:
+    """v5 → v6 additive ALTER TABLE for the reflection column."""
+
+    def test_reflection_column_present_on_fresh_db(self, state):
+        # A first connect through StateManager runs _ensure_schema, which on a
+        # fresh DB applies schema.sql (already declares the column).
+        state.load_journal()  # force a connection
+        with state._conn() as c:
+            cols = {r[1] for r in c.execute("PRAGMA table_info(sessions)")}
+        assert "reflection" in cols
+
+    def test_alter_table_adds_column_to_existing_db(self, state):
+        # Simulate a v5 DB by dropping the column post-create.
+        state.load_journal()  # ensure schema exists
+        with state._conn() as c:
+            # SQLite supports DROP COLUMN since 3.35; the test DB definitely has it.
+            c.execute("ALTER TABLE sessions DROP COLUMN reflection")
+            cols = {r[1] for r in c.execute("PRAGMA table_info(sessions)")}
+            assert "reflection" not in cols
+        # Reset the cached flag so _ensure_schema re-runs the migration.
+        state._schema_applied = False
+        with state._conn() as c:
+            cols = {r[1] for r in c.execute("PRAGMA table_info(sessions)")}
+        assert "reflection" in cols

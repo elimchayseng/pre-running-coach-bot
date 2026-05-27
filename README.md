@@ -186,6 +186,7 @@ Singleton blobs (plan, athlete, journal) are upserted on every run so re-running
 | `NOTION_PARENT_PAGE_ID` | Page id (32-char hex) of the parent page that holds the four mirror databases. Connect your integration to it. |
 | `NOTION_API_VERSION` | Pinned to `2026-03-11` by default. |
 | `NOTION_SESSIONS_DS_ID` / `NOTION_JOURNAL_DS_ID` / `NOTION_PLAN_CHANGES_DS_ID` / `NOTION_REVIEWS_DS_ID` | Data-source ids printed by `scripts/notion_bootstrap.py`. Each gates its DB independently — a partially-configured workspace mirrors just what's wired. |
+| `WORKER_BRIDGE_SECRET` | Shared secret for the Notion-Workers reflection bridge (`PUT /sessions/<id>/reflection`). Same value lives in Railway env **and** in the Worker's `ntn workers secrets`. Unset → bridge endpoint refuses every request. See [docs/notion-workers-architecture.md](docs/notion-workers-architecture.md). |
 
 ## Usage
 
@@ -329,6 +330,14 @@ sqlite3 state/coach.db "SELECT content FROM plan_changelog WHERE id=1" | tail -3
 ```
 
 **Reversing it.** The mirror is one-way. Editing or trashing a Notion page changes nothing in SQLite. `scripts/notion_seed.py` reconstructs the Notion side from SQLite at any time.
+
+### Bidirectional sync (Reflections) — Notion Workers
+
+One Sessions property — `Reflection` — flows the other way too. The athlete types a post-run note on any PRE Sessions row in Notion (e.g. *"ran out of water at mile 8"*) and a Notion Worker pushes the text back into the `sessions.reflection` SQLite column within a few seconds. The coach reads it on the next chat turn alongside the actuals.
+
+This is PRE's use of Notion's 3.5 Developer Platform (Workers + Webhook Triggers). The Worker (one TypeScript file in [`notion_worker/`](notion_worker/)) is hosted by Notion; it calls a Bearer-authenticated bridge endpoint on Railway (`PUT /sessions/<id>/reflection`, gated by `WORKER_BRIDGE_SECRET`). The Python mirror omits `Reflection` from every page-update payload, so there is no echo loop.
+
+Architecture overview + interview talking points: [`docs/notion-workers-architecture.md`](docs/notion-workers-architecture.md). Deploy runbook: [`notion_worker/README.md`](notion_worker/README.md).
 
 ## Coach personality
 

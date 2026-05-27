@@ -193,3 +193,98 @@ class TestStravaWebhook:
         assert resp.status_code == 200
         # Empty payload still dispatches; handler.handle_event filters internally
         mock_thread.assert_called_once()
+
+
+class TestReflectionBridge:
+    """PUT /sessions/<id>/reflection — Worker → SQLite bridge."""
+
+    SECRET = "test-bridge-secret"
+
+    def _set_secret(self, monkeypatch):
+        monkeypatch.setenv("WORKER_BRIDGE_SECRET", self.SECRET)
+
+    def test_missing_secret_env_returns_403(self, client, monkeypatch):
+        monkeypatch.delenv("WORKER_BRIDGE_SECRET", raising=False)
+        resp = client.put(
+            "/sessions/1/reflection",
+            json={"reflection": "x"},
+            headers={"Authorization": f"Bearer {self.SECRET}"},
+        )
+        assert resp.status_code == 403
+
+    def test_missing_bearer_returns_403(self, client, monkeypatch):
+        self._set_secret(monkeypatch)
+        resp = client.put("/sessions/1/reflection", json={"reflection": "x"})
+        assert resp.status_code == 403
+
+    def test_wrong_bearer_returns_403(self, client, monkeypatch):
+        self._set_secret(monkeypatch)
+        resp = client.put(
+            "/sessions/1/reflection",
+            json={"reflection": "x"},
+            headers={"Authorization": "Bearer nope"},
+        )
+        assert resp.status_code == 403
+
+    def test_malformed_body_returns_400(self, client, monkeypatch):
+        self._set_secret(monkeypatch)
+        resp = client.put(
+            "/sessions/1/reflection",
+            json={"not_the_key": "x"},
+            headers={"Authorization": f"Bearer {self.SECRET}"},
+        )
+        assert resp.status_code == 400
+
+    def test_non_string_reflection_returns_400(self, client, monkeypatch):
+        self._set_secret(monkeypatch)
+        resp = client.put(
+            "/sessions/1/reflection",
+            json={"reflection": 42},
+            headers={"Authorization": f"Bearer {self.SECRET}"},
+        )
+        assert resp.status_code == 400
+
+    @patch("state_manager.StateManager")
+    def test_unknown_id_returns_404(self, mock_sm, client, monkeypatch):
+        self._set_secret(monkeypatch)
+        instance = MagicMock()
+        instance.set_session_reflection.return_value = False
+        mock_sm.return_value = instance
+        resp = client.put(
+            "/sessions/999/reflection",
+            json={"reflection": "x"},
+            headers={"Authorization": f"Bearer {self.SECRET}"},
+        )
+        assert resp.status_code == 404
+        instance.set_session_reflection.assert_called_once_with(999, "x")
+
+    @patch("state_manager.StateManager")
+    def test_happy_path_returns_200(self, mock_sm, client, monkeypatch):
+        self._set_secret(monkeypatch)
+        instance = MagicMock()
+        instance.set_session_reflection.return_value = True
+        mock_sm.return_value = instance
+        resp = client.put(
+            "/sessions/42/reflection",
+            json={"reflection": "ran out of water at mile 8"},
+            headers={"Authorization": f"Bearer {self.SECRET}"},
+        )
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["session_id"] == 42
+        assert data["reflection"] == "ran out of water at mile 8"
+        instance.set_session_reflection.assert_called_once_with(42, "ran out of water at mile 8")
+
+    @patch("state_manager.StateManager")
+    def test_null_reflection_clears(self, mock_sm, client, monkeypatch):
+        self._set_secret(monkeypatch)
+        instance = MagicMock()
+        instance.set_session_reflection.return_value = True
+        mock_sm.return_value = instance
+        resp = client.put(
+            "/sessions/42/reflection",
+            json={"reflection": None},
+            headers={"Authorization": f"Bearer {self.SECRET}"},
+        )
+        assert resp.status_code == 200
+        instance.set_session_reflection.assert_called_once_with(42, None)

@@ -43,6 +43,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     prescribed_notes   TEXT,
     detail_md          TEXT,
     data               TEXT,
+    reflection         TEXT    DEFAULT NULL,
     created_at         TEXT    NOT NULL DEFAULT (datetime('now')),
     updated_at         TEXT    NOT NULL DEFAULT (datetime('now')),
     completed_at       TEXT,
