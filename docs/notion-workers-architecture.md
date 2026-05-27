@@ -1,14 +1,5 @@
 # Notion Workers in PRE — Architecture Overview
 
-> **Audience.** Engineering interview / code-review reader who wants to see
-> how PRE uses Notion's 3.5 Developer Platform (May 2026) to add a
-> bidirectional surface without owning new infrastructure.
-> **One-line pitch.** PRE shipped a one-field bidirectional sync —
-> session reflections — on top of a Notion Worker. Notion-hosted compute
-> receives a webhook trigger, parses the changed page, and calls a
-> Bearer-authenticated PUT into the existing Railway service. No second
-> server, no second auth model, no Flask handler dedicated to Notion.
-
 ## Why this matters
 
 PRE's Notion integration was already a one-way mirror: every SQLite write
@@ -194,22 +185,6 @@ Full runbook lives in [`../notion_worker/README.md`](../notion_worker/README.md)
 Phase-by-phase implementation plan in
 [`session-reflection-sync-plan.md`](session-reflection-sync-plan.md).
 
-## Interview talking points (compressed)
-
-> "I shipped a one-field bidirectional sync — session reflections — on
-> top of Notion Workers. The interesting question wasn't 'how do I
-> sync,' it was 'which field is worth syncing?' Plan rows are too
-> contentious (the agent and the user both want to write them);
-> journal entries are too freeform. Session notes are perfect — the
-> athlete is the only writer, the value is concrete post-run context
-> the coach actually uses, and the surface is one Notion property.
-> Smallest possible thing that proves the platform works."
-
-> "The architectural decision was Workers vs. a second Flask endpoint.
-> Workers won on four counts: no new public URL on the Railway tier,
-> first-party retries, amortization across later phases, and a clean
-> interview narrative — all in a single TS file behind `ntn workers
-> deploy`."
 
 > "The load-bearing primitive is a one-line omission contract: the
 > Python mirror never writes the Reflection property. Notion PATCH
