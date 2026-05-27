@@ -186,7 +186,7 @@ Singleton blobs (plan, athlete, journal) are upserted on every run so re-running
 | `NOTION_PARENT_PAGE_ID` | Page id (32-char hex) of the parent page that holds the four mirror databases. Connect your integration to it. |
 | `NOTION_API_VERSION` | Pinned to `2026-03-11` by default. |
 | `NOTION_SESSIONS_DS_ID` / `NOTION_JOURNAL_DS_ID` / `NOTION_PLAN_CHANGES_DS_ID` / `NOTION_REVIEWS_DS_ID` | Data-source ids printed by `scripts/notion_bootstrap.py`. Each gates its DB independently — a partially-configured workspace mirrors just what's wired. |
-| `WORKER_BRIDGE_SECRET` | Shared secret for the Notion-Workers reflection bridge (`PUT /sessions/<id>/reflection`). Same value lives in Railway env **and** in the Worker's `ntn workers secrets`. Unset → bridge endpoint refuses every request. See [docs/notion-workers-architecture.md](docs/notion-workers-architecture.md). |
+| `WORKER_BRIDGE_SECRET` | Shared secret for the Notion-Workers reflection bridge (`PUT /sessions/<id>/reflection`). Same value lives in Railway env **and** in the Worker's `ntn workers env`. Unset → bridge endpoint refuses every request. See [docs/notion-workers-architecture.md](docs/notion-workers-architecture.md). |
 
 ## Usage
 
