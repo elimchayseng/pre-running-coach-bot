@@ -1,5 +1,16 @@
 # Notion Workers in PRE — Architecture Overview
 
+> **Plan requirement.** Notion Workers are only available on certain paid
+> Notion plans (Business / Enterprise at time of writing). The free /
+> Plus tier `ntn` CLI rejects `ntn workers deploy` with a plan-tier
+> error — and the Notion docs don't surface this clearly. Everything in
+> this doc except the Worker deploy step works without that plan tier:
+> the schema bump, the bridge endpoint, the mirror omission contract,
+> and the coach prompt wiring all live in `main` and stay dormant until
+> a Worker is deployed. The Reflection property on the live Notion DB
+> and `WORKER_BRIDGE_SECRET` on Railway are the only two pieces of
+> external state to provision / stand down.
+
 ## Why this matters
 
 PRE's Notion integration was already a one-way mirror: every SQLite write
@@ -31,8 +42,9 @@ capability types:
 | `worker.tool(name, ...)` | Callable surface for Notion Custom Agents — agents in Notion invoke the tool on demand. | Not used (yet). Phase 4 of the original PRD (coaching log) would register PRE as a tool so `@PRE` works from any Notion page. |
 | `worker.webhook(name, ...)` | HTTP endpoint at a Notion-signed URL. Subscribed to by **either** an external webhook publisher (GitHub, Stripe, ...) **or** a Notion webhook subscription (`page.content_updated`, `comment.created`, `data_source.schema_updated`, ...). | **This is the one PRE ships.** |
 
-Secrets are injected via `process.env.*` at runtime; you configure them
-out-of-band with `ntn workers secrets set <KEY> <value>`.
+Env vars are injected via `process.env.*` at runtime; you configure them
+out-of-band with `ntn workers env set <KEY> <value>` (the subcommand was
+renamed from `secrets` to `env` in the public release).
 
 ## How PRE uses it
 
@@ -110,7 +122,7 @@ Two trust boundaries:
 | Boundary | Mechanism |
 |---|---|
 | Notion → Worker | Notion-signed webhook URL. The URL itself is the bearer token (long random path). Rotated by re-deploying / regenerating the webhook. |
-| Worker → Railway bridge | `Authorization: Bearer <WORKER_BRIDGE_SECRET>` header, validated by the Flask handler. Same value lives in Railway env var and `ntn workers secrets`. |
+| Worker → Railway bridge | `Authorization: Bearer <WORKER_BRIDGE_SECRET>` header, validated by the Flask handler. Same value lives in Railway env var and `ntn workers env`. |
 
 No webhook **signature** verification on the Worker side: the URL secrecy
 is the auth. (Notion can — and may in future — sign payloads; the Worker
@@ -167,9 +179,9 @@ completion; the test is the trip-wire.
 # 2. Deploy the Worker (assuming `ntn login` already done).
 cd notion_worker
 npm install
-ntn workers secrets set NOTION_TOKEN <token>
-ntn workers secrets set RAILWAY_BASE_URL https://pre-coach.up.railway.app
-ntn workers secrets set WORKER_BRIDGE_SECRET <same-as-railway>
+ntn workers env set NOTION_TOKEN <token>
+ntn workers env set RAILWAY_BASE_URL https://pre-coach.up.railway.app
+ntn workers env set WORKER_BRIDGE_SECRET <same-as-railway>
 ntn workers deploy
 ntn workers webhooks list   # copy URL → Notion webhook subscription on PRE Sessions
 

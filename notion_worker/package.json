@@ -7,7 +7,7 @@
   "scripts": {
     "build": "tsc --noEmit",
     "deploy": "ntn workers deploy",
-    "secrets:set": "echo 'Run: ntn workers secrets set NOTION_TOKEN <value>; ntn workers secrets set RAILWAY_BASE_URL <value>; ntn workers secrets set WORKER_BRIDGE_SECRET <value>'",
+    "env:set": "echo 'Run: ntn workers env set NOTION_TOKEN <value>; ntn workers env set RAILWAY_BASE_URL <value>; ntn workers env set WORKER_BRIDGE_SECRET <value>'",
     "webhooks:list": "ntn workers webhooks list"
   },
   "dependencies": {

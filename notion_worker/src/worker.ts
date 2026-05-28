@@ -19,10 +19,14 @@
  * Architecture overview:  docs/notion-workers-architecture.md
  * Phase plan:             docs/session-reflection-sync-plan.md
  *
- * Secrets (configure via `ntn workers secrets set`):
+ * Env vars (configure via `ntn workers env set`):
  *   - NOTION_TOKEN          internal-integration token (Read content)
  *   - RAILWAY_BASE_URL      e.g. https://pre-coach.up.railway.app
  *   - WORKER_BRIDGE_SECRET  shared with Railway's WORKER_BRIDGE_SECRET env
+ *
+ * Note: Notion Workers require a Business / Enterprise plan tier; the
+ * `ntn workers deploy` step will reject otherwise. See
+ * docs/notion-workers-architecture.md for the workaround / status.
  */
 
 // The `@notionhq/workers` package is supplied by the Notion runtime; types
@@ -122,7 +126,7 @@ worker.webhook("onReflectionEdit", {
     const secret = process.env.WORKER_BRIDGE_SECRET;
     if (!notionToken || !baseUrl || !secret) {
       throw new Error(
-        "Missing required secret: set NOTION_TOKEN, RAILWAY_BASE_URL, WORKER_BRIDGE_SECRET via `ntn workers secrets set`.",
+        "Missing required env var: set NOTION_TOKEN, RAILWAY_BASE_URL, WORKER_BRIDGE_SECRET via `ntn workers env set`.",
       );
     }
 

@@ -158,7 +158,7 @@ def put_session_reflection(session_id: int):
     Reflection property on a PRE Sessions page in Notion.
 
     Auth: ``Authorization: Bearer <WORKER_BRIDGE_SECRET>``. The same secret is
-    configured on the Worker via ``ntn workers secrets set
+    configured on the Worker via ``ntn workers env set
     WORKER_BRIDGE_SECRET``. Without ``WORKER_BRIDGE_SECRET`` set on Railway,
     the endpoint refuses every request — no unauthenticated fallback.
 

@@ -31,6 +31,12 @@ from every update payload — so there is no echo loop.
   and `Reflection`, calls the bridge endpoint.
 - `package.json` / `tsconfig.json` — minimal TS + `@notionhq/workers` scaffold.
 
+## Plan requirement
+
+Notion Workers are **only available on certain paid Notion plans** (Business / Enterprise at time of writing). The free / Plus tier `ntn` CLI rejects `ntn workers deploy` with a plan-tier error. The Notion docs don't surface this clearly — verify your workspace's eligibility before running the steps below.
+
+The rest of the integration (Phase 1 mirror, schema, bridge endpoint) is plan-agnostic and works without Workers; only the **bidirectional** Reflection sync needs the Worker.
+
 ## One-time setup
 
 ```bash
@@ -42,10 +48,11 @@ ntn login
 cd notion_worker
 npm install
 
-# 3. Configure the Worker secrets.
-ntn workers secrets set NOTION_TOKEN <internal-integration-token>
-ntn workers secrets set RAILWAY_BASE_URL https://pre-coach.up.railway.app
-ntn workers secrets set WORKER_BRIDGE_SECRET <same-value-as-railway-env>
+# 3. Configure the Worker environment variables. The CLI subcommand is
+#    `env`, not `secrets` — it was renamed in the public release.
+ntn workers env set NOTION_TOKEN <internal-integration-token>
+ntn workers env set RAILWAY_BASE_URL https://pre-coach.up.railway.app
+ntn workers env set WORKER_BRIDGE_SECRET <same-value-as-railway-env>
 
 # 4. Deploy. The CLI bundles, uploads, and starts the Worker.
 ntn workers deploy
@@ -79,7 +86,7 @@ In Notion, on the **PRE Sessions** database:
 ntn workers deploy
 ```
 
-Secrets are sticky — `ntn workers secrets set` only when rotating.
+Env vars are sticky — `ntn workers env set` only when rotating.
 
 ## Failure modes
 
