@@ -269,6 +269,14 @@ def setup_webhook():
 with app.app_context():
     setup_webhook()
 
+# Start the in-process calendar watchdog (auto-enables in prod; no-op locally /
+# in tests). Runs inside this worker so it shares the SQLite volume DB and the
+# Redis token store. Import-time placement (not gunicorn on_starting) keeps it
+# in the serving worker, alongside the asyncio loop and _SYNC_STATE_LOCK.
+import calendar_health  # noqa: E402
+
+calendar_health.start_scheduler_if_enabled()
+
 
 if __name__ == "__main__":
     # Direct dev run (prod goes through gunicorn, which runs the cutover in

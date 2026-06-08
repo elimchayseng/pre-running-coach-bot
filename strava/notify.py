@@ -49,13 +49,18 @@ def _format_ping(entry: dict) -> str:
     return "\n".join(line for line in [line1, line2, line3] if line)
 
 
-def send_telegram_text(text: str, chat_id: Optional[str] = None) -> bool:
+def send_telegram_text(text: str, chat_id: Optional[str] = None, mirror: bool = True) -> bool:
     """Send arbitrary text to Telegram. Shared by templated pings and
     LLM-generated post-activity analysis.
 
     chat_id defaults to USER_TELEGRAM_CHAT_ID env var. Returns True on success.
     Logs and returns False on any failure — never raises (called from a
     background thread we don't want to crash on transient errors).
+
+    mirror=True (default) records the sent text into the chat agent's
+    conversation history so the next user turn knows what the bot already said.
+    Pass mirror=False for system/ops alerts (e.g. calendar-auth health pings)
+    that should NOT leak into the coaching conversation as an assistant turn.
     """
     chat_id = chat_id or os.getenv("USER_TELEGRAM_CHAT_ID")
     token = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -97,7 +102,7 @@ def send_telegram_text(text: str, chat_id: Optional[str] = None) -> bool:
         logger.error(f"Failed to send Telegram text: {e}")
         return False
 
-    if sent:
+    if sent and mirror:
         # Mirror outbound Strava-side messages (templated pings + LLM
         # post-activity reviews) into the chat agent's conversation history.
         # Without this, the next user turn doesn't know we already acknowledged

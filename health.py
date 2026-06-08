@@ -36,6 +36,19 @@ def run_health_checks() -> dict[str, bool]:
             logger.error(f"Strava health check failed: {e}")
             results["strava"] = False
 
+    # Google Calendar is optional — only check when a calendar is configured.
+    # This catches the silent failure mode where the OAuth refresh token has
+    # expired (e.g. the 7-day testing-mode cap) and the plan has quietly
+    # stopped syncing to the calendar.
+    if os.getenv("CALENDAR_ID"):
+        try:
+            from google_calendar.auth import health_check as gcal_health
+
+            results["gcal"] = gcal_health()
+        except Exception as e:
+            logger.error(f"Gcal health check failed: {e}")
+            results["gcal"] = False
+
     # Notion mirror is optional — only check when a token is configured.
     if os.getenv("NOTION_TOKEN"):
         try:
