@@ -231,16 +231,23 @@ def run(dry_run: bool = False, do_sync: bool = True, now: float | None = None) -
 def scheduler_enabled(env: Mapping[str, str]) -> bool:
     """True when the periodic watchdog should run in this process.
 
-    Auto-enables in prod with no manual flag: requires WEBHOOK_URL (set only in
-    the deployed web service — never in pytest, local dev, or the `flask` CLI)
-    plus CALENDAR_ID and TELEGRAM_BOT_TOKEN (so it can actually sync and alert).
-    Force-off with DISABLE_CALENDAR_HEALTH_SCHEDULER=1; always off under TESTING.
+    Auto-enables in prod with no manual flag. The prod discriminator is a
+    Railway-injected runtime var (RAILWAY_ENVIRONMENT / RAILWAY_SERVICE_NAME /
+    RAILWAY_PROJECT_ID) — present only inside the deployed container, never in
+    pytest, the `flask` CLI, or a local `python app.py`. This matters: without
+    it, a dev running locally with a prod-shaped .env would sweep the LOCAL
+    stale DB onto the PROD calendar. Also requires CALENDAR_ID and
+    TELEGRAM_BOT_TOKEN so the watchdog can actually sync and alert. Force-off
+    with DISABLE_CALENDAR_HEALTH_SCHEDULER=1; always off under TESTING.
     """
     if (env.get("TESTING") or "").lower() in ("1", "true"):
         return False
     if (env.get(_DISABLE_FLAG) or "").lower() in ("1", "true"):
         return False
-    return bool(env.get("WEBHOOK_URL") and env.get("CALENDAR_ID") and env.get("TELEGRAM_BOT_TOKEN"))
+    on_railway = bool(
+        env.get("RAILWAY_ENVIRONMENT") or env.get("RAILWAY_SERVICE_NAME") or env.get("RAILWAY_PROJECT_ID")
+    )
+    return bool(on_railway and env.get("CALENDAR_ID") and env.get("TELEGRAM_BOT_TOKEN"))
 
 
 def _interval_seconds(env: Mapping[str, str]) -> float:

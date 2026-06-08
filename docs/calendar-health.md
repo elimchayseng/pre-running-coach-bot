@@ -93,10 +93,13 @@ It starts ~60s after boot, then sweeps every `CALENDAR_HEALTH_INTERVAL_HOURS`
 auto-recovers after a re-auth, keeps the token warm) → dedup Telegram alert on
 auth failure.
 
-**Enablement — auto, no manual flag.** It turns on whenever `WEBHOOK_URL` +
-`CALENDAR_ID` + `TELEGRAM_BOT_TOKEN` are all set (true only in the deployed web
-service — never in pytest, local dev, or the `flask` CLI). Force it off with
-`DISABLE_CALENDAR_HEALTH_SCHEDULER=1`; it's always off under `TESTING`.
+**Enablement — auto, no manual flag.** It turns on only inside the Railway
+deploy: the gate requires a Railway-injected runtime var (`RAILWAY_ENVIRONMENT`
+/ `RAILWAY_SERVICE_NAME` / `RAILWAY_PROJECT_ID` — absent in pytest, the `flask`
+CLI, and a local `python app.py`) plus `CALENDAR_ID` + `TELEGRAM_BOT_TOKEN`. The
+Railway signal is deliberate: without it, a dev running locally with a
+prod-shaped `.env` would sweep the **local stale DB** onto the **prod calendar**.
+Force it off with `DISABLE_CALENDAR_HEALTH_SCHEDULER=1`; always off under `TESTING`.
 
 **Env to set on the `web` service:** `CALENDAR_ID`, `TELEGRAM_BOT_TOKEN`,
 `USER_TELEGRAM_CHAT_ID`, `GCAL_TOKENS_BACKEND=redis` (plus the OAuth creds and

@@ -20,6 +20,8 @@ check: lint test
 gcal-reauth-prod:
 	@command -v railway >/dev/null 2>&1 || { echo "ERROR: railway CLI not found. Install: https://docs.railway.app/guides/cli"; exit 1; }
 	@railway whoami >/dev/null 2>&1 || { echo "ERROR: railway not logged in / linked. Run: railway login && railway link"; exit 1; }
+	@echo "Target → $$(railway status 2>/dev/null | grep -iE 'project|environment' | tr '\n' ' ')"
+	@echo "This writes a fresh token to the above environment's Redis. Ctrl-C now if that's wrong."
 	@PUB="$$(railway variables --service Redis --json | ./venv/bin/python -c 'import sys,json; u=json.load(sys.stdin).get("REDIS_PUBLIC_URL"); sys.exit("ERROR: REDIS_PUBLIC_URL not found on the Redis service") if not u else print(u)')" || exit 1; \
 	echo "Re-authing Google Calendar against prod Redis..."; \
 	REDIS_URL="$$PUB" GCAL_TOKENS_BACKEND=redis ./venv/bin/python scripts/google_calendar_setup.py auth

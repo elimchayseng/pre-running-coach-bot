@@ -98,8 +98,15 @@ def health_check():
     from health import run_health_checks
 
     results = run_health_checks()
+    # Liveness (200/503) gates ONLY on core dependencies. Optional one-way
+    # integrations (gcal / strava / notion) are reported per-field and flip
+    # `status` to "degraded", but must NOT 503 the probe — otherwise a dead
+    # gcal refresh token (the exact state the calendar watchdog exists to
+    # survive) could crash-loop the worker on Railway's healthcheck.
+    CORE_CHECKS = ("redis", "llm")
+    core_ok = all(results.get(k, False) for k in CORE_CHECKS)
     all_ok = all(results.values())
-    status_code = 200 if all_ok else 503
+    status_code = 200 if core_ok else 503
     return jsonify(
         {
             "status": "healthy" if all_ok else "degraded",

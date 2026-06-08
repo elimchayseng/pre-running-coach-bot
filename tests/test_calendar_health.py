@@ -173,12 +173,17 @@ class TestRun:
 # ---------- scheduler gating ----------
 
 
-PROD_ENV = {"WEBHOOK_URL": "https://x", "CALENDAR_ID": "cal", "TELEGRAM_BOT_TOKEN": "tok"}
+PROD_ENV = {"RAILWAY_ENVIRONMENT": "production", "CALENDAR_ID": "cal", "TELEGRAM_BOT_TOKEN": "tok"}
 
 
 class TestSchedulerEnabled:
     def test_on_when_all_signals_present(self):
         assert ch.scheduler_enabled(dict(PROD_ENV)) is True
+
+    def test_on_with_alternate_railway_signal(self):
+        # Any Railway-injected runtime var counts as the prod discriminator.
+        env = {"RAILWAY_SERVICE_NAME": "web", "CALENDAR_ID": "cal", "TELEGRAM_BOT_TOKEN": "tok"}
+        assert ch.scheduler_enabled(env) is True
 
     def test_off_under_testing(self):
         assert ch.scheduler_enabled({**PROD_ENV, "TESTING": "1"}) is False
@@ -186,8 +191,9 @@ class TestSchedulerEnabled:
     def test_off_when_disable_flag_set(self):
         assert ch.scheduler_enabled({**PROD_ENV, ch._DISABLE_FLAG: "true"}) is False
 
-    def test_off_when_webhook_url_absent(self):
-        env = {k: v for k, v in PROD_ENV.items() if k != "WEBHOOK_URL"}
+    def test_off_when_not_on_railway(self):
+        # Local dev with a prod-shaped .env but no RAILWAY_* signal must stay off.
+        env = {"CALENDAR_ID": "cal", "TELEGRAM_BOT_TOKEN": "tok", "WEBHOOK_URL": "https://x"}
         assert ch.scheduler_enabled(env) is False
 
     def test_off_when_calendar_id_absent(self):
