@@ -279,7 +279,12 @@ Then:
 ./venv/bin/python scripts/google_calendar_setup.py sync
 ```
 
-While the OAuth consent screen is in "testing" mode, refresh tokens for unverified apps expire after 7 days. When that happens, just rerun `scripts/google_calendar_setup.py auth`. Pursuing production verification is overkill for a single-user app.
+While the OAuth consent screen is in "testing" mode, refresh tokens for unverified apps expire after 7 days, silently stalling sync. **To end this for good, publish the app to production** (Cloud Console → OAuth consent screen → "Publish App") — even without full verification this removes the 7-day cap. An in-process watchdog (`calendar_health.py`, auto-enabled in prod) sweeps the calendar every 6h — self-healing drift, keeping the token warm, and Telegram-alerting you if a token ever dies, so the calendar never silently rots. See [docs/calendar-health.md](docs/calendar-health.md) for the publish click-path, the watchdog, and one-command prod re-auth (`make gcal-reauth-prod`).
+
+```bash
+./venv/bin/python calendar_health.py            # check auth + sync sweep + alert on failure
+./venv/bin/python calendar_health.py --check    # classify auth only
+```
 
 To back out the integration entirely:
 

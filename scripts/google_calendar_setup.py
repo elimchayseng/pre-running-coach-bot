@@ -23,8 +23,15 @@ GCP setup (one-time, manual):
 
 Known gotcha: while the OAuth consent screen is in "testing" mode, refresh
 tokens for unverified apps expire after 7 days. When you next see a refresh
-error, just re-run `python scripts/google_calendar_setup.py auth`. Pursuing
-production verification is overkill for a single-user app.
+error, re-run `python scripts/google_calendar_setup.py auth`.
+
+To END this recurring expiry, *publish* the app (Cloud Console → OAuth consent
+screen → "Publish App"). Publishing to production — even WITHOUT going through
+Google verification — stops the 7-day cap; refresh tokens then persist until
+revoked. You'll click through a one-time "unverified app" warning. Full
+verification is only needed to drop that warning / exceed 100 users. See
+docs/calendar-health.md. The `calendar_health.py` watchdog Telegram-alerts you
+if a token ever does die so the calendar never silently stops syncing.
 
 Usage:
     ./venv/bin/python scripts/google_calendar_setup.py auth

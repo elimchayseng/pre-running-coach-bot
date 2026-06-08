@@ -98,8 +98,15 @@ def health_check():
     from health import run_health_checks
 
     results = run_health_checks()
+    # Liveness (200/503) gates ONLY on core dependencies. Optional one-way
+    # integrations (gcal / strava / notion) are reported per-field and flip
+    # `status` to "degraded", but must NOT 503 the probe — otherwise a dead
+    # gcal refresh token (the exact state the calendar watchdog exists to
+    # survive) could crash-loop the worker on Railway's healthcheck.
+    CORE_CHECKS = ("redis", "llm")
+    core_ok = all(results.get(k, False) for k in CORE_CHECKS)
     all_ok = all(results.values())
-    status_code = 200 if all_ok else 503
+    status_code = 200 if core_ok else 503
     return jsonify(
         {
             "status": "healthy" if all_ok else "degraded",
@@ -268,6 +275,14 @@ def setup_webhook():
 # Set up webhook on startup
 with app.app_context():
     setup_webhook()
+
+# Start the in-process calendar watchdog (auto-enables in prod; no-op locally /
+# in tests). Runs inside this worker so it shares the SQLite volume DB and the
+# Redis token store. Import-time placement (not gunicorn on_starting) keeps it
+# in the serving worker, alongside the asyncio loop and _SYNC_STATE_LOCK.
+import calendar_health  # noqa: E402
+
+calendar_health.start_scheduler_if_enabled()
 
 
 if __name__ == "__main__":
