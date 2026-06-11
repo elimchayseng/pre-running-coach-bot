@@ -1,0 +1,1 @@
+"HRV Assessment — Last 7 days\n========================\n\nNormal Range: 61 - 89 ms\nBaseline: 75 ms\n\n2026-06-10:\n  HRV Avg: 95 ms — Above normal\n2026-06-09:\n  HRV Avg: 98 ms — Above normal\n2026-06-08:\n  HRV Avg: 64 ms — Normal\n2026-06-07:\n  HRV Avg: 72 ms — Normal\n2026-06-06:\n  HRV Avg: 85 ms — Normal\n2026-06-05:\n  HRV Avg: 68 ms — Normal"

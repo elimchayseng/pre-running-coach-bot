@@ -1,0 +1,1 @@
+"Recovery Status\n========================\n\nRecovery: 87%\nLevel: Heavy training allowed\nEstimated Full Recovery: 16h"

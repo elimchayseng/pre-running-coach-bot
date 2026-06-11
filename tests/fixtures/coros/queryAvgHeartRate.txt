@@ -1,0 +1,1 @@
+"Average Heart Rate — Last 7 days\n========================\n\n2026-06-11: 88 bpm (Min: 52, Max: 158)\n2026-06-10: 56 bpm (Min: 41, Max: 102)\n2026-06-09: 64 bpm (Min: 43, Max: 147)\n2026-06-08: 55 bpm (Min: 40, Max: 121)\n2026-06-07: 83 bpm (Min: 44, Max: 169)\n2026-06-06: 57 bpm (Min: 39, Max: 95)\n2026-06-05: 60 bpm (Min: 42, Max: 126)"
