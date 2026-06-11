@@ -12,12 +12,13 @@ SQLite stays authoritative; Notion is a one-way reflection.
 
 from __future__ import annotations
 
-# Database titles. The four live under the PRE Training parent page; the
+# Database titles. The five live under the PRE Training parent page; the
 # bootstrap matches on these exact titles for idempotency.
 DB_SESSIONS = "PRE Sessions"
 DB_JOURNAL = "PRE Journal"
 DB_PLAN_CHANGES = "PRE Plan Changes"
 DB_REVIEWS = "PRE Reviews"
+DB_HEALTH = "PRE Health"
 
 # Hidden idempotency key carried on every mirrored row. The mirror queries
 # on it to decide insert-vs-update. (Notion has no per-property "hidden"
@@ -40,6 +41,11 @@ def plan_change_key(changelog_id: int) -> str:
 
 def review_key(review_id: int) -> str:
     return f"rid:{review_id}"
+
+
+def health_key(date_iso: str) -> str:
+    """daily_health rows are keyed by date (the table's primary key)."""
+    return f"hid:{date_iso}"
 
 
 # ---------- property-definition helpers ----------
@@ -123,3 +129,28 @@ def reviews_properties(sessions_data_source_id: str) -> dict:
         "Status": _select("approved", "rejected", "expired", "no-op"),
         SOURCE_KEY: {"rich_text": {}},
     }
+
+
+# Health — one row per local date, mirroring the daily_health table (nightly
+# COROS pull). Notion auto-creates unseen select options on write, so the
+# option lists below only seed the values observed so far.
+HEALTH_PROPERTIES: dict = {
+    "Title": {"title": {}},  # the ISO date
+    "Date": {"date": {}},
+    "Sleep score": {"number": {"format": "number"}},
+    "Sleep hours": {"number": {"format": "number"}},
+    "Nap min": {"number": {"format": "number"}},
+    "HRV": {"number": {"format": "number"}},
+    "HRV baseline": {"number": {"format": "number"}},
+    "HRV eval": _select("Above normal", "Normal", "Below normal"),
+    "Resting HR": {"number": {"format": "number"}},
+    "Stress": {"number": {"format": "number"}},
+    "Steps": {"number": {"format": "number"}},
+    "Recovery %": {"number": {"format": "number"}},
+    "Recovery level": _select("Heavy training allowed", "Good", "Fair", "Rest needed"),
+    "Load ST": {"number": {"format": "number"}},
+    "Load LT": {"number": {"format": "number"}},
+    "Load ratio": {"number": {"format": "number"}},
+    "Load status": _select("Optimized", "Excessive", "Maintaining", "Detraining"),
+    SOURCE_KEY: {"rich_text": {}},
+}

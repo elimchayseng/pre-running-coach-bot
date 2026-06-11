@@ -1,8 +1,9 @@
 """One-shot bootstrap for the Notion mirror (Phase 1B.1).
 
-Creates the four mirror databases under the PRE Training parent page:
-PRE Sessions, PRE Journal, PRE Plan Changes, PRE Reviews. Sessions is created
-first so Plan Changes and Reviews can declare a relation into it.
+Creates the five mirror databases under the PRE Training parent page:
+PRE Sessions, PRE Journal, PRE Plan Changes, PRE Reviews, PRE Health.
+Sessions is created first so Plan Changes and Reviews can declare a relation
+into it.
 
 Idempotent: a database whose exact title already exists under the parent page
 is reused, not recreated. Safe to re-run.
@@ -109,6 +110,8 @@ def bootstrap() -> list[dict]:
             parent_page_id,
         )
     )
+    # Health has no relations — order-independent.
+    out.append(_create_or_reuse(client, schema.DB_HEALTH, schema.HEALTH_PROPERTIES, parent_page_id))
     return out
 
 
@@ -117,6 +120,7 @@ _ENV_KEYS = {
     schema.DB_JOURNAL: ("NOTION_JOURNAL_DB_ID", "NOTION_JOURNAL_DS_ID"),
     schema.DB_PLAN_CHANGES: ("NOTION_PLAN_CHANGES_DB_ID", "NOTION_PLAN_CHANGES_DS_ID"),
     schema.DB_REVIEWS: ("NOTION_REVIEWS_DB_ID", "NOTION_REVIEWS_DS_ID"),
+    schema.DB_HEALTH: ("NOTION_HEALTH_DB_ID", "NOTION_HEALTH_DS_ID"),
 }
 
 
