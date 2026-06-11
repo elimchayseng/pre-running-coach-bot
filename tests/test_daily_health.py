@@ -168,6 +168,37 @@ class TestRenderReadinessBlock:
         assert "chronic load 105.0" in block
 
 
+# ---------- load_full_context integration ----------
+
+
+class TestFullContextIntegration:
+    def _seed_minimum(self, state):
+        """load_full_context needs athlete + plan rows to exist."""
+        with state._conn() as conn:
+            conn.execute("INSERT OR REPLACE INTO athlete (id, yaml_text) VALUES (1, 'name: Test')")
+            conn.commit()
+
+    def test_blocks_absent_without_health_data(self, state):
+        self._seed_minimum(state)
+        blob = state.load_full_context()
+        assert "=== READINESS" not in blob
+        assert "=== TRAINING LOAD TREND" not in blob
+
+    def test_blocks_present_with_health_data(self, state):
+        from datetime import date as _date
+
+        self._seed_minimum(state)
+        # Seed with the real today: load_full_context's blocks use default
+        # windows anchored to date.today().
+        state.upsert_daily_health([_row(_date.today().isoformat())])
+        blob = state.load_full_context()
+        assert "=== READINESS (COROS, last 7 days) ===" in blob
+        assert "=== TRAINING LOAD TREND (last 4 weeks) ===" in blob
+        assert "| Date | Sleep | HRV | RHR | Stress | Load ratio | Load status |" in blob
+        # Journal stays last.
+        assert blob.index("READINESS") < blob.index("JOURNAL")
+
+
 # ---------- migration ----------
 
 

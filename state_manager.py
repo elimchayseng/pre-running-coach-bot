@@ -1110,13 +1110,15 @@ class StateManager:
             val = row.get(key)
             return f"{val}{suffix}" if val is not None else "—"
 
-        latest = rows[-1]
         header_bits = []
-        if latest.get("hrv_baseline") is not None:
+        # Today's row often lags (no HRV entry yet) — take the baseline from
+        # the most recent row that has one.
+        baseline_row = next((r for r in reversed(rows) if r.get("hrv_baseline") is not None), None)
+        if baseline_row:
             rng = ""
-            if latest.get("hrv_range_low") is not None and latest.get("hrv_range_high") is not None:
-                rng = f" (normal {latest['hrv_range_low']}–{latest['hrv_range_high']}ms)"
-            header_bits.append(f"HRV baseline {latest['hrv_baseline']}ms{rng}")
+            if baseline_row.get("hrv_range_low") is not None and baseline_row.get("hrv_range_high") is not None:
+                rng = f" (normal {baseline_row['hrv_range_low']}–{baseline_row['hrv_range_high']}ms)"
+            header_bits.append(f"HRV baseline {baseline_row['hrv_baseline']}ms{rng}")
         recovery_row = next((r for r in reversed(rows) if r.get("recovery_pct") is not None), None)
         if recovery_row:
             header_bits.append(
@@ -1275,6 +1277,21 @@ class StateManager:
             "",
             f"=== RECENT SESSIONS (last {recent_days} days) ===",
             *(json.dumps(e, ensure_ascii=False) for e in recent),
+        ]
+
+        # Wearable readiness + load trend (COROS nightly pull). Both render
+        # "" on a pre-COROS database, keeping the blob unchanged until the
+        # first pull lands. Daily readiness drives today's-session decisions;
+        # the weekly trend gives plan-construction turns the chronic-load
+        # arc without re-deriving it from raw rows.
+        readiness = self.render_readiness_block(days=7)
+        if readiness:
+            parts += ["", "=== READINESS (COROS, last 7 days) ===", readiness]
+        load_trend = self._render_load_trend_block(weeks=4)
+        if load_trend:
+            parts += ["", "=== TRAINING LOAD TREND (last 4 weeks) ===", load_trend]
+
+        parts += [
             "",
             f"=== JOURNAL (last {journal_entries} entries) ===",
             journal.rstrip(),
