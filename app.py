@@ -284,6 +284,14 @@ import calendar_health  # noqa: E402
 
 calendar_health.start_scheduler_if_enabled()
 
+# Start the in-process COROS nightly-pull scheduler (same gating philosophy:
+# auto-enables on Railway only, no-op locally / in tests). Interval ticks run
+# a cheap due-check; the actual pull fires once per night after
+# COROS_PULL_HOUR_LOCAL.
+from coros import scheduler as coros_scheduler  # noqa: E402
+
+coros_scheduler.start_scheduler_if_enabled()
+
 
 if __name__ == "__main__":
     # Direct dev run (prod goes through gunicorn, which runs the cutover in

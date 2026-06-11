@@ -49,6 +49,21 @@ def run_health_checks() -> dict[str, bool]:
             logger.error(f"Gcal health check failed: {e}")
             results["gcal"] = False
 
+    # COROS is optional — only check when token storage is configured
+    # (COROS_TOKENS_BACKEND set in prod; a local token file in dev). The
+    # check is a token-validity probe (refresh only when stale), so it
+    # catches the silent failure mode where the rotated refresh token was
+    # lost and the nightly health pull has quietly stopped.
+    try:
+        from coros.auth import TOKEN_FILE as _coros_token_file
+        from coros.auth import health_check as coros_health
+
+        if os.getenv("COROS_TOKENS_BACKEND") or _coros_token_file.exists():
+            results["coros"] = coros_health()
+    except Exception as e:
+        logger.error(f"COROS health check failed: {e}")
+        results["coros"] = False
+
     # Notion mirror is optional — only check when a token is configured.
     if os.getenv("NOTION_TOKEN"):
         try:
