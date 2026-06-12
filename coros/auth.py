@@ -103,6 +103,63 @@ def _read_blob_file() -> Optional[dict]:
         return None
 
 
+def _rescue_path() -> Path:
+    """Computed (not a constant) so tests that monkeypatch TOKEN_FILE get a
+    matching rescue path."""
+    return TOKEN_FILE.with_suffix(".rescue.json")
+
+
+def _write_rescue_file(blob: dict, replaces_refresh_token: str) -> bool:
+    """Last-ditch durable copy of a rotated blob whose backend persist
+    failed. The in-memory _unsaved_blob fallback dies with the process — a
+    one-shot CLI (`make coros-status-prod` against prod Redis) exiting after
+    a failed write would otherwise destroy the grant permanently.
+
+    `replaces_refresh_token` records which (consumed) token this rotation
+    replaced, so the flush can detect a stale rescue and never clobber a
+    grant that was re-authed or re-rotated in the meantime."""
+    try:
+        fd = os.open(_rescue_path(), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"replaces_refresh_token": replaces_refresh_token, "blob": blob}, indent=2))
+        return True
+    except OSError as e:
+        logger.error(f"COROS rescue-file write failed too: {e}")
+        return False
+
+
+def _flush_rescue_file() -> None:
+    """Adopt a rescue blob left by an earlier process whose backend persist
+    failed — but only while storage still holds the dead token the rescue's
+    rotation replaced. If storage moved on (full re-auth, later rotation),
+    the rescue is stale and adopting it would kill the LIVE grant."""
+    rescue_path = _rescue_path()
+    if not rescue_path.exists():
+        return
+    try:
+        rescue = json.loads(rescue_path.read_text())
+        blob = rescue["blob"]
+        replaces = rescue.get("replaces_refresh_token")
+    except (OSError, json.JSONDecodeError, KeyError, TypeError) as e:
+        logger.warning(f"Unreadable COROS rescue file {rescue_path}: {e}")
+        return
+    try:
+        stored = _read_blob()
+    except TokenStorageUnavailable:
+        return  # backend still down — keep the rescue for the next attempt
+    stored_rt = ((stored or {}).get("tokens") or {}).get("refresh_token")
+    if stored_rt and stored_rt != replaces:
+        logger.info("Discarding stale COROS rescue file (storage has moved on)")
+        rescue_path.unlink(missing_ok=True)
+        return
+    try:
+        _write_blob(blob)
+    except (TokenStorageUnavailable, OSError):
+        return  # keep the rescue; try again next call
+    rescue_path.unlink(missing_ok=True)
+    logger.info("Recovered COROS token blob from rescue file into %s backend", _backend())
+
+
 def _write_blob_file(blob: dict) -> None:
     """Atomic file write: write to .tmp + rename. Crash-safe."""
     TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -179,10 +236,12 @@ def register_client(redirect_uri: str) -> dict:
 
 
 # Assumed access-token lifetime when the token endpoint omits expires_in.
-# Conservative 1h: without this floor, a missing expires_in would make
-# expires_at == now, and EVERY subsequent call would refresh-and-rotate —
-# multiplying the rotation-loss window by orders of magnitude.
-FALLBACK_EXPIRES_IN = 3600
+# Must comfortably exceed REFRESH_LEEWAY_SECONDS: freshness is
+# `expires_at - now > leeway`, so a fallback equal to the leeway would be
+# fresh for zero seconds and EVERY subsequent call would refresh-and-rotate —
+# multiplying the rotation-loss window by orders of magnitude. 2x the leeway
+# treats the token as usable for one leeway-window before refreshing.
+FALLBACK_EXPIRES_IN = 2 * REFRESH_LEEWAY_SECONDS
 
 
 def _tokens_from_response(body: dict, fallback_refresh: Optional[str] = None) -> dict:
@@ -233,8 +292,12 @@ def exchange_code_for_tokens(code: str, redirect_uri: str, code_verifier: str, c
     wait=wait_exponential(multiplier=1, min=1, max=8),
     # ConnectionError ONLY — never Timeout. A read timeout can mean COROS
     # already processed the refresh and rotated the (single-use) token; a
-    # retry would re-present the consumed token and kill the grant. A
-    # ConnectionError guarantees the request never reached the server.
+    # retry would re-present the consumed token and kill the grant.
+    # Caveat: ConnectionError is NOT a guarantee the request never reached
+    # the server (requests also raises it for reset-while-reading-response).
+    # In that case the rotation result died on the wire and the grant is
+    # lost either way — the new token was never received by anyone — so the
+    # retry merely discovers the death sooner; it cannot make it worse.
     retry=retry_if_exception_type(requests.ConnectionError),
 )
 def _refresh_request(refresh_token: str, client_id: str) -> dict:
@@ -276,6 +339,10 @@ def get_access_token() -> str:
     refresh fails.
     """
     global _unsaved_blob
+    # Adopt a rescue file left by an earlier (now-dead) process whose
+    # persist failed — must run before any storage read so the rotated
+    # token wins over the consumed one still in storage.
+    _flush_rescue_file()
     # Flush a blob whose persist failed earlier — even when the in-memory
     # token is still fresh, storage must catch up as soon as it recovers
     # (another process reading storage would otherwise see the dead token).
@@ -354,11 +421,19 @@ def get_access_token() -> str:
         try:
             _write_blob(blob)
             _unsaved_blob = None
-        except TokenStorageUnavailable as e:
+        except (TokenStorageUnavailable, OSError) as e:
+            # OSError covers the file backend (_write_blob_file raises raw
+            # mkstemp/os.replace failures: disk full, permissions, read-only
+            # fs); TokenStorageUnavailable covers the Redis backend. Either
+            # way the rotated single-use token must survive in memory — and
+            # on disk: a one-shot CLI exiting here would otherwise take the
+            # only copy of the live grant with it.
             _unsaved_blob = blob
+            rescued = _write_rescue_file(blob, replaces_refresh_token=tokens["refresh_token"])
             logger.error(
                 f"COROS token persist failed after rotation ({e}); holding "
                 "rotated token in memory and retrying the write on next use"
+                + (f" — durable rescue copy at {_rescue_path()}" if rescued else " — RESCUE WRITE ALSO FAILED")
             )
         return blob["tokens"]["access_token"]
 

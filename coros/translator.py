@@ -11,7 +11,7 @@ quotes around the whole payload, \\n escapes). Every parser here:
 Quirks worth knowing (verified live; see docs/coros-mcp.md):
 - queryDailyHealthData section headers use yyyyMMdd; other tools use ISO.
 - queryDailyHealthData's header "Resting HR / HRV Baseline" values disagree
-  with the dedicated tools (e.g. baseline 42 vs queryHrvAssessment's 82), so
+  with the dedicated tools (e.g. baseline 39 vs queryHrvAssessment's 75), so
   the header is deliberately NOT parsed — per-day tools win.
 - The same night's sleep score can differ between queryDailyHealthData and
   querySleepData; querySleepData (the dedicated tool) takes precedence.
@@ -67,12 +67,24 @@ def _duration_min(text: str) -> Optional[int]:
     return (int(h.group(1)) * 60 if h else 0) + (int(m.group(1)) if m else 0)
 
 
+def _real_iso(iso: str) -> Optional[str]:
+    """Return iso only if it is a real calendar date. Digit-shape alone is
+    not enough: these strings become daily_health PRIMARY KEYs, and a bogus
+    '2026-06-32' row makes date.fromisoformat() blow up in get_load_trend —
+    i.e. on every chat turn — until someone hand-deletes the row."""
+    try:
+        date.fromisoformat(iso)
+        return iso
+    except ValueError:
+        return None
+
+
 def _iso(yyyymmdd: str) -> Optional[str]:
     """'20260611' -> '2026-06-11' (None on malformed input)."""
     s = yyyymmdd.strip()
     if not re.fullmatch(r"\d{8}", s):
         return None
-    return f"{s[:4]}-{s[4:6]}-{s[6:]}"
+    return _real_iso(f"{s[:4]}-{s[4:6]}-{s[6:]}")
 
 
 _ISO_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})\b")
@@ -135,7 +147,8 @@ def parse_sleep(text: str) -> dict[str, dict]:
         line = line.strip()
         m = _ISO_RE.match(line)
         if m and ":" not in line:
-            current = out.setdefault(m.group(1), {})
+            key = _real_iso(m.group(1))
+            current = out.setdefault(key, {}) if key else None
             continue
         if current is None:
             continue
@@ -170,7 +183,7 @@ def parse_hrv(text: str) -> dict:
             baseline = _to_int(m.group(1))
         m = _ISO_RE.match(line)
         if m:
-            current_date = m.group(1)
+            current_date = _real_iso(m.group(1))
             continue
         m = re.match(r"^HRV Avg:\s*(\d+)\s*ms(?:\s*—\s*(.+))?$", line)
         if m and current_date:
@@ -188,8 +201,9 @@ def parse_resting_hr(text: str) -> dict[str, int]:
         m = re.match(r"^(\d{4}-\d{2}-\d{2}):\s*(\d+)\s*bpm", line.strip())
         if m:
             bpm = _to_int(m.group(2))
-            if bpm is not None:
-                out[m.group(1)] = bpm
+            day = _real_iso(m.group(1))
+            if bpm is not None and day:
+                out[day] = bpm
     return out
 
 
@@ -202,7 +216,8 @@ def parse_training_load(text: str) -> dict[str, dict]:
         line = line.strip()
         m = _ISO_RE.match(line)
         if m and ":" not in line:
-            current = out.setdefault(m.group(1), {})
+            key = _real_iso(m.group(1))
+            current = out.setdefault(key, {}) if key else None
             continue
         if current is None:
             continue

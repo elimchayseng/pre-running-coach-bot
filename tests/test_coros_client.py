@@ -70,3 +70,57 @@ class TestDefaultTimezone:
     def test_fallback_utc(self, monkeypatch):
         monkeypatch.delenv("USER_TIMEZONE", raising=False)
         assert client._default_timezone() == "UTC"
+
+
+class TestCallToolTextRetryScope:
+    """Token acquisition must live OUTSIDE the transport retry: COROS rotates
+    single-use refresh tokens, so retrying a failed refresh (requests
+    exceptions subclass OSError, which the predicate matches) re-presents a
+    possibly-consumed token — permanent grant lockout."""
+
+    def test_auth_failure_fetches_token_once_no_retry(self, monkeypatch):
+        calls = []
+
+        def _dead():
+            calls.append(1)
+            raise CorosAuthError("grant dead")
+
+        monkeypatch.setattr(client, "get_access_token", _dead)
+        with pytest.raises(CorosAuthError):
+            client.call_tool_text("queryUserInfo", {})
+        assert len(calls) == 1
+
+    def test_refresh_network_error_not_retried(self, monkeypatch):
+        import requests
+
+        calls = []
+
+        def _reset_mid_refresh():
+            calls.append(1)
+            # Connection reset while READING the refresh response: the server
+            # may have already rotated the token. Re-presenting it = lockout.
+            raise requests.exceptions.ConnectionError("reset by peer")
+
+        monkeypatch.setattr(client, "get_access_token", _reset_mid_refresh)
+        with pytest.raises(requests.exceptions.ConnectionError):
+            client.call_tool_text("queryUserInfo", {})
+        assert len(calls) == 1
+
+    def test_transport_retry_reuses_token(self, monkeypatch):
+        import httpx
+
+        token_fetches = []
+        monkeypatch.setattr(client, "get_access_token", lambda: token_fetches.append(1) or "tok")
+        attempts = []
+
+        async def _flaky(name, args, token):
+            attempts.append(token)
+            if len(attempts) < 3:
+                raise httpx.ConnectError("net blip")
+            return "payload"
+
+        monkeypatch.setattr(client, "_call_tool_async", _flaky)
+        monkeypatch.setattr(client._call_with_retries.retry, "sleep", lambda s: None)
+        assert client.call_tool_text("queryUserInfo", {}) == "payload"
+        assert attempts == ["tok", "tok", "tok"]  # transport retried...
+        assert len(token_fetches) == 1  # ...but the token was fetched once

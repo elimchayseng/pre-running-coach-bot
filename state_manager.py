@@ -226,13 +226,35 @@ class StateManager:
                 # column. SQLite's CREATE TABLE IF NOT EXISTS in schema.sql is a
                 # no-op when the table already exists, so a column added after
                 # the table was first created has to come in via ALTER TABLE.
+                def _add_column(sql: str) -> None:
+                    # The PRAGMA guard races across PROCESSES (_schema_lock
+                    # only serializes threads): old/new containers overlap
+                    # during a deploy, both pass the check, the loser gets
+                    # 'duplicate column name'. That loss is harmless — the
+                    # column exists, which is all we wanted.
+                    try:
+                        conn.execute(sql)
+                    except sqlite3.OperationalError as e:
+                        if "duplicate column name" not in str(e).lower():
+                            raise
+
                 cols = {r[1] for r in conn.execute("PRAGMA table_info(sessions)")}
                 if "reflection" not in cols:
-                    conn.execute("ALTER TABLE sessions ADD COLUMN reflection TEXT DEFAULT NULL")
+                    _add_column("ALTER TABLE sessions ADD COLUMN reflection TEXT DEFAULT NULL")
                 # v7 → v8: review kind discriminator ('activity' | 'readiness').
                 rev_cols = {r[1] for r in conn.execute("PRAGMA table_info(reviews)")}
                 if "kind" not in rev_cols:
-                    conn.execute("ALTER TABLE reviews ADD COLUMN kind TEXT NOT NULL DEFAULT 'activity'")
+                    _add_column("ALTER TABLE reviews ADD COLUMN kind TEXT NOT NULL DEFAULT 'activity'")
+                # One readiness check-in per night, enforced by the DB — the
+                # SELECT-then-INSERT dedup in coros/review.py has a race
+                # window (manual scheduler run vs. in-process tick). Lives
+                # here rather than schema.sql because executescript runs
+                # BEFORE this block, when a pre-v8 DB doesn't yet have the
+                # `kind` column the partial index references.
+                conn.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_reviews_readiness_per_date "
+                    "ON reviews(date) WHERE kind = 'readiness'"
+                )
             conn.execute(
                 "INSERT OR IGNORE INTO schema_version (version) VALUES (?)",
                 (CURRENT_SCHEMA_VERSION if unified else 3,),
@@ -1094,6 +1116,27 @@ class StateManager:
                 (start, ref.isoformat()),
             ).fetchall()
         return [dict(r) for r in rows]
+
+    def latest_metric_date(self) -> Optional[str]:
+        """Most recent daily_health date carrying at least one PARSED metric.
+
+        Raw-insurance rows (ingest always writes today's row holding the
+        unparsed bundle, even when zero fields parse) don't count: a
+        freshness check that treats them as data would never notice a COROS
+        output-format change — the exact failure the staleness alert and
+        /health exist to catch."""
+        from coros.translator import METRIC_KEYS  # lazy import — avoids a module cycle
+
+        predicate = " OR ".join(f"{key} IS NOT NULL" for key in METRIC_KEYS)
+        with self._conn() as conn:
+            row = conn.execute(f"SELECT MAX(date) FROM daily_health WHERE {predicate}").fetchone()
+        return row[0]
+
+    def has_daily_health_rows(self) -> bool:
+        """Cheap existence probe — /health runs on every Railway poll, so it
+        must not materialize rows (the raw column alone is kilobytes)."""
+        with self._conn() as conn:
+            return conn.execute("SELECT EXISTS(SELECT 1 FROM daily_health)").fetchone()[0] == 1
 
     def get_load_trend(self, weeks: int = 4, today: Optional[date] = None) -> list[dict]:
         """Per-ISO-week training-load aggregates over the trailing window.

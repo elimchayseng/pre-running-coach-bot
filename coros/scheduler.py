@@ -29,7 +29,7 @@ import sys
 import threading
 import time
 from collections.abc import Mapping
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -42,7 +42,12 @@ from coros import auth  # noqa: E402
 logger = logging.getLogger("pre_coach.coros.scheduler")
 
 ALERT_COOLDOWN_HOURS = float(os.getenv("COROS_HEALTH_ALERT_COOLDOWN_HOURS", "24"))
-_ALERT_REDIS_KEY = "coros:health:last_alert"
+# Per-alert-type dedup keys: the re-auth alert ("run make coros-reauth-prod")
+# and the data-staleness alert ("check COROS outage / format change") demand
+# different operator actions, so one firing must not suppress the other for
+# a cooldown window.
+_AUTH_ALERT_KEY = "coros:health:last_alert:auth"
+_STALENESS_ALERT_KEY = "coros:health:last_alert:staleness"
 _LAST_RUN_REDIS_KEY = "coros:nightly:last_run_date"
 
 EXIT_OK = 0
@@ -100,13 +105,14 @@ def _alert_text() -> str:
     )
 
 
-def _should_alert(now: float) -> bool:
-    """True if we're outside the alert cooldown. Fails OPEN: if the dedup
-    store is unreachable we alert anyway — over-notifying beats silence."""
+def _should_alert(now: float, key: str = _AUTH_ALERT_KEY) -> bool:
+    """True if we're outside the alert cooldown for this alert type. Fails
+    OPEN: if the dedup store is unreachable we alert anyway — over-notifying
+    beats silence."""
     try:
         from conversation_store import _get_redis
 
-        last = _get_redis().get(_ALERT_REDIS_KEY)
+        last = _get_redis().get(key)
     except Exception as e:
         logger.warning(f"Alert-dedup read failed ({e}); alerting anyway")
         return True
@@ -118,11 +124,11 @@ def _should_alert(now: float) -> bool:
         return True
 
 
-def _record_alert(now: float) -> None:
+def _record_alert(now: float, key: str = _AUTH_ALERT_KEY) -> None:
     try:
         from conversation_store import _get_redis
 
-        _get_redis().set(_ALERT_REDIS_KEY, str(int(now)))
+        _get_redis().set(key, str(int(now)))
     except Exception as e:
         logger.warning(f"Could not record alert timestamp: {e}")
 
@@ -132,7 +138,7 @@ def _clear_alert_state() -> None:
     try:
         from conversation_store import _get_redis
 
-        _get_redis().delete(_ALERT_REDIS_KEY)
+        _get_redis().delete(_AUTH_ALERT_KEY, _STALENESS_ALERT_KEY)
     except Exception as e:
         logger.debug(f"Could not clear alert state: {e}")
 
@@ -211,6 +217,7 @@ def run(now: float | None = None, dry_run: bool = False, do_pull: bool = True) -
     if status == "infra":
         logger.error(f"COROS token storage unavailable: {detail}")
         print(f"infra: token storage unavailable — {detail}", file=sys.stderr)
+        _attempt_staleness_alert(now)
         return EXIT_INFRA
 
     if status == "needs_auth":
@@ -239,6 +246,7 @@ def run(now: float | None = None, dry_run: bool = False, do_pull: bool = True) -
     except Exception as e:
         logger.error(f"COROS pull failed: {e}")
         print(f"infra: pull failed — {e}", file=sys.stderr)
+        _attempt_staleness_alert(now)
         return EXIT_INFRA
 
     print(
@@ -263,6 +271,19 @@ def run(now: float | None = None, dry_run: bool = False, do_pull: bool = True) -
     return EXIT_OK
 
 
+def _attempt_staleness_alert(now: float) -> None:
+    """Infra-failure paths deserve the staleness alert too — without it a
+    persistent pull exception loops nightly with no Telegram signal (exit
+    codes only reach logs). Guarded: whatever broke the pass may also break
+    StateManager construction."""
+    try:
+        from state_manager import StateManager
+
+        _maybe_send_staleness_alert(StateManager(ROOT / "state"), now)
+    except Exception as e:
+        logger.warning(f"Could not attempt staleness alert: {e}")
+
+
 def _maybe_send_staleness_alert(state, now: float) -> None:
     """Alert (cooldown-deduped) when pulls have failed long enough that
     readiness data is going stale — the non-auth analog of the re-auth
@@ -270,9 +291,16 @@ def _maybe_send_staleness_alert(state, now: float) -> None:
     only reach logs, and the quiet-night ping policy makes silence look
     healthy."""
     try:
-        if state.get_daily_health(days=2):
-            return  # data still fresh — one failed night isn't alertable
-        if not _should_alert(now):
+        from temporal_context import today_local
+
+        # Only PARSED metrics count as fresh: ingest's raw-insurance row is
+        # written even when zero fields parse, so mere row existence would
+        # keep this alert permanently suppressed during the format-change
+        # scenario it exists for.
+        latest = state.latest_metric_date()
+        if latest and date.fromisoformat(latest) >= today_local() - timedelta(days=1):
+            return  # metrics still fresh — one failed night isn't alertable
+        if not _should_alert(now, _STALENESS_ALERT_KEY):
             return
         from strava.notify import send_telegram_text
 
@@ -283,7 +311,7 @@ def _maybe_send_staleness_alert(state, now: float) -> None:
             mirror=False,
         )
         if sent:
-            _record_alert(now)
+            _record_alert(now, _STALENESS_ALERT_KEY)
     except Exception:
         logger.exception("COROS staleness alert failed")
 

@@ -23,7 +23,7 @@ from openai import APIStatusError, RateLimitError
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from config import HEROKU_MODEL, llm_client
-from pending_proposal_store import set_pending_plan_proposal
+from pending_proposal_store import get_pending_plan_proposal, set_pending_plan_proposal
 from state_manager import StateManager
 from temporal_context import today_local
 
@@ -294,6 +294,19 @@ def run_post_activity_review(entry: dict, state: StateManager, session_id: Optio
         if parsed is None:
             return None
         plan_change = parsed.get("plan_change")
+        # Single-proposal-key collision guard (mirrors coros/review.py): a
+        # webhook-driven post-activity review can land at any hour and would
+        # otherwise silently clobber a pending readiness proposal the user
+        # was already pinged about — their "yes" would then apply the wrong
+        # change. First proposal wins; this one is delivered as analysis only.
+        if plan_change and get_pending_plan_proposal():
+            logger.info("Pending proposal already exists; withholding post-activity plan_change")
+            parsed["plan_change"] = None
+            plan_change = None
+            parsed["feedback"] = (
+                parsed["feedback"].rstrip(".")
+                + ". (A plan change is warranted but another proposal is already pending — resolve that first.)"
+            )
         if plan_change:
             try:
                 set_pending_plan_proposal(

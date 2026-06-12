@@ -21,6 +21,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
+import sqlite3
 from datetime import timedelta
 from typing import Optional
 
@@ -40,6 +42,17 @@ _MAX_TOKENS = 8000
 
 def _always_ping() -> bool:
     return (os.getenv("COROS_CHECKIN_ALWAYS_PING") or "").lower() in ("1", "true")
+
+
+def _clean_text(val: str) -> str:
+    """COROS-derived free text (regex captures like load_comment and
+    hrv_evaluation accept arbitrary line content) feeds the LLM that drafts
+    plan changes and Telegram text — the same trust boundary
+    state_manager.render_readiness_block already enforces with this exact
+    charset/length clamp for the chat system prompt. Without it, a
+    hijacked/garbled COROS payload gets ~one line of instructions per field
+    per day into the plan-proposing prompt."""
+    return re.sub(r"[^A-Za-z0-9 .%/:-]", "", val)[:40]
 
 
 def _build_messages(state: StateManager) -> list[dict]:
@@ -91,8 +104,10 @@ def _build_messages(state: StateManager) -> list[dict]:
     # third-party-controlled free text) and fetched_at from the prompt rows:
     # the parsed columns carry the signal; raw would be a prompt-injection
     # surface feeding an LLM that drafts plan changes and Telegram text.
+    # The parsed TEXT columns are regex captures of the same third-party
+    # text, so they get the charset/length clamp too.
     readiness_rows = [
-        {k: v for k, v in row.items() if k not in ("raw", "fetched_at")}
+        {k: (_clean_text(v) if isinstance(v, str) else v) for k, v in row.items() if k not in ("raw", "fetched_at")}
         for row in state.get_daily_health(days=7, today=today)
     ]
 
@@ -163,6 +178,15 @@ def run_readiness_review(state: StateManager) -> Optional[str]:
         if parsed is None:
             return None
 
+        # LLMs in JSON mode occasionally emit booleans as strings. The
+        # string "false" is truthy: it would ping Telegram every night AND
+        # skip the quiet-night no-op resolution, accumulating the perpetual
+        # Pending rows that machinery exists to prevent. Normalize first.
+        concern = parsed.get("concern")
+        if isinstance(concern, str):
+            concern = concern.strip().lower() in ("true", "yes", "1")
+        parsed["concern"] = bool(concern)
+
         plan_change = parsed.get("plan_change")
         # Single-proposal-key collision guard: a pending post-activity (or
         # earlier readiness) proposal would be clobbered by stashing a new
@@ -188,6 +212,13 @@ def run_readiness_review(state: StateManager) -> Optional[str]:
                 proposed_change=parsed.get("plan_change"),
                 kind="readiness",
             )
+        except sqlite3.IntegrityError:
+            # The partial unique index (one readiness row per date) says
+            # another process wrote tonight's review between our dedup
+            # SELECT and this INSERT. That process owns the ping and the
+            # proposal — stand down entirely.
+            logger.info("Readiness review for %s inserted concurrently; standing down", today.isoformat())
+            return None
         except Exception as e:
             logger.error(f"Failed to persist readiness review: {e}")
 

@@ -88,6 +88,16 @@ class CorosToolError(RuntimeError):
     retry=retry_if_exception_type((httpx.TransportError, ConnectionError, TimeoutError, OSError)),
     reraise=True,
 )
+def _call_with_retries(name: str, arguments: dict, token: str) -> str:
+    """Transport-only retry scope. Token acquisition deliberately lives
+    OUTSIDE this function: requests.Timeout/ConnectionError subclass OSError,
+    so a refresh failure inside the retried scope would match the predicate
+    and re-present the consumed single-use refresh token (auth.py owns the
+    only safe refresh-retry policy), as well as multiplying refresh attempts
+    (inner tenacity x outer tenacity)."""
+    return asyncio.run(_call_tool_async(name, arguments, token))
+
+
 def call_tool_text(name: str, arguments: Optional[dict] = None) -> str:
     """Call one MCP tool and return its concatenated text content.
 
@@ -97,7 +107,7 @@ def call_tool_text(name: str, arguments: Optional[dict] = None) -> str:
     needs_auth rather than infra).
     """
     token = get_access_token()
-    return asyncio.run(_call_tool_async(name, arguments or {}, token))
+    return _call_with_retries(name, arguments or {}, token)
 
 
 def fetch_daily_bundle(days: int = 7, timezone: Optional[str] = None) -> dict[str, str]:

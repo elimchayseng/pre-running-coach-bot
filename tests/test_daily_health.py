@@ -183,12 +183,14 @@ class TestFullContextIntegration:
         assert "=== TRAINING LOAD TREND" not in blob
 
     def test_blocks_present_with_health_data(self, state):
-        from datetime import date as _date
+        from temporal_context import today_local
 
         self._seed_minimum(state)
-        # Seed with the real today: load_full_context's blocks use default
-        # windows anchored to date.today().
-        state.upsert_daily_health([_row(_date.today().isoformat())])
+        # Seed with today in USER_TIMEZONE: load_full_context's windows are
+        # anchored to today_local(), not date.today() — across a midnight
+        # boundary (e.g. UTC CI with a US timezone in the env) the system
+        # clock's date can fall one day AFTER the window and be excluded.
+        state.upsert_daily_health([_row(today_local().isoformat())])
         blob = state.load_full_context()
         assert "=== READINESS (COROS, last 7 days) ===" in blob
         assert "=== TRAINING LOAD TREND (last 4 weeks) ===" in blob
@@ -287,3 +289,55 @@ class TestRunNightlyPull:
         result = ingest.run_nightly_pull(state)
         assert any("querySleepData" in e for e in result["errors"])
         assert result["dates"]  # other tools still landed
+
+
+class TestBackfillDays:
+    def test_clamps_to_at_least_one_day(self, monkeypatch):
+        from coros import ingest
+
+        monkeypatch.setenv("COROS_BACKFILL_DAYS", "-3")
+        assert ingest._backfill_days() == 1
+        monkeypatch.setenv("COROS_BACKFILL_DAYS", "0")
+        assert ingest._backfill_days() == 1
+
+    def test_junk_falls_back_to_default(self, monkeypatch):
+        from coros import ingest
+
+        monkeypatch.setenv("COROS_BACKFILL_DAYS", "junk")
+        assert ingest._backfill_days() == ingest.DEFAULT_BACKFILL_DAYS
+
+
+class TestMetricFreshnessHelpers:
+    def test_latest_metric_date_ignores_raw_only_rows(self, state):
+        """Ingest's raw-insurance row (today's row carrying only the unparsed
+        bundle) must not count as fresh data — otherwise the staleness alert
+        and /health never notice a COROS format change."""
+        state.upsert_daily_health([_row("2026-06-09")])
+        state.upsert_daily_health([{"date": "2026-06-11", "raw": '{"t": "unparsed"}'}])
+        assert state.latest_metric_date() == "2026-06-09"
+
+    def test_latest_metric_date_none_without_metrics(self, state):
+        assert state.latest_metric_date() is None
+        state.upsert_daily_health([{"date": "2026-06-11", "raw": "{}"}])
+        assert state.latest_metric_date() is None
+
+    def test_has_daily_health_rows(self, state):
+        assert state.has_daily_health_rows() is False
+        state.upsert_daily_health([{"date": "2026-06-11", "raw": "{}"}])
+        assert state.has_daily_health_rows() is True
+
+
+class TestReadinessUniqueIndex:
+    def test_one_readiness_review_per_date(self, state):
+        """The 'once per night, DB-enforced' comment in coros/review.py is
+        only true because of this partial unique index."""
+        import sqlite3
+
+        state.save_review(None, None, TODAY, "first", kind="readiness")
+        with pytest.raises(sqlite3.IntegrityError):
+            state.save_review(None, None, TODAY, "second", kind="readiness")
+
+    def test_activity_reviews_not_constrained(self, state):
+        state.save_review(None, None, TODAY, "a")
+        state.save_review(None, None, TODAY, "b")  # duplicates fine for activity
+        state.save_review(None, None, TODAY, "r", kind="readiness")  # kinds coexist

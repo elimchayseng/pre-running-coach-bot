@@ -54,7 +54,12 @@ def set_pending_plan_proposal(payload: dict) -> None:
         _reset_redis()
         raise
     except Exception as e:
+        # Re-raise: swallowing here would return "success" for a proposal
+        # that was never stored — the user gets "Reply 'yes' to apply" for
+        # nothing. Both callers (strava/coros review) catch and degrade by
+        # stripping the proposal from the message.
         logger.error(f"Failed to set pending plan proposal: {e}")
+        raise
 
 
 @retry(

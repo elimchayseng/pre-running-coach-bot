@@ -22,7 +22,7 @@ DEFAULT_BACKFILL_DAYS = 4
 
 def _backfill_days() -> int:
     try:
-        return int(os.getenv("COROS_BACKFILL_DAYS", str(DEFAULT_BACKFILL_DAYS)))
+        return max(1, int(os.getenv("COROS_BACKFILL_DAYS", str(DEFAULT_BACKFILL_DAYS))))
     except ValueError:
         return DEFAULT_BACKFILL_DAYS
 

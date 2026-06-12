@@ -278,6 +278,73 @@ class TestGetAccessToken:
         assert auth._unsaved_blob is None
         auth._unsaved_blob = None  # leave no state for other tests
 
+    def test_oserror_write_failure_keeps_rotated_token_in_memory(self, file_backend, monkeypatch):
+        """The file backend (the default) raises raw OSError — disk full,
+        permissions, read-only fs — not TokenStorageUnavailable. The persist
+        safety net must catch it too, or the rotated single-use token dies
+        with the stack frame and the grant is permanently lost."""
+        auth._unsaved_blob = None
+        auth._write_blob(_blob(expires_in=10))
+        monkeypatch.setattr(
+            auth,
+            "_refresh_request",
+            lambda rt, cid: {"access_token": "at-2", "refresh_token": "rt-2", "expires_in": 2591999},
+        )
+
+        def _disk_full(blob):
+            raise OSError(28, "No space left on device")
+
+        monkeypatch.setattr(auth, "_write_blob", _disk_full)
+        assert auth.get_access_token() == "at-2"
+        assert auth._unsaved_blob["tokens"]["refresh_token"] == "rt-2"
+        auth._unsaved_blob = None  # leave no state for other tests
+
+    def test_persist_failure_survives_process_death_via_rescue_file(self, file_backend, monkeypatch):
+        """One-shot CLIs (`make coros-status-prod`) exit right after the
+        failed persist — the in-memory fallback dies with them. The rescue
+        file is the only thing standing between that and permanent lockout."""
+        import json as _json
+
+        auth._unsaved_blob = None
+        auth._write_blob(_blob(expires_in=10, refresh="rt-1"))
+        monkeypatch.setattr(
+            auth,
+            "_refresh_request",
+            lambda rt, cid: {"access_token": "at-2", "refresh_token": "rt-2", "expires_in": 2591999},
+        )
+        real_write = auth._write_blob
+        monkeypatch.setattr(auth, "_write_blob", lambda blob: (_ for _ in ()).throw(OSError("proxy reset")))
+        assert auth.get_access_token() == "at-2"
+        rescue = _json.loads(auth._rescue_path().read_text())
+        assert rescue["blob"]["tokens"]["refresh_token"] == "rt-2"
+        assert rescue["replaces_refresh_token"] == "rt-1"
+
+        # Process death: memory gone. Next process recovers from the rescue.
+        auth._unsaved_blob = None
+        monkeypatch.setattr(auth, "_write_blob", real_write)
+        monkeypatch.setattr(auth, "_refresh_request", lambda rt, cid: pytest.fail("must not refresh again"))
+        assert auth.get_access_token() == "at-2"
+        assert not auth._rescue_path().exists()  # flushed and cleared
+        assert auth._read_blob()["tokens"]["refresh_token"] == "rt-2"
+        auth._unsaved_blob = None
+
+    def test_stale_rescue_file_never_clobbers_newer_grant(self, file_backend, monkeypatch):
+        """If the user re-authed (or another rotation landed) after the
+        rescue was written, storage holds a LIVE grant the rescue must not
+        overwrite — adopting it would be a second lockout."""
+        import json as _json
+
+        auth._unsaved_blob = None
+        # Rescue from an old rotation: replaced rt-1 with rt-2.
+        auth._rescue_path().write_text(
+            _json.dumps({"replaces_refresh_token": "rt-1", "blob": _blob(refresh="rt-2")})
+        )
+        # Storage moved on: a re-auth wrote rt-3.
+        auth._write_blob(_blob(refresh="rt-3"))
+        assert auth.get_access_token() == "at-1"  # fresh token from storage
+        assert auth._read_blob()["tokens"]["refresh_token"] == "rt-3"  # untouched
+        assert not auth._rescue_path().exists()  # stale rescue discarded
+
     def test_register_client_failure_raises(self, monkeypatch):
         class _Resp:
             status_code = 400
@@ -324,6 +391,18 @@ class TestTokenNormalization:
         tokens = auth._tokens_from_response({"access_token": "a", "refresh_token": "r"})
         assert tokens["expires_at"] >= int(_time.time()) + auth.FALLBACK_EXPIRES_IN - 5
 
+    def test_fallback_token_is_fresh_immediately(self):
+        """Regression: with FALLBACK_EXPIRES_IN == REFRESH_LEEWAY_SECONDS the
+        fallback token was fresh for ZERO seconds (freshness is strict `>`),
+        so every call refreshed-and-rotated anyway — the exact amplifier the
+        floor exists to prevent. The fallback must comfortably exceed the
+        leeway."""
+        import time as _time
+
+        assert auth.FALLBACK_EXPIRES_IN > auth.REFRESH_LEEWAY_SECONDS
+        tokens = auth._tokens_from_response({"access_token": "a", "refresh_token": "r"})
+        assert auth._fresh_token(tokens, int(_time.time()))
+
 
 # ---------- health check ----------
 
@@ -355,7 +434,6 @@ class TestRunHealthChecksCorosGate:
         monkeypatch.delenv("COROS_TOKENS_BACKEND", raising=False)
         monkeypatch.setattr(auth, "TOKEN_FILE", tmp_path / "nope.json")
         monkeypatch.setattr(health, "check_redis_health", lambda: True, raising=False)
-        results = {}
         # Run only the COROS section semantics: call the real function but
         # stub the unrelated checks fast.
         import conversation_store
@@ -367,10 +445,10 @@ class TestRunHealthChecksCorosGate:
         monkeypatch.delenv("STRAVA_CLIENT_ID", raising=False)
         monkeypatch.delenv("CALENDAR_ID", raising=False)
         monkeypatch.delenv("NOTION_TOKEN", raising=False)
-        try:
-            results = health.run_health_checks()
-        except Exception:
-            pass
+        # No try/except: swallowing an exception here with results
+        # pre-initialized to {} made the assertion pass vacuously when
+        # run_health_checks crashed.
+        results = health.run_health_checks()
         assert "coros" not in results
 
     def test_false_when_configured_but_dead(self, monkeypatch, tmp_path):
@@ -391,3 +469,60 @@ class TestRunHealthChecksCorosGate:
         except Exception:
             results = {}
         assert results.get("coros") is False
+
+    def _stub_other_checks(self, monkeypatch):
+        import conversation_store
+
+        monkeypatch.setattr(conversation_store, "check_redis_health", lambda: True)
+        import config
+
+        monkeypatch.setattr(config, "llm_client", None)
+        monkeypatch.delenv("STRAVA_CLIENT_ID", raising=False)
+        monkeypatch.delenv("CALENDAR_ID", raising=False)
+        monkeypatch.delenv("NOTION_TOKEN", raising=False)
+
+    def _healthy_blob_and_tmp_db(self, monkeypatch, tmp_path):
+        from state_manager import StateManager
+
+        monkeypatch.setenv("COROS_TOKENS_BACKEND", "file")
+        monkeypatch.setattr(auth, "TOKEN_FILE", tmp_path / "tokens.json")
+        auth._write_blob(_blob())
+        monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "coach.db"))
+        return StateManager()
+
+    def test_true_when_metrics_fresh(self, monkeypatch, tmp_path):
+        import health
+        from temporal_context import today_local
+
+        self._stub_other_checks(monkeypatch)
+        state = self._healthy_blob_and_tmp_db(monkeypatch, tmp_path)
+        state.upsert_daily_health([{"date": today_local().isoformat(), "sleep_score": 80}])
+        assert health.run_health_checks().get("coros") is True
+
+    def test_true_when_table_empty_fresh_install(self, monkeypatch, tmp_path):
+        import health
+
+        self._stub_other_checks(monkeypatch)
+        self._healthy_blob_and_tmp_db(monkeypatch, tmp_path)  # creates empty DB
+        assert health.run_health_checks().get("coros") is True
+
+    def test_false_when_metrics_stale(self, monkeypatch, tmp_path):
+        """Token healthy but the pull silently stopped days ago — the
+        freshness branch is the only thing that surfaces this."""
+        import health
+
+        self._stub_other_checks(monkeypatch)
+        state = self._healthy_blob_and_tmp_db(monkeypatch, tmp_path)
+        state.upsert_daily_health([{"date": "2020-01-01", "sleep_score": 80}])
+        assert health.run_health_checks().get("coros") is False
+
+    def test_false_when_only_raw_rows_ever(self, monkeypatch, tmp_path):
+        """Raw-insurance rows alone (pull runs, nothing parses — a COROS
+        format change) must read as UNhealthy, not as a fresh install."""
+        import health
+        from temporal_context import today_local
+
+        self._stub_other_checks(monkeypatch)
+        state = self._healthy_blob_and_tmp_db(monkeypatch, tmp_path)
+        state.upsert_daily_health([{"date": today_local().isoformat(), "raw": "{}"}])
+        assert health.run_health_checks().get("coros") is False

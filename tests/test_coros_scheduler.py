@@ -105,12 +105,15 @@ class TestIsDue:
 
 
 class TestRun:
-    def test_infra_returns_exit_infra_no_alert(self, monkeypatch):
+    def test_infra_returns_exit_infra_no_auth_alert(self, monkeypatch):
         monkeypatch.setattr(scheduler, "classify_auth", lambda: ("infra", "redis down"))
         sent = []
         monkeypatch.setattr(scheduler, "_send_alert", lambda now: sent.append(1))
+        staleness = []
+        monkeypatch.setattr(scheduler, "_attempt_staleness_alert", lambda now: staleness.append(1))
         assert scheduler.run() == scheduler.EXIT_INFRA
-        assert sent == []
+        assert sent == []  # re-auth alert is wrong for infra failures...
+        assert staleness == [1]  # ...but the staleness path must be attempted
 
     def test_needs_auth_alerts_and_returns_code(self, monkeypatch):
         monkeypatch.setattr(scheduler, "classify_auth", lambda: ("needs_auth", "dead"))
@@ -119,15 +122,21 @@ class TestRun:
         assert scheduler.run() == scheduler.EXIT_NEEDS_AUTH
         assert sent == [1]
 
-    def test_ok_pulls_and_clears_alert(self, monkeypatch):
+    def test_ok_pulls_and_clears_alert(self, monkeypatch, fake_redis):
         monkeypatch.setattr(scheduler, "classify_auth", lambda: ("ok", ""))
         cleared = []
         monkeypatch.setattr(scheduler, "_clear_alert_state", lambda: cleared.append(1))
+        # MUST be stubbed: without it, run() hands the REAL repo StateManager
+        # to the readiness check-in — a real LLM call, a real Telegram ping,
+        # and a review row in the developer's live coach.db.
+        monkeypatch.setattr(scheduler, "_run_readiness_checkin", lambda state: None)
 
         from coros import ingest
 
         monkeypatch.setattr(
-            ingest, "run_nightly_pull", lambda state, dry_run=False: {"dates": ["d"], "fields_parsed": 5, "errors": []}
+            ingest,
+            "run_nightly_pull",
+            lambda state, dry_run=False: {"dates": ["d"], "fields_parsed": 5, "errors": [], "ok": True},
         )
         assert scheduler.run() == scheduler.EXIT_OK
         assert cleared == [1]
@@ -231,23 +240,37 @@ class TestRun:
 
         monkeypatch.setattr(notify, "send_telegram_text", lambda text, mirror=True: sent.append(text) or True)
 
+        from temporal_context import today_local
+
         class _FreshState:
-            def get_daily_health(self, days):
-                return [{"date": "2026-06-11"}]
+            def latest_metric_date(self):
+                return today_local().isoformat()
 
         class _StaleState:
-            def get_daily_health(self, days):
-                return []
+            def latest_metric_date(self):
+                return None
+
+        class _RawOnlyState:
+            # Rows exist (ingest's raw-insurance row) but no metric ever
+            # parsed — the format-change scenario the alert exists for.
+            # Mere row existence must NOT count as fresh.
+            def latest_metric_date(self):
+                return None
 
         scheduler._maybe_send_staleness_alert(_FreshState(), now=1000.0)
-        assert sent == []  # fresh data -> no alert
+        assert sent == []  # fresh metrics -> no alert
         scheduler._maybe_send_staleness_alert(_StaleState(), now=1000.0)
         assert len(sent) == 1 and "COROS pull has been failing" in sent[0]
+        # cooldown: a second stale state within the window stays quiet
+        scheduler._maybe_send_staleness_alert(_RawOnlyState(), now=1000.0)
+        assert len(sent) == 1
 
     def test_pull_crash_is_infra_not_auth(self, monkeypatch):
         monkeypatch.setattr(scheduler, "classify_auth", lambda: ("ok", ""))
         sent = []
         monkeypatch.setattr(scheduler, "_send_alert", lambda now: sent.append(1))
+        staleness = []
+        monkeypatch.setattr(scheduler, "_attempt_staleness_alert", lambda now: staleness.append(1))
 
         from coros import ingest
 
@@ -257,6 +280,9 @@ class TestRun:
         monkeypatch.setattr(ingest, "run_nightly_pull", _die)
         assert scheduler.run() == scheduler.EXIT_INFRA
         assert sent == []
+        # A persistent pull exception must not be logs-only: the staleness
+        # alert (data-freshness gated) is the Telegram signal for this mode.
+        assert staleness == [1]
 
 
 # ---------- gating ----------

@@ -73,14 +73,25 @@ def run_health_checks() -> dict[str, bool]:
             if results["coros"]:
                 # Freshness: a token can be valid while the nightly pull has
                 # been failing for days (non-auth breakage is otherwise
-                # invisible — exit codes only reach logs). A table with rows
-                # but none recent means the pull STOPPED; a fully empty
-                # table is a fresh install and stays healthy.
+                # invisible — exit codes only reach logs). Only PARSED
+                # metrics count as fresh: ingest's raw-insurance row is
+                # written even when zero fields parse, so mere row existence
+                # would mask a COROS format change forever. Rows but no
+                # metric ever = pulls run, nothing parses (unhealthy); a
+                # truly empty table is a fresh install and stays healthy.
+                from datetime import date, timedelta
+
                 from state_manager import StateManager
+                from temporal_context import today_local
 
                 state = StateManager()
-                if not state.get_daily_health(days=3) and state.get_daily_health(days=3650):
-                    logger.warning("COROS auth ok but no daily_health rows in 3 days")
+                latest = state.latest_metric_date()
+                if latest is None:
+                    if state.has_daily_health_rows():
+                        logger.warning("COROS auth ok but no daily_health row has ever parsed a metric")
+                        results["coros"] = False
+                elif date.fromisoformat(latest) < today_local() - timedelta(days=2):
+                    logger.warning("COROS auth ok but no parsed daily_health metrics in 3 days")
                     results["coros"] = False
         except Exception as e:
             logger.error(f"COROS health check failed: {e}")

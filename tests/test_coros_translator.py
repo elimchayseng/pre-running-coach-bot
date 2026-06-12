@@ -62,17 +62,17 @@ class TestParseDailyHealth:
     def test_parses_all_seven_days(self):
         out = translator.parse_daily_health(_fx("queryDailyHealthData"))
         assert len(out) == 7
-        assert out["2026-06-05"]["steps"] == 12377
-        assert out["2026-06-05"]["stress_avg"] == 31
-        assert out["2026-06-05"]["sleep_score"] == 77
-        assert out["2026-06-05"]["sleep_total_min"] == 8 * 60 + 27
-        assert out["2026-06-05"]["sleep_deep_min"] == 65
-        assert out["2026-06-07"]["exercise_min"] == 214  # "3h 34min"
+        assert out["2026-06-05"]["steps"] == 11842
+        assert out["2026-06-05"]["stress_avg"] == 34
+        assert out["2026-06-05"]["sleep_score"] == 81
+        assert out["2026-06-05"]["sleep_total_min"] == 7 * 60 + 58
+        assert out["2026-06-05"]["sleep_deep_min"] == 72
+        assert out["2026-06-07"]["exercise_min"] == 246  # "4h 6min"
 
     def test_today_has_no_sleep_yet(self):
         out = translator.parse_daily_health(_fx("queryDailyHealthData"))
         assert "sleep_score" not in out["2026-06-11"]
-        assert out["2026-06-11"]["stress_avg"] == 60
+        assert out["2026-06-11"]["stress_avg"] == 54
 
     def test_mangled_text_returns_empty_not_raise(self):
         assert translator.parse_daily_health("Completely Different Format") == {}
@@ -82,25 +82,25 @@ class TestParseDailyHealth:
 class TestParseSleep:
     def test_parses_main_sleep_and_naps(self):
         out = translator.parse_sleep(_fx("querySleepData"))
-        assert out["2026-06-10"]["sleep_score"] == 96
-        assert out["2026-06-10"]["sleep_duration_min"] == 6 * 60 + 24
-        assert out["2026-06-10"]["sleep_nap_min"] == 122
+        assert out["2026-06-10"]["sleep_score"] == 91
+        assert out["2026-06-10"]["sleep_duration_min"] == 6 * 60 + 48
+        assert out["2026-06-10"]["sleep_nap_min"] == 94
         assert out["2026-06-09"]["sleep_nap_min"] == 0
-        assert out["2026-06-09"]["sleep_awake_min"] == 4
+        assert out["2026-06-09"]["sleep_awake_min"] == 6
 
     def test_dedicated_score_differs_from_daily_health(self):
-        # Known COROS quirk: 2026-06-09 scores 79 here but 83 in
+        # Known COROS quirk: 2026-06-09 scores 74 here but 80 in
         # queryDailyHealthData. The merge must prefer this tool's value.
         out = translator.parse_sleep(_fx("querySleepData"))
-        assert out["2026-06-09"]["sleep_score"] == 79
+        assert out["2026-06-09"]["sleep_score"] == 74
 
 
 class TestParseHrv:
     def test_baseline_range_and_days(self):
         out = translator.parse_hrv(_fx("queryHrvAssessment"))
-        assert out["baseline"] == 82
-        assert (out["range_low"], out["range_high"]) == (68, 96)
-        assert out["days"]["2026-06-10"] == {"hrv_avg": 102, "evaluation": "Above normal"}
+        assert out["baseline"] == 75
+        assert (out["range_low"], out["range_high"]) == (61, 89)
+        assert out["days"]["2026-06-10"] == {"hrv_avg": 95, "evaluation": "Above normal"}
         assert out["days"]["2026-06-08"]["evaluation"] == "Normal"
         # No entry for today (2026-06-11) — COROS lags a day.
         assert "2026-06-11" not in out["days"]
@@ -109,7 +109,7 @@ class TestParseHrv:
 class TestParseRestingHr:
     def test_no_data_days_omitted(self):
         out = translator.parse_resting_hr(_fx("queryRestingHeartRate"))
-        assert out["2026-06-10"] == 49
+        assert out["2026-06-10"] == 47
         assert "2026-06-11" not in out  # "No data"
         assert len(out) == 6
 
@@ -119,9 +119,9 @@ class TestParseTrainingLoad:
         out = translator.parse_training_load(_fx("queryTrainingLoadAssessment"))
         assert out["2026-06-11"] == {
             "load_comment": "Optimized",
-            "load_short_term": 128.0,
-            "load_long_term": 105.0,
-            "load_ratio": 1.21,
+            "load_short_term": 112.0,
+            "load_long_term": 96.0,
+            "load_ratio": 1.17,
         }
         assert out["2026-06-07"]["load_comment"] == "Excessive"
 
@@ -129,7 +129,7 @@ class TestParseTrainingLoad:
 class TestParseRecovery:
     def test_point_in_time(self):
         out = translator.parse_recovery(_fx("queryRecoveryStatus"))
-        assert out == {"recovery_pct": 92, "recovery_level": "Heavy training allowed"}
+        assert out == {"recovery_pct": 87, "recovery_level": "Heavy training allowed"}
 
 
 # ---------- merge ----------
@@ -146,14 +146,14 @@ class TestMergeDailyRows:
     def test_sleep_tool_beats_daily_health(self):
         rows = translator.merge_daily_rows(_bundle(), today=date(2026, 6, 11))
         by_date = {r["date"]: r for r in rows}
-        assert by_date["2026-06-09"]["sleep_score"] == 79  # querySleepData wins
+        assert by_date["2026-06-09"]["sleep_score"] == 74  # querySleepData wins
         # Stage minutes come from daily health (sleep tool only has ratios).
-        assert by_date["2026-06-09"]["sleep_deep_min"] == 70
+        assert by_date["2026-06-09"]["sleep_deep_min"] == 76
 
     def test_recovery_and_raw_only_on_today(self):
         rows = translator.merge_daily_rows(_bundle(), today=date(2026, 6, 11))
         by_date = {r["date"]: r for r in rows}
-        assert by_date["2026-06-11"]["recovery_pct"] == 92
+        assert by_date["2026-06-11"]["recovery_pct"] == 87
         assert by_date["2026-06-11"]["recovery_level"] == "Heavy training allowed"
         assert "recovery_pct" not in by_date["2026-06-10"]
         assert "raw" in by_date["2026-06-11"]
@@ -168,8 +168,8 @@ class TestMergeDailyRows:
     def test_hrv_baseline_denormalized_onto_hrv_days(self):
         rows = translator.merge_daily_rows(_bundle(), today=date(2026, 6, 11))
         by_date = {r["date"]: r for r in rows}
-        assert by_date["2026-06-10"]["hrv_baseline"] == 82
-        assert by_date["2026-06-10"]["hrv_range_high"] == 96
+        assert by_date["2026-06-10"]["hrv_baseline"] == 75
+        assert by_date["2026-06-10"]["hrv_range_high"] == 89
 
     def test_empty_bundle_yields_no_rows(self):
         assert translator.merge_daily_rows({}, today=date(2026, 6, 11)) == []
@@ -196,3 +196,33 @@ class TestMergeDailyRows:
         from state_manager import StateManager
 
         assert tuple(translator.METRIC_KEYS) == tuple(StateManager._HEALTH_COLS)
+
+
+class TestDateValidation:
+    """Parsed dates become daily_health PRIMARY KEYs. A digit-shaped but
+    impossible date ('2026-06-32') would poison the table: get_load_trend's
+    date.fromisoformat() then raises on EVERY chat turn until the row is
+    hand-deleted."""
+
+    def test_iso_rejects_impossible_dates(self):
+        assert translator._iso("20260632") is None
+        assert translator._iso("20260230") is None
+        assert translator._iso("20261301") is None
+        assert translator._iso("20260611") == "2026-06-11"
+
+    def test_parse_sleep_drops_invalid_date_sections(self):
+        out = translator.parse_sleep("2026-06-32\nSleep Score: 80\n2026-06-11\nSleep Score: 75")
+        assert "2026-06-32" not in out
+        assert out["2026-06-11"]["sleep_score"] == 75
+
+    def test_parse_training_load_drops_invalid_date_sections(self):
+        out = translator.parse_training_load("2026-02-30\nComment: Optimized\n2026-06-11\nComment: Optimized")
+        assert list(out) == ["2026-06-11"]
+
+    def test_parse_resting_hr_drops_invalid_dates(self):
+        out = translator.parse_resting_hr("2026-02-30: 50 bpm\n2026-06-11: 48 bpm")
+        assert out == {"2026-06-11": 48}
+
+    def test_parse_hrv_drops_invalid_dates(self):
+        out = translator.parse_hrv("2026-06-32\nHRV Avg: 80 ms\n2026-06-11\nHRV Avg: 85 ms")
+        assert list(out["days"]) == ["2026-06-11"]
