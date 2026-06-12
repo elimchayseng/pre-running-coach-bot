@@ -9,10 +9,11 @@
 ## What PRE does for you
 
 - <img src="https://cdn.simpleicons.org/strava/FC4C02" height="14" alt="Strava" valign="middle" /> **Auto-logs every run from Strava** — pulls splits, laps, HR, elevation the moment an activity uploads.
+- ⌚ **Reads your wearable readiness from COROS** — a nightly pull over the official COROS MCP server lands sleep, HRV, resting HR, stress, recovery, and training load into the coach's context. Each night PRE checks tomorrow's prescription against tonight's vitals and proposes a change if your readiness contradicts it.
 - **Writes and adapts your training plan** — a Claude-powered coach drafts the week, adjusts when life intervenes.
 - **Reviews each workout** — a separate post-activity LLM pass critiques the session and can propose a plan change for you to approve on your next chat. Reviews are persisted, not ephemeral.
 - <img src="https://cdn.simpleicons.org/googlecalendar/4285F4" height="14" alt="Google Calendar" valign="middle" /> **Pushes workouts to your Google Calendar** — your week shows up on your phone alongside everything else, with full coaching notes in the event description.
-- <img src="https://cdn.simpleicons.org/notion/333333" height="14" alt="Notion" valign="middle" /> **Mirrors your training data into Notion** — sessions, journal entries, every plan change with before/after diffs, and every post-activity review land in four Notion databases under a single parent page. One-way, best-effort, fully optional.
+- <img src="https://cdn.simpleicons.org/notion/333333" height="14" alt="Notion" valign="middle" /> **Mirrors your training data into Notion** — sessions, journal entries, every plan change with before/after diffs, every post-activity review, and your daily wearable health metrics land in five Notion databases under a single parent page. One-way, best-effort, fully optional.
 - **Talks to you over Telegram** — chat naturally, or use slash commands like `/today`, `/race`, `/log`.
 - **Remembers your context** — PRs, pace and HR zones, injury history, strength routine, and a journal of sleep / stress / travel.
 
@@ -23,26 +24,30 @@ graph LR
   You((🏃 You))
   Telegram["💬 Telegram"]
   Strava["🟧 Strava"]
+  Coros["⌚ COROS<br/>(MCP)"]
   PRE["🧠 PRE<br/>(Claude coach)"]
   Profile["👤 About you<br/>• Goal races<br/>• PRs<br/>• Pace + HR zones<br/>• Injury history<br/>• Strength routine"]
   Log["📈 Your runs<br/>• Every session<br/>• Splits, laps, HR<br/>• 3-week trends"]
+  Readiness["💤 Readiness<br/>• Sleep / HRV / RHR<br/>• Stress / recovery<br/>• Training load"]
   Plan["📅 Your plan<br/>• This week's workouts<br/>• Pace targets<br/>• Coaching notes"]
   Journal["📝 Journal<br/>• Sleep / stress<br/>• Travel, illness<br/>• Decisions"]
   GCal["📆 Google Calendar"]
-  Notion["📓 Notion<br/>(4 mirror DBs)"]
+  Notion["📓 Notion<br/>(5 mirror DBs)"]
   You --> Telegram
   Telegram <--> PRE
   You -->|"upload run"| Strava
   Strava -->|"auto-logs +<br/>post-run review"| PRE
+  Coros -->|"nightly readiness pull"| PRE
   PRE --- Profile
   PRE --- Log
+  PRE --- Readiness
   PRE --- Plan
   PRE --- Journal
   PRE -->|"syncs weekly workouts"| GCal
-  PRE -->|"mirrors plan, sessions,<br/>changes, reviews"| Notion
+  PRE -->|"mirrors plan, sessions,<br/>changes, reviews, health"| Notion
 ```
 
-Everything PRE remembers lives in a single SQLite DB (`state/coach.db`, mounted on a Railway volume in prod). Strava feeds into PRE read-only; Google Calendar and Notion are written one-way out.
+Everything PRE remembers lives in a single SQLite DB (`state/coach.db`, mounted on a Railway volume in prod). Strava and COROS feed into PRE read-only; Google Calendar and Notion are written one-way out.
 
 ## How it works
 
@@ -61,21 +66,24 @@ Every turn the agent loads the full state (athlete profile, plan prose + this we
 
 Strava activity uploads run on a separate path: the webhook fetches the activity, deterministically translates it into a session row (reconciling it against the plan), fires a Telegram ping, and asynchronously runs a post-activity LLM review. The review is persisted to the `reviews` table and mirrored into Notion; any proposed plan change is also stashed in Redis for the next chat turn so the user can approve it.
 
-Short-term conversation history lives in Redis (~10 turns, 2-hour TTL). Long-term state lives in SQLite. The Notion mirror (when configured) reflects new writes into four Notion databases within a few seconds via daemon threads — see [Notion mirror](#notion-mirror) below.
+COROS runs on a third path, scheduled rather than event-driven: an in-process nightly scheduler pulls the day's wearable bundle over the official COROS MCP server, parses it into a `daily_health` row, and runs a readiness check-in — a single LLM pass comparing tomorrow's prescription against tonight's vitals. Like the post-activity review, it never auto-applies a plan change: it persists a `kind='readiness'` review and rides the same propose-and-confirm Redis flow. Tonight's sleep / HRV / recovery and the 4-week load trend also load into every chat turn's system prompt. See [COROS readiness integration](#coros-readiness-integration) below.
+
+Short-term conversation history lives in Redis (~10 turns, 2-hour TTL). Long-term state lives in SQLite. The Notion mirror (when configured) reflects new writes into five Notion databases within a few seconds via daemon threads — see [Notion mirror](#notion-mirror) below.
 
 ## Tech stack
 
 - **LLM**: Claude Sonnet 4.6 (default) via Heroku Inference, OpenAI-compatible client. Prompt-caching attempted via `cache_control` (falls back to plain string if the proxy rejects it).
-- **State**: single SQLite DB (`state/coach.db`) at schema v5. `athlete` round-trips via `ruamel.yaml`; plan lives as rows in `sessions` + prose in `plan_meta`.
+- **State**: single SQLite DB (`state/coach.db`) at schema v8. `athlete` round-trips via `ruamel.yaml`; plan lives as rows in `sessions` + prose in `plan_meta`; daily wearable metrics in `daily_health`.
 - **Session store**: Redis (single-user, single key, 2h TTL)
 - **Pending proposals**: Redis (`pending_plan_proposal`, 24h TTL) — surfaces in the next system prompt
+- **Schedulers**: in-process daemon threads — Google Calendar health sweep (6h) and COROS nightly readiness pull (`coros/scheduler.py`), both Railway-gated, both with Telegram watchdog alerts
 - **Interfaces**: Telegram webhook (`app.py` + `bot.py`), CLI (`main.py`), test harness (`scripts/test_agent.py`)
-- **External integrations**: Strava (webhook + REST), Google Calendar (REST, write-only), Notion (REST, write-only mirror to four databases — optional)
+- **External integrations**: Strava (webhook + REST), COROS (official MCP server, read-only, OAuth), Google Calendar (REST, write-only), Notion (REST, write-only mirror to five databases — optional)
 - **Deployment**: Railway via gunicorn (`Procfile`). DB schema migrations run from `gunicorn.conf.py:on_starting` before workers serve traffic.
 
 ## State
 
-All bot/agent state lives in a single SQLite database (`state/coach.db` locally, mounted on a Railway persistent volume in prod). Current schema: **v5**.
+All bot/agent state lives in a single SQLite database (`state/coach.db` locally, mounted on a Railway persistent volume in prod). Current schema: **v8**.
 
 | Table | Contents |
 |-------|----------|
@@ -84,17 +92,19 @@ All bot/agent state lives in a single SQLite database (`state/coach.db` locally,
 | `plan_changelog` | Append-only changelog of every plan write (note + timestamp). |
 | `athlete` | YAML text in `yaml_text` — identity, target races, PRs, pace + HR zones, preferences, injury history. Round-trip via ruamel. |
 | `journal` | Freeform timestamped entries. |
-| `reviews` | One row per post-activity LLM review — critique, optional `proposed_change` JSON, `status` (NULL = Pending). FK to `sessions(id)`. |
+| `reviews` | One row per LLM review — `kind` discriminates post-activity (`activity`, FK to `sessions(id)`) from the nightly COROS `readiness` check-in. Critique, optional `proposed_change` JSON, `status` (NULL = Pending). A partial unique index enforces one `readiness` review per date. |
+| `daily_health` | One row per day of COROS wearable metrics — sleep stages, HRV, resting HR, stress, steps, recovery, training load — keyed by local date. Raw MCP payload stored alongside the parsed columns as format-change insurance. |
 | `gcal_sync_state` | Per-event sync metadata for the Google Calendar integration. |
 
-Schema source of truth: [`state/schema.sql`](state/schema.sql). Full reference: [docs/state-schema.md](docs/state-schema.md). The Phase 1A cutover (v3 → v4) runs once on deploy from `gunicorn.conf.py:on_starting` via `scripts/cutover_to_unified_sessions.py`; later migrations (e.g. v4 → v5) are purely additive `CREATE TABLE IF NOT EXISTS` and land the next time `_ensure_schema` runs.
+Schema source of truth: [`state/schema.sql`](state/schema.sql). Full reference: [docs/state-schema.md](docs/state-schema.md). The Phase 1A cutover (v3 → v4) runs once on deploy from `gunicorn.conf.py:on_starting` via `scripts/cutover_to_unified_sessions.py`; later migrations are additive and land the next time `_ensure_schema` runs — `CREATE TABLE IF NOT EXISTS` for new tables (v6 `sessions.reflection`, v7 `daily_health`), and guarded `ALTER TABLE` for new columns (v8 `reviews.kind`).
 
 ### Inspecting state
 
 ```bash
 # Local
 sqlite3 state/coach.db 'SELECT date, status, type, prescribed_workout FROM sessions ORDER BY date DESC LIMIT 20'
-sqlite3 state/coach.db 'SELECT id, date, status FROM reviews ORDER BY id DESC LIMIT 10'
+sqlite3 state/coach.db 'SELECT id, date, kind, status FROM reviews ORDER BY id DESC LIMIT 10'
+sqlite3 state/coach.db 'SELECT date, sleep_score, hrv_avg, resting_hr, load_ratio FROM daily_health ORDER BY date DESC LIMIT 10'
 python scripts/state_dump.py log --since 2026-05-01     # completed-session actuals
 python scripts/state_dump.py plan_meta                  # plan prose
 python scripts/state_dump.py --all
@@ -118,7 +128,9 @@ sqlite3 /tmp/prod-coach.db
 - Heroku Inference API key (with access to `claude-sonnet-4-6` or `claude-opus-4-7`)
 - Telegram Bot token (for the Telegram interface)
 - *Optional:* Strava API app for auto-logging
+- *Optional:* a COROS account for nightly wearable readiness (no API key — OAuth via the official MCP server)
 - *Optional:* Google Cloud OAuth credentials for calendar sync
+- *Note:* the `mcp` Python SDK requires **Python ≥ 3.10** (the venv is built on 3.12); only the COROS integration needs it
 
 ## Installation
 
@@ -178,14 +190,28 @@ Singleton blobs (plan, athlete, journal) are upserted on every run so re-running
 | `CALENDAR_ID` | ID of your dedicated "PRE Training" calendar |
 | `GCAL_TOKENS_BACKEND` | `file` (default) or `redis` |
 
+**COROS readiness (optional)**
+
+| Var | Purpose |
+|-----|---------|
+| `COROS_TOKENS_BACKEND` | `file` (default, local — `.coros_tokens.json`) or `redis` (Railway — filesystem is ephemeral). Unset + no token file → COROS short-circuits silently. |
+| `COROS_MCP_URL` | MCP server endpoint. Defaults to the North America region (`https://mcpus.coros.com/mcp`); EU/CN have their own hosts. |
+| `COROS_OAUTH_ISSUER` | OAuth issuer root for metadata discovery. Defaults to match `COROS_MCP_URL`. |
+| `COROS_PULL_HOUR_LOCAL` | Hour (0–23, local `USER_TIMEZONE`) after which the nightly pull becomes due. Default `22`. |
+| `COROS_SCHEDULER_INTERVAL_MINUTES` | Watchdog tick interval. Default 30 (floored at 5). |
+| `COROS_BACKFILL_DAYS` | How many days each pull fetches (heals missed nights). Default 4, floored at 1. |
+| `COROS_CHECKIN_ALWAYS_PING` | `1` to Telegram the readiness assessment every night; default is quiet-night (ping only on a proposed change or flagged concern). |
+| `COROS_HEALTH_ALERT_COOLDOWN_HOURS` | Dedup window for re-auth / staleness watchdog alerts. Default 24. |
+| `DISABLE_COROS_SCHEDULER` | `1` to keep the in-process scheduler off even on Railway. |
+
 **Notion mirror (optional)**
 
 | Var | Purpose |
 |-----|---------|
 | `NOTION_TOKEN` | Integration token from <https://app.notion.com/developers> (Read/Insert/Update content capabilities). Unset → mirror short-circuits silently. |
-| `NOTION_PARENT_PAGE_ID` | Page id (32-char hex) of the parent page that holds the four mirror databases. Connect your integration to it. |
+| `NOTION_PARENT_PAGE_ID` | Page id (32-char hex) of the parent page that holds the five mirror databases. Connect your integration to it. |
 | `NOTION_API_VERSION` | Pinned to `2026-03-11` by default. |
-| `NOTION_SESSIONS_DS_ID` / `NOTION_JOURNAL_DS_ID` / `NOTION_PLAN_CHANGES_DS_ID` / `NOTION_REVIEWS_DS_ID` | Data-source ids printed by `scripts/notion_bootstrap.py`. Each gates its DB independently — a partially-configured workspace mirrors just what's wired. |
+| `NOTION_SESSIONS_DS_ID` / `NOTION_JOURNAL_DS_ID` / `NOTION_PLAN_CHANGES_DS_ID` / `NOTION_REVIEWS_DS_ID` / `NOTION_HEALTH_DS_ID` | Data-source ids printed by `scripts/notion_bootstrap.py`. Each gates its DB independently — a partially-configured workspace mirrors just what's wired. |
 | `WORKER_BRIDGE_SECRET` | Shared secret for the Notion-Workers reflection bridge (`PUT /sessions/<id>/reflection`). Same value lives in Railway env **and** in the Worker's `ntn workers env`. Unset → bridge endpoint refuses every request. See [docs/notion-workers-architecture.md](docs/notion-workers-architecture.md). |
 
 ## Usage
@@ -292,32 +318,63 @@ To back out the integration entirely:
 ./venv/bin/python scripts/google_calendar_setup.py purge --yes
 ```
 
+## COROS readiness integration
+
+PRE reads your wearable readiness from COROS through the **official COROS MCP server** — no unofficial API, no scraping. A one-time browser OAuth produces a refresh token; production then runs fully headless.
+
+**What it pulls.** A nightly bundle of six read-only MCP tools — `queryDailyHealthData`, `querySleepData`, `queryHrvAssessment`, `queryRestingHeartRate`, `queryTrainingLoadAssessment`, `queryRecoveryStatus`. The MCP returns human-readable text; `coros/translator.py` parses each tool deterministically (fixture-tested against captured real outputs) into one `daily_health` row per date, storing the raw payload alongside as format-change insurance.
+
+**The nightly loop.** An in-process scheduler (`coros/scheduler.py`, daemon thread, Railway-gated like the calendar watchdog) wakes on an interval, and once past `COROS_PULL_HOUR_LOCAL` runs one pass: classify auth → pull the bundle → upsert `daily_health` → run a **readiness check-in**. The check-in is a single LLM pass (`coros/review.py`) comparing tomorrow's prescription against tonight's vitals and the 4-week load trend. It never auto-applies a change — it persists a `kind='readiness'` review and, if it proposes a plan edit, stashes it in the same `pending_plan_proposal` Redis flow the post-activity review uses, for you to approve on your next chat. Quiet-night by default: no Telegram ping unless it proposes a change or flags a concern.
+
+**In the coach's context.** Every chat turn loads a `=== READINESS (COROS, last 7 days) ===` block (sleep / HRV / RHR / stress / load ratio table) and a `=== TRAINING LOAD TREND (last 4 weeks) ===` block into the system prompt, so the coach reasons over readiness on every turn, not just at night.
+
+**Resilience.** COROS rotates its refresh token on every refresh, so `coros/auth.py` persists the rotated token before returning the access token, serializes refreshes under a lock, and keeps in-memory + on-disk rescue copies if a persist fails (a one-shot CLI must never take the only copy of the grant down with it). The watchdog raises separate Telegram alerts for dead auth ("re-auth needed") vs stale data ("pull failing"), and `/health` gains a passive COROS gate (token-blob shape + parsed-metric freshness — a token can be valid while the pull has silently stopped).
+
+**One-time setup:**
+
+```bash
+./venv/bin/python scripts/coros_setup.py auth      # browser OAuth (loopback on :8766), persists tokens + client_id
+./venv/bin/python scripts/coros_setup.py status    # verify tokens + a live queryUserInfo round-trip
+./venv/bin/python scripts/coros_setup.py pull --dry-run   # fetch + parse a bundle without writing
+./venv/bin/python scripts/coros_setup.py pull      # one manual nightly pull
+```
+
+On Railway, set `COROS_TOKENS_BACKEND=redis` and re-auth against prod with one command:
+
+```bash
+make coros-reauth-prod     # OAuth against prod Redis over the public proxy
+make coros-status-prod     # classify prod auth + a live round-trip
+```
+
+Spike findings, OAuth quirks, and per-tool parsing notes: [docs/coros-mcp.md](docs/coros-mcp.md).
+
 ## Notion mirror
 
-PRE mirrors its state into four Notion databases so you can see your training in the same workspace you already use for everything else. SQLite stays the **source of truth**; the mirror is one-way, best-effort, and fully optional — without `NOTION_TOKEN`, the bot behaves exactly as before.
+PRE mirrors its state into five Notion databases so you can see your training in the same workspace you already use for everything else. SQLite stays the **source of truth**; the mirror is one-way, best-effort, and fully optional — without `NOTION_TOKEN`, the bot behaves exactly as before.
 
-**The four databases (all under a single parent page):**
+**The five databases (all under a single parent page):**
 
 | DB | Source | Page body |
 |---|---|---|
 | **PRE Sessions** | every `sessions` row, `sid:{id}` | coaching detail + notes / laps / splits |
 | **PRE Journal** | every journal entry, `jid:{title}` | the entry text |
 | **PRE Plan Changes** | every changelog entry, `cid:{timestamp}` | `## Before` / `## After` fenced markdown of the affected row(s) — flips to `## Prescribed` / `## Actuals` when the change is a Strava completion |
-| **PRE Reviews** | every post-activity review, `rid:{id}` | `## Critique` + `## Proposed change` (summary as quote, proposed new plan fenced as markdown, italic reason). `Session` property relates back to the matching Sessions page. |
+| **PRE Reviews** | every review, `rid:{id}` | `## Critique` + `## Proposed change` (summary as quote, proposed new plan fenced as markdown, italic reason). A `Kind` property tags `activity` vs `readiness`; for activity reviews the `Session` property relates back to the matching Sessions page. |
+| **PRE Health** | every `daily_health` row, `hid:{date}` | the day's COROS wearable metrics — sleep stages, HRV vs baseline, resting HR, stress, recovery, training load — as page properties |
 
-**How it works.** Every SQLite write (session reconcile, plan edit, journal append, post-activity review) ends with a daemon-thread fire-and-forget call into `notion/mirror.py`. The mirror queries the target Notion database by a hidden `source_key` property — hit → patch, miss → insert — so re-running the seed or remirroring the same row never duplicates. A module-level lock serializes the query-then-insert path so two threads can't race into a duplicate page. Failures (auth, rate-limit, network) log a warning and are dropped; nothing on the user-facing path waits for Notion.
+**How it works.** Every SQLite write (session reconcile, plan edit, journal append, review, nightly health pull) ends with a daemon-thread fire-and-forget call into `notion/mirror.py`. The mirror queries the target Notion database by a hidden `source_key` property — hit → patch, miss → insert — so re-running the seed or remirroring the same row never duplicates. A module-level lock serializes the query-then-insert path so two threads can't race into a duplicate page. Failures (auth, rate-limit, network) log a warning and are dropped; nothing on the user-facing path waits for Notion.
 
 **One-time setup:**
 
 1. Create an internal integration at <https://app.notion.com/developers>. Enable **Read content**, **Insert content**, **Update content**. Copy the secret into `.env` as `NOTION_TOKEN`.
 2. Create a Notion page to be the parent (e.g. `PRE Training`). On that page: `••• → Connections → connect` your integration. Copy the 32-char page id from the URL into `.env` as `NOTION_PARENT_PAGE_ID`.
-3. Bootstrap the four databases (idempotent — safe to re-run):
+3. Bootstrap the five databases (idempotent — safe to re-run):
 
 ```bash
 ./venv/bin/python scripts/notion_bootstrap.py
 ```
 
-   Paste the printed `NOTION_*_DB_ID` / `NOTION_*_DS_ID` lines into `.env`.
+   Paste the printed `NOTION_*_DB_ID` / `NOTION_*_DS_ID` lines into `.env`. Re-running also patches missing properties onto existing databases (e.g. the `Kind` property added to PRE Reviews) — **run it once after upgrading** an already-bootstrapped workspace, or the Reviews mirror silently drops every write until the property exists.
 
 4. Backfill from SQLite (idempotent via `source_key`):
 
@@ -371,7 +428,7 @@ Deploy to Railway with the included `Procfile`:
 3. Add environment variables from `.env.example`
 4. **Mount a persistent volume at `/app/data`** (Settings → Volumes → New Volume). 1 GB is plenty. This is where `coach.db` lives — without it, every deploy wipes your logs, plan edits, and athlete profile.
 5. Set `DATABASE_PATH=/app/data/coach.db` in the Railway env.
-6. Set `STRAVA_TOKENS_BACKEND=redis` and `GCAL_TOKENS_BACKEND=redis` (the filesystem outside the volume is ephemeral).
+6. Set `STRAVA_TOKENS_BACKEND=redis`, `GCAL_TOKENS_BACKEND=redis`, and `COROS_TOKENS_BACKEND=redis` (the filesystem outside the volume is ephemeral). The COROS nightly scheduler and the calendar watchdog both auto-enable on Railway (gated on `RAILWAY_ENVIRONMENT` + `TELEGRAM_BOT_TOKEN`); set `DISABLE_COROS_SCHEDULER=1` to keep COROS off. After deploy, run `make coros-reauth-prod` once to seed the prod token, and re-run `scripts/notion_bootstrap.py` if you already had a Notion workspace (to add the new PRE Health DB + `Kind` property).
 7. After the first deploy with the volume attached, seed the DB once:
 
 ```bash
@@ -402,9 +459,9 @@ python scripts/migrate_state_to_sqlite.py /app/state --db /app/data/coach.db --r
 ├── plan_markdown.py                    Plan-blob parsers + week-table renderer
 ├── temporal_context.py                 Timezone-aware now/today + race resolution
 ├── conversation_store.py               Redis short-term history
-├── pending_proposal_store.py           Redis stash for post-activity plan proposals
+├── pending_proposal_store.py           Redis stash for plan proposals (post-activity + readiness)
 ├── config.py                           LLM client, env validation, PRE_PERSONALITY
-├── health.py                           Health checks + slash command list
+├── health.py                           Health checks (Redis, LLM, COROS gate) + slash command list
 ├── gunicorn.conf.py                    on_starting hook: runs the cutover before workers serve
 ├── tools/                              Tool schemas + handlers
 │   ├── state.py                        log_session, update_workout, replace_week_table,
@@ -414,10 +471,17 @@ python scripts/migrate_state_to_sqlite.py /app/state --db /app/data/coach.db --r
 │   └── calendar.py                     sync_plan_to_calendar, get_calendar_status
 ├── notion/                             Notion mirror (Phase 1B)
 │   ├── client.py                       Thin requests wrapper pinned to Notion-Version 2026-03-11
-│   ├── schema.py                       Four DB property schemas + source_key helpers
+│   ├── schema.py                       Five DB property schemas + source_key helpers
 │   ├── markdown.py                     render_session_body / render_change_body / render_review_body
 │   ├── entries.py                      Parsers for journal + plan_changelog singletons
 │   └── mirror.py                       Upserts + fire-and-forget daemon threads
+├── coros/                              COROS MCP readiness (read-only)
+│   ├── auth.py                         OAuth + headless refresh-token rotation + rescue
+│   ├── client.py                       MCP transport: tool calls, bundle assembly
+│   ├── translator.py                   Tool-text parsers → daily_health rows
+│   ├── ingest.py                       Nightly pull orchestration (fetch → merge → upsert)
+│   ├── scheduler.py                    In-process nightly scheduler + watchdog + alerts
+│   └── review.py                       Nightly readiness check-in (one LLM pass)
 ├── strava/                             OAuth, REST client, webhook handler,
 │                                       translator (activity → session row),
 │                                       post-activity LLM review (persists to `reviews`)
@@ -427,16 +491,17 @@ python scripts/migrate_state_to_sqlite.py /app/state --db /app/data/coach.db --r
 │   ├── strava_setup.py                 OAuth + webhook subscription mgmt
 │   ├── strava_backfill.py              Import historical activities
 │   ├── google_calendar_setup.py        OAuth + sync/purge ops
+│   ├── coros_setup.py                  COROS OAuth + status + manual pull
 │   ├── cutover_to_unified_sessions.py  Phase 1A.2 schema cutover (idempotent)
-│   ├── notion_bootstrap.py             Find-or-create the four mirror DBs
+│   ├── notion_bootstrap.py             Find-or-create the five mirror DBs (+ patch new props)
 │   └── notion_seed.py                  Backfill SQLite → Notion (idempotent)
 ├── docs/                               Schema reference, audit notes
-└── tests/                              pytest (~440)
+└── tests/                              pytest (~800)
 ```
 
 ## What's next
 
-Phase 1 (the SQLite cutover + the four-database one-way Notion mirror) is complete. Three contained follow-ups are filed as issues for next-day work: [#26](https://github.com/elimchayseng/pre-running-coach-bot/issues/26) (auto-sync plan edits to Google Calendar), [#33](https://github.com/elimchayseng/pre-running-coach-bot/issues/33) (auto-resolve reviews when a proposal is applied), and [#34](https://github.com/elimchayseng/pre-running-coach-bot/issues/34) (custom Notion views — calendar, board, smart filters).
+Phase 1 (the SQLite cutover + the five-database one-way Notion mirror) is complete, and COROS wearable readiness now feeds the coach nightly. Three contained follow-ups are filed as issues for next-day work: [#26](https://github.com/elimchayseng/pre-running-coach-bot/issues/26) (auto-sync plan edits to Google Calendar), [#33](https://github.com/elimchayseng/pre-running-coach-bot/issues/33) (auto-resolve reviews when a proposal is applied), and [#34](https://github.com/elimchayseng/pre-running-coach-bot/issues/34) (custom Notion views — calendar, board, smart filters).
 
 The longer-arc direction for the Notion integration:
 

@@ -9,23 +9,24 @@ State lives in a single SQLite database (`$DATABASE_PATH`, default `state/coach.
 
 ---
 
-## Table index (schema v5)
+## Table index (schema v8)
 
 | Table | Format | Writer | Reader(s) |
 |---|---|---|---|
 | `athlete` | YAML text in `yaml_text` column (round-trip via ruamel) | `tools.state.update_athlete` | `StateManager.load_athlete`, all tools |
-| `sessions` | **Unified plan-as-rows.** One row per workout in a lifecycle state — `planned` / `completed` / `missed` / `off-plan`. `prescribed_workout`, `prescribed_pace`, `prescribed_notes`, `detail_md` carry what the plan asked for; `data` JSON carries the actuals once the workout is logged. `UNIQUE(date, slot)` keeps one prescription per slot; partial UNIQUE index on `details.strava_id` enforces webhook idempotency. | `StateManager.update_plan` / `update_workout` / `replace_week_table` / `reconcile_strava_activity` / `update_session_by_strava_id` | `get_workout_row`, `get_todays_workout`, `get_prescription_rows`, `get_recent_sessions`, `get_sessions_in_range`, `existing_strava_ids`; `google_calendar.sync`; `notion.mirror` |
+| `sessions` | **Unified plan-as-rows.** One row per workout in a lifecycle state — `planned` / `completed` / `missed` / `off-plan`. `prescribed_workout`, `prescribed_pace`, `prescribed_notes`, `detail_md` carry what the plan asked for; `data` JSON carries the actuals once the workout is logged. `reflection` (v6) holds an athlete-authored post-run note synced back from Notion. `UNIQUE(date, slot)` keeps one prescription per slot; partial UNIQUE index on `details.strava_id` enforces webhook idempotency. | `StateManager.update_plan` / `update_workout` / `replace_week_table` / `reconcile_strava_activity` / `update_session_by_strava_id` | `get_workout_row`, `get_todays_workout`, `get_prescription_rows`, `get_recent_sessions`, `get_sessions_in_range`, `existing_strava_ids`; `google_calendar.sync`; `notion.mirror` |
 | `plan_meta` | Singleton row holding plan prose (phases, goal, pace zones, adjustment triggers) — the non-row remainder of the legacy plan.md. | `StateManager.update_plan_meta` (also written by `update_plan`) | `get_plan_meta`, `render_plan` (system prompt) |
 | `plan_changelog` | Singleton row holding append-only changelog (one line per write). | `StateManager._append_changelog` (called by every plan writer) | Read by humans / agent on demand; not parsed |
 | `journal` | Singleton row holding markdown text; timestamped sections separated by `\n---\n`. | `StateManager.append_journal` | `StateManager.load_journal` (last N entries); `notion.entries.parse_journal_entries` for the mirror |
-| `reviews` | One row per post-activity LLM review — `session_id` (FK), `strava_id`, `date`, `critique`, `proposed_change` (JSON), `status` (NULL = Pending; `approved`/`rejected`/`expired`/`no-op` on resolution), `resolved_at`. | `StateManager.save_review` (via `strava.review.run_post_activity_review`) | `get_reviews_in_range`, `get_all_reviews`; `notion.mirror.mirror_review` |
+| `reviews` | One row per LLM review. `kind` (v8) discriminates `activity` (post-activity, FK to `sessions(id)` via `session_id`/`strava_id`) from `readiness` (nightly COROS check-in, no session link). `date`, `critique`, `proposed_change` (JSON), `status` (NULL = Pending; `approved`/`rejected`/`expired`/`no-op` on resolution), `resolved_at`. Partial unique index `idx_reviews_readiness_per_date` enforces one `readiness` row per date. | `StateManager.save_review` (via `strava.review.run_post_activity_review` and `coros.review.run_readiness_review`) | `get_reviews_in_range`, `get_all_reviews`; `notion.mirror.mirror_review` |
+| `daily_health` | One row per day (PK = local ISO date) of COROS wearable metrics — sleep stages, HRV vs baseline, resting HR, stress, steps, recovery, training load. Parsed columns plus the `raw` MCP payload as format-change insurance. Upserts COALESCE so a backfill re-pull never erases a previously captured value. | `StateManager.upsert_daily_health` (via `coros.ingest.run_nightly_pull`) | `get_daily_health`, `get_load_trend`, `latest_metric_date`, `has_daily_health_rows`, `render_readiness_block`; `notion.mirror.mirror_health` |
 | `gcal_sync_state` | One row per gcal `event_id` with `hash`, `last_synced_at`, `completed`, `last_completed_at`, `off_plan`. | `google_calendar.sync.sync_plan` / `mark_complete` (via `StateManager.save_gcal_sync_state`) | `google_calendar.sync.reconcile_completion`, `get_last_sync_summary` |
 
 Schema source of truth: [`state/schema.sql`](../state/schema.sql). Schema version is tracked in `schema_version`.
 
-**Migrations.** v3 → v4 is the Phase 1A cutover (plan blob → unified `sessions` rows) — runs once via `scripts/cutover_to_unified_sessions.py`, invoked from `gunicorn.conf.py:on_starting` before workers serve traffic. v4 → v5 (adds `reviews`) is purely additive and lands the next time `_ensure_schema` re-runs `schema.sql`. The legacy `state/*.{md,yaml,jsonl,json}` files in the repo are pre-cutover migration seeds for first-time setup; once the DB is populated they aren't read at runtime.
+**Migrations.** v3 → v4 is the Phase 1A cutover (plan blob → unified `sessions` rows) — runs once via `scripts/cutover_to_unified_sessions.py`, invoked from `gunicorn.conf.py:on_starting` before workers serve traffic. Later migrations are additive and land the next time `_ensure_schema` runs: v4 → v5 adds `reviews` and v7 adds `daily_health` (both `CREATE TABLE IF NOT EXISTS` in `schema.sql`); v6 (`sessions.reflection`) and v8 (`reviews.kind` + the readiness partial unique index) come in as guarded `ALTER TABLE` / `CREATE INDEX` statements in `_ensure_schema` (a `PRAGMA table_info` check, with the `ALTER` wrapped to tolerate a cross-process "duplicate column" race). The legacy `state/*.{md,yaml,jsonl,json}` files in the repo are pre-cutover migration seeds for first-time setup; once the DB is populated they aren't read at runtime.
 
-**Notion mirror.** Every write into `sessions`, `journal`, `plan_changelog`, or `reviews` fires a daemon-thread upsert into the matching Notion database (when `NOTION_TOKEN` is configured). SQLite stays authoritative; the mirror is one-way and best-effort. See [README.md → Notion mirror](../README.md#notion-mirror) and `notion/mirror.py`.
+**Notion mirror.** Every write into `sessions`, `journal`, `plan_changelog`, `reviews`, or `daily_health` fires a daemon-thread upsert into the matching Notion database (when `NOTION_TOKEN` is configured). SQLite stays authoritative; the mirror is one-way and best-effort. See [README.md → Notion mirror](../README.md#notion-mirror) and `notion/mirror.py`.
 
 ---
 
@@ -260,6 +261,39 @@ Append-only freeform notes. Newest entries at the bottom.
 
 ---
 
+## `daily_health` (COROS wearable metrics)
+
+One row per day, primary-keyed by local ISO date (`USER_TIMEZONE`). Written by `StateManager.upsert_daily_health`, fed by `coros.ingest.run_nightly_pull` → `coros.translator.merge_daily_rows`. The upsert is per-column COALESCE: a re-pull of the same date never erases a value captured on the original night (e.g. the point-in-time recovery snapshot, which `queryRecoveryStatus` only reports for "now").
+
+Every parsed column is nullable. A COROS output-format change degrades to NULL columns rather than an exception — and because the `raw` payload is always stored, a fully unparsed pull still lands a row for recovery. Freshness checks therefore count only rows with at least one non-NULL **parsed** metric (`latest_metric_date`), never mere row existence, so a raw-only "insurance" row can't mask a silently broken pull.
+
+| Column | Type | Source tool | Notes |
+|---|---|---|---|
+| `date` | TEXT (PK) | — | Local ISO date. |
+| `sleep_score` | INTEGER | querySleepData / queryDailyHealthData | Dedicated sleep tool wins on conflict. |
+| `sleep_duration_min` | INTEGER | querySleepData | Main sleep, **excludes** naps. |
+| `sleep_nap_min` | INTEGER | querySleepData | |
+| `sleep_deep_min` / `sleep_light_min` / `sleep_rem_min` / `sleep_awake_min` | INTEGER | queryDailyHealthData | Minute-granular stages. |
+| `hrv_avg` | INTEGER | queryHrvAssessment | Lags a day — no entry for "today". |
+| `hrv_baseline` / `hrv_range_low` / `hrv_range_high` | INTEGER | queryHrvAssessment | Rolling baseline + normal band. |
+| `hrv_evaluation` | TEXT | queryHrvAssessment | e.g. `Above normal` / `Normal`. |
+| `resting_hr` | INTEGER | queryRestingHeartRate | `No data` until tomorrow for the current day. |
+| `stress_avg` | INTEGER | queryStressLevel | Per-bucket breakdown is currently all `No data`. |
+| `steps` | INTEGER | queryDailyHealthData | |
+| `exercise_min` | INTEGER | queryDailyHealthData | |
+| `recovery_pct` | INTEGER | queryRecoveryStatus | Point-in-time only; today's row only. |
+| `recovery_level` | TEXT | queryRecoveryStatus | e.g. `Heavy training allowed`. |
+| `load_short_term` / `load_long_term` / `load_ratio` | REAL | queryTrainingLoadAssessment | |
+| `load_comment` | TEXT | queryTrainingLoadAssessment | e.g. `Optimized` / `Excessive`. |
+| `raw` | TEXT | — | JSON of the full tool bundle; today's row only. Format-change insurance. |
+| `fetched_at` | TEXT | — | `datetime('now')` at write. |
+
+**Readiness in the system prompt.** `render_readiness_block(days=7)` renders a sleep / HRV / RHR / stress / load-ratio table and `_render_load_trend_block(weeks=4)` aggregates `get_load_trend` into a per-ISO-week training-load arc. Both are injected into every chat turn by `load_full_context` as `=== READINESS (COROS, last 7 days) ===` / `=== TRAINING LOAD TREND (last 4 weeks) ===`. Free-text columns (`load_comment`, `hrv_evaluation`, `recovery_level`) are charset/length-clamped before they reach the prompt — they're third-party-controlled text crossing into an LLM trust boundary.
+
+**Date safety.** Parsed dates are validated against the real calendar (`coros.translator._real_iso`) before becoming primary keys — a digit-shaped but impossible date like `2026-06-32` is dropped rather than poisoning the table (a bad PK would crash `date.fromisoformat` in `get_load_trend` on every chat turn).
+
+---
+
 
 ## Schema evolution guidelines
 
@@ -275,4 +309,5 @@ When state shapes drift in production:
 - `python scripts/state_dump.py log` to inspect recent sessions (or `--all` for everything).
 - `sqlite3 state/coach.db 'SELECT id, date, type, json_valid(data) FROM sessions WHERE NOT json_valid(data)'` to find any malformed JSON in `sessions.data` (should always be 0 — the writers go through `json.dumps`).
 - `python -c "from state_manager import StateManager; print(StateManager().load_athlete())"` to verify athlete YAML parses.
-- `python scripts/strava_setup.py status` for the live token + API health.
+- `python scripts/strava_setup.py status` for the live Strava token + API health.
+- `python scripts/coros_setup.py status` for the live COROS token + a `queryUserInfo` round-trip; `python scripts/coros_setup.py pull --dry-run` to fetch + parse a bundle without writing.
