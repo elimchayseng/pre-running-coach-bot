@@ -157,6 +157,46 @@ class TestRun:
         assert scheduler.run() == scheduler.EXIT_NEEDS_AUTH
         assert sent == [1]
 
+    def test_successful_pull_triggers_readiness_checkin(self, monkeypatch):
+        monkeypatch.setattr(scheduler, "classify_auth", lambda: ("ok", ""))
+        from coros import ingest
+
+        monkeypatch.setattr(
+            ingest, "run_nightly_pull", lambda state, dry_run=False: {"dates": ["d"], "fields_parsed": 5, "errors": []}
+        )
+        called = []
+        monkeypatch.setattr(scheduler, "_run_readiness_checkin", lambda state: called.append(1))
+        assert scheduler.run() == scheduler.EXIT_OK
+        assert called == [1]
+
+    def test_dry_run_skips_readiness_checkin(self, monkeypatch):
+        monkeypatch.setattr(scheduler, "classify_auth", lambda: ("ok", ""))
+        from coros import ingest
+
+        monkeypatch.setattr(
+            ingest, "run_nightly_pull", lambda state, dry_run=False: {"dates": ["d"], "fields_parsed": 5, "errors": []}
+        )
+        called = []
+        monkeypatch.setattr(scheduler, "_run_readiness_checkin", lambda state: called.append(1))
+        assert scheduler.run(dry_run=True) == scheduler.EXIT_OK
+        assert called == []
+
+    def test_readiness_checkin_failure_does_not_fail_pass(self, monkeypatch):
+        monkeypatch.setattr(scheduler, "classify_auth", lambda: ("ok", ""))
+        from coros import ingest
+
+        monkeypatch.setattr(
+            ingest, "run_nightly_pull", lambda state, dry_run=False: {"dates": ["d"], "fields_parsed": 5, "errors": []}
+        )
+
+        def _explode(state):
+            raise RuntimeError("llm down")
+
+        from coros import review as coros_review
+
+        monkeypatch.setattr(coros_review, "run_readiness_review", _explode)
+        assert scheduler.run() == scheduler.EXIT_OK
+
     def test_pull_crash_is_infra_not_auth(self, monkeypatch):
         monkeypatch.setattr(scheduler, "classify_auth", lambda: ("ok", ""))
         sent = []

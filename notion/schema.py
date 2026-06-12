@@ -121,12 +121,14 @@ def plan_changes_properties(sessions_data_source_id: str) -> dict:
 
 
 def reviews_properties(sessions_data_source_id: str) -> dict:
-    """Reviews — one row per post-activity review. Relates to Sessions."""
+    """Reviews — one row per review (post-activity or nightly readiness
+    check-in, discriminated by Kind). Relates to Sessions."""
     return {
         "Title": {"title": {}},
         "Session": _relation(sessions_data_source_id),
         "Date": {"date": {}},
         "Status": _select("approved", "rejected", "expired", "no-op"),
+        "Kind": _select("activity", "readiness"),
         SOURCE_KEY: {"rich_text": {}},
     }
 

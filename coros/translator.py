@@ -282,8 +282,16 @@ def merge_daily_rows(bundle: dict[str, str], today: date) -> list[dict]:
     daily = parse_daily_health(bundle.get("queryDailyHealthData", ""))
     for d, fields in daily.items():
         row = _row(d)
-        for key in ("steps", "exercise_min", "stress_avg", "sleep_score",
-                    "sleep_awake_min", "sleep_deep_min", "sleep_light_min", "sleep_rem_min"):
+        for key in (
+            "steps",
+            "exercise_min",
+            "stress_avg",
+            "sleep_score",
+            "sleep_awake_min",
+            "sleep_deep_min",
+            "sleep_light_min",
+            "sleep_rem_min",
+        ):
             if fields.get(key) is not None:
                 row[key] = fields[key]
         # Fallback main-sleep duration: total minus naps isn't derivable here

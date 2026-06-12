@@ -462,17 +462,23 @@ def _auto_resolve_matching_review(state) -> None:
         return
     if not proposal:
         return
+    # Readiness check-in proposals carry a direct review_id backlink (no
+    # strava activity exists to match on) — flip that review straight away.
+    review_id = proposal.get("review_id")
     strava_id = proposal.get("proposed_for_activity")
-    if strava_id is None:
+    if review_id is None and strava_id is None:
         return
     try:
-        review = state.find_pending_review_for_activity(strava_id=strava_id)
-        if review is None:
-            return
+        if review_id is not None:
+            review = {"id": review_id}
+        else:
+            review = state.find_pending_review_for_activity(strava_id=strava_id)
+            if review is None:
+                return
         resolved = state.resolve_pending_review(review["id"], "approved")
     except Exception as e:
         logging.getLogger("pre_coach.tools.state").warning(
-            f"auto-resolve: failed to flip review for strava_id={strava_id}: {e}"
+            f"auto-resolve: failed to flip review (review_id={review_id}, strava_id={strava_id}): {e}"
         )
         return
     if resolved is None:

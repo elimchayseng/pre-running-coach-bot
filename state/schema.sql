@@ -101,7 +101,11 @@ CREATE TABLE IF NOT EXISTS reviews (
     status          TEXT
                     CHECK (status IS NULL OR status IN ('approved','rejected','expired','no-op')),
     created_at      TEXT    NOT NULL DEFAULT (datetime('now')),
-    resolved_at     TEXT
+    resolved_at     TEXT,
+    -- v8: 'activity' = post-activity review; 'readiness' = nightly COROS
+    -- check-in (no session_id/strava_id). Pre-v8 DBs gain this via the
+    -- PRAGMA-guarded ALTER in state_manager._ensure_schema.
+    kind            TEXT    NOT NULL DEFAULT 'activity'
 );
 CREATE INDEX IF NOT EXISTS idx_reviews_session_id ON reviews(session_id);
 CREATE INDEX IF NOT EXISTS idx_reviews_date ON reviews(date);

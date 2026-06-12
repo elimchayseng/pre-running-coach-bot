@@ -241,15 +241,34 @@ def run(now: float | None = None, dry_run: bool = False, do_pull: bool = True) -
         return EXIT_INFRA
 
     print(
-        f"{'[dry-run] ' if dry_run else ''}auth ok · pull "
-        f"dates={len(result['dates'])} fields={result['fields_parsed']}"
+        f"{'[dry-run] ' if dry_run else ''}auth ok · pull dates={len(result['dates'])} fields={result['fields_parsed']}"
     )
     for err in result.get("errors", []):
         # Partial-tool or format-change problems are diagnostics, not auth.
         logger.warning(f"COROS pull issue: {err}")
 
+    if not dry_run and result["dates"]:
+        _run_readiness_checkin(state)
+
     _clear_alert_state()
     return EXIT_OK
+
+
+def _run_readiness_checkin(state) -> None:
+    """Phase 2: nightly LLM check of tomorrow's plan against tonight's
+    vitals. Best-effort — a failure here never fails the pull pass (the
+    data is already stored; the check-in re-runs tomorrow night)."""
+    try:
+        from coros.review import run_readiness_review
+
+        text = run_readiness_review(state)
+        if text:
+            from strava.notify import send_telegram_text
+
+            send_telegram_text(text, mirror=True)
+            logger.info("Sent nightly readiness check-in to Telegram")
+    except Exception:
+        logger.exception("Readiness check-in failed (pull already persisted)")
 
 
 # ---------- in-process scheduler ----------

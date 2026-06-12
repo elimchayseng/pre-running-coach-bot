@@ -107,9 +107,7 @@ class _OAuthHandler(http.server.BaseHTTPRequestHandler):
 def _pkce_pair() -> tuple[str, str]:
     """Return (code_verifier, S256 code_challenge)."""
     verifier = base64.urlsafe_b64encode(secrets.token_bytes(48)).rstrip(b"=").decode()
-    challenge = (
-        base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
-    )
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
     return verifier, challenge
 
 
@@ -253,7 +251,7 @@ def cmd_status(_: argparse.Namespace) -> int:
     _section("COROS MCP API:")
     try:
         info = client.query_user_info()
-        first_line = next((ln for ln in info.replace('\\n', '\n').splitlines() if ln.strip()), "")
+        first_line = next((ln for ln in info.replace("\\n", "\n").splitlines() if ln.strip()), "")
         _ok(f"queryUserInfo round-trip OK ({first_line.strip()[:60]})")
     except Exception as e:
         _fail(f"queryUserInfo failed: {e}")

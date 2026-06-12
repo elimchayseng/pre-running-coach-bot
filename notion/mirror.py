@@ -146,12 +146,16 @@ def _review_properties(row: dict, source_key: str, session_page_id: Optional[str
     ``session_page_id`` is the Notion Sessions page id for the related
     session row; looked up by the mirror via ``sid:<session_id>`` source_key.
     Left empty when the session hasn't been mirrored yet (the next review
-    upsert will fill the relation if the page exists by then).
+    upsert will fill the relation if the page exists by then). Readiness
+    check-ins (kind='readiness') have no session and title accordingly.
     """
+    kind = row.get("kind") or "activity"
+    title = f"{row['date']} readiness check-in" if kind == "readiness" else f"{row['date']} review"
     return {
-        "Title": _title(f"{row['date']} review"),
+        "Title": _title(title),
         "Date": _date_prop(row.get("date")),
         "Status": _select(row.get("status")),
+        "Kind": _select(kind),
         "Session": _relation([session_page_id] if session_page_id else None),
         schema.SOURCE_KEY: _rich(source_key),
     }

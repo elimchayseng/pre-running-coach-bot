@@ -195,9 +195,7 @@ def _tokens_from_response(body: dict, fallback_refresh: Optional[str] = None) ->
     }
 
 
-def exchange_code_for_tokens(
-    code: str, redirect_uri: str, code_verifier: str, client_info: dict
-) -> dict:
+def exchange_code_for_tokens(code: str, redirect_uri: str, code_verifier: str, client_info: dict) -> dict:
     """One-time: trade an authorization code (PKCE) for refresh + access
     tokens. Persists {client_info, tokens} and returns the blob."""
     resp = requests.post(
@@ -262,9 +260,7 @@ def get_access_token() -> str:
     client_info = (blob or {}).get("client_info") or {}
     if not tokens.get("refresh_token") or not client_info.get("client_id"):
         location = f"Redis key {TOKENS_REDIS_KEY}" if _backend() == "redis" else f"{TOKEN_FILE}"
-        raise CorosAuthError(
-            f"No COROS tokens at {location}. Run `python scripts/coros_setup.py auth` first."
-        )
+        raise CorosAuthError(f"No COROS tokens at {location}. Run `python scripts/coros_setup.py auth` first.")
 
     now = int(time.time())
     if tokens.get("access_token") and int(tokens.get("expires_at") or 0) - now > REFRESH_LEEWAY_SECONDS:

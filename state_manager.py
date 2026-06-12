@@ -50,11 +50,13 @@ SCHEMA_PATH = Path(__file__).resolve().parent / "state" / "schema.sql"
 # the `sessions.reflection` column for the Notion-Workers bidirectional
 # sync (athlete-owned post-run notes; see docs/notion-workers-architecture.md);
 # v7 adds the `daily_health` table for the nightly COROS wearable pull
-# (see docs/coros-mcp.md). scripts/cutover_to_unified_sessions.py handles
-# v3→v4; v4→v5 / v5→v6 / v6→v7 are additive and land the next time
-# _ensure_schema runs (v6 uses an ALTER TABLE … ADD COLUMN guarded by a
-# PRAGMA table_info check; v5/v7 are plain CREATE TABLE IF NOT EXISTS).
-CURRENT_SCHEMA_VERSION = 7
+# (see docs/coros-mcp.md); v8 adds `reviews.kind` ('activity' | 'readiness')
+# so the nightly readiness check-in reuses the reviews machinery.
+# scripts/cutover_to_unified_sessions.py handles v3→v4; v4 onward are
+# additive and land the next time _ensure_schema runs (v6/v8 use an
+# ALTER TABLE … ADD COLUMN guarded by a PRAGMA table_info check; v5/v7 are
+# plain CREATE TABLE IF NOT EXISTS).
+CURRENT_SCHEMA_VERSION = 8
 
 _JOURNAL_HEADER = "# Journal\n\nAppend-only freeform notes. Newest entries at the bottom.\n"
 
@@ -226,6 +228,10 @@ class StateManager:
                 cols = {r[1] for r in conn.execute("PRAGMA table_info(sessions)")}
                 if "reflection" not in cols:
                     conn.execute("ALTER TABLE sessions ADD COLUMN reflection TEXT DEFAULT NULL")
+                # v7 → v8: review kind discriminator ('activity' | 'readiness').
+                rev_cols = {r[1] for r in conn.execute("PRAGMA table_info(reviews)")}
+                if "kind" not in rev_cols:
+                    conn.execute("ALTER TABLE reviews ADD COLUMN kind TEXT NOT NULL DEFAULT 'activity'")
             conn.execute(
                 "INSERT OR IGNORE INTO schema_version (version) VALUES (?)",
                 (CURRENT_SCHEMA_VERSION if unified else 3,),
@@ -852,19 +858,24 @@ class StateManager:
         review_date: date,
         critique: str,
         proposed_change: Optional[dict] = None,
+        kind: str = "activity",
     ) -> dict:
-        """Persist a post-activity review and fire the Notion mirror.
+        """Persist a review and fire the Notion mirror.
 
-        Returns the inserted row as a dict with ``proposed_change`` parsed
-        back into a dict (it's stored as JSON in SQLite). ``status`` starts
-        NULL (= Pending in the Notion view).
+        ``kind`` discriminates post-activity reviews ('activity', the
+        default) from the nightly COROS readiness check-in ('readiness',
+        which carries no session_id/strava_id). Returns the inserted row as
+        a dict with ``proposed_change`` parsed back into a dict (it's stored
+        as JSON in SQLite). ``status`` starts NULL (= Pending in the Notion
+        view).
         """
         proposed_json = json.dumps(proposed_change, ensure_ascii=False) if proposed_change else None
         iso = review_date.isoformat() if isinstance(review_date, date) else str(review_date)[:10]
         with self._conn() as conn:
             cur = conn.execute(
-                "INSERT INTO reviews (session_id, strava_id, date, critique, proposed_change) VALUES (?, ?, ?, ?, ?)",
-                (session_id, strava_id, iso, critique, proposed_json),
+                "INSERT INTO reviews (session_id, strava_id, date, critique, proposed_change, kind) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (session_id, strava_id, iso, critique, proposed_json, kind),
             )
             row = _parse_review_row(
                 dict(conn.execute("SELECT * FROM reviews WHERE id = ?", (cur.lastrowid,)).fetchone())
@@ -1072,7 +1083,8 @@ class StateManager:
             d = date.fromisoformat(row["date"])
             key = d.isocalendar()[:2]
             b = buckets.setdefault(
-                key, {"start": (d - timedelta(days=d.weekday())).isoformat(), "ratios": [], "long_terms": [], "flagged": 0}
+                key,
+                {"start": (d - timedelta(days=d.weekday())).isoformat(), "ratios": [], "long_terms": [], "flagged": 0},
             )
             if row.get("load_ratio") is not None:
                 b["ratios"].append(row["load_ratio"])

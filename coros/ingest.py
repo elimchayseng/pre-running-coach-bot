@@ -48,9 +48,7 @@ def run_nightly_pull(state, days: Optional[int] = None, dry_run: bool = False) -
         return {"dates": [], "fields_parsed": 0, "errors": errors + ["empty bundle — nothing fetched"]}
 
     rows = translator.merge_daily_rows(bundle, today=today)
-    fields_parsed = sum(
-        1 for row in rows for key in translator.METRIC_KEYS if row.get(key) is not None
-    )
+    fields_parsed = sum(1 for row in rows for key in translator.METRIC_KEYS if row.get(key) is not None)
     if rows and fields_parsed == 0:
         errors.append(
             "0 fields parsed from a non-empty bundle — COROS output format "

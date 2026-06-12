@@ -68,9 +68,7 @@ class TestUpsertDailyHealth:
 
     def test_null_field_does_not_clobber_existing(self, state):
         # Night 1: today's row carries the recovery snapshot + raw bundle.
-        state.upsert_daily_health(
-            [_row("2026-06-10", recovery_pct=88, recovery_level="Good", raw='{"t": "night1"}')]
-        )
+        state.upsert_daily_health([_row("2026-06-10", recovery_pct=88, recovery_level="Good", raw='{"t": "night1"}')])
         # Night 2: backfill re-pull of the same date — no recovery, no raw.
         state.upsert_daily_health([_row("2026-06-10", sleep_score=81)])
         row = state.get_daily_health(days=7, today=TODAY)[0]
@@ -217,9 +215,7 @@ class TestV7Migration:
         conn.executescript(head)  # current schema.sql minus daily_health = v6 shape
         conn.execute("INSERT OR IGNORE INTO schema_version (version) VALUES (6)")
         conn.commit()
-        assert not conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='daily_health'"
-        ).fetchone()
+        assert not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='daily_health'").fetchone()
         conn.close()
 
         state = StateManager(state_dir)

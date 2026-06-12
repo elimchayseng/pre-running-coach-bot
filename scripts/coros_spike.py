@@ -21,8 +21,8 @@ Tokens land in .coros_spike_tokens.json (gitignored; deleted after PR 0).
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import base64
+import hashlib
 import json
 import os
 import secrets
@@ -32,7 +32,7 @@ import time
 import webbrowser
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from urllib.parse import urlencode, urlparse, parse_qs
+from urllib.parse import parse_qs, urlencode, urlparse
 
 import requests
 
@@ -124,11 +124,7 @@ def cmd_auth() -> int:
         print(f"registered client_id={client['client_id']}")
 
     verifier = base64.urlsafe_b64encode(secrets.token_bytes(48)).rstrip(b"=").decode()
-    challenge = (
-        base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest())
-        .rstrip(b"=")
-        .decode()
-    )
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
     state = secrets.token_urlsafe(24)
     _CallbackHandler.expected_state = state
 
@@ -226,7 +222,6 @@ def _ensure_fresh(blob: dict) -> dict:
 
 
 async def _call_tool(access_token: str, name: str, args: dict) -> str:
-    import httpx
     from mcp import ClientSession
     from mcp.client.streamable_http import streamablehttp_client
 
