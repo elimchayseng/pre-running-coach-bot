@@ -311,7 +311,7 @@ class TestAutoResolveReviewIdBranch:
         assert get_pending_plan_proposal() is None
 
 
-class TestReviewHardening:
+class TestReviewHardeningSecondPass:
     def test_string_false_concern_is_quiet_night(self, state_with_health, monkeypatch, fake_redis):
         """LLMs in JSON mode sometimes emit booleans as strings. The string
         "false" is truthy — it would ping every night AND skip the

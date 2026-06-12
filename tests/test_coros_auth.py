@@ -336,9 +336,7 @@ class TestGetAccessToken:
 
         auth._unsaved_blob = None
         # Rescue from an old rotation: replaced rt-1 with rt-2.
-        auth._rescue_path().write_text(
-            _json.dumps({"replaces_refresh_token": "rt-1", "blob": _blob(refresh="rt-2")})
-        )
+        auth._rescue_path().write_text(_json.dumps({"replaces_refresh_token": "rt-1", "blob": _blob(refresh="rt-2")}))
         # Storage moved on: a re-auth wrote rt-3.
         auth._write_blob(_blob(refresh="rt-3"))
         assert auth.get_access_token() == "at-1"  # fresh token from storage
