@@ -527,5 +527,140 @@ class TestRenderChangeBody:
         assert "## Prescribed" in body and "## Actuals" in body
 
 
+# ---------------- daily health (PRE Health) ----------------
+
+
+def _health_row(**overrides) -> dict:
+    base = {
+        "date": "2026-06-10",
+        "sleep_score": 96,
+        "sleep_duration_min": 384,
+        "sleep_nap_min": 122,
+        "hrv_avg": 102,
+        "hrv_baseline": 82,
+        "hrv_evaluation": "Above normal",
+        "resting_hr": 49,
+        "stress_avg": 22,
+        "steps": 4356,
+        "recovery_pct": None,
+        "recovery_level": None,
+        "load_short_term": 131.0,
+        "load_long_term": 104.0,
+        "load_ratio": 1.25,
+        "load_comment": "Optimized",
+    }
+    base.update(overrides)
+    return base
+
+
+class TestHealthProperties:
+    def test_maps_metrics(self):
+        props = mirror._health_properties(_health_row(), "hid:2026-06-10")
+        assert props["Title"]["title"][0]["text"]["content"] == "2026-06-10"
+        assert props["Date"] == {"date": {"start": "2026-06-10"}}
+        assert props["Sleep score"] == {"number": 96}
+        assert props["Sleep hours"] == {"number": 6.4}  # 384 min, naps separate
+        assert props["Nap min"] == {"number": 122}
+        assert props["HRV eval"] == {"select": {"name": "Above normal"}}
+        assert props["Load status"] == {"select": {"name": "Optimized"}}
+        assert props["source_key"]["rich_text"][0]["text"]["content"] == "hid:2026-06-10"
+
+    def test_missing_fields_clear_properties(self):
+        props = mirror._health_properties({"date": "2026-06-11"}, "hid:2026-06-11")
+        assert props["Sleep hours"] == {"number": None}
+        assert props["HRV eval"] == {"select": None}
+        assert props["Recovery %"] == {"number": None}
+
+    def test_health_key(self):
+        from notion import schema
+
+        assert schema.health_key("2026-06-11") == "hid:2026-06-11"
+
+
+class TestHealthUpsert:
+    def test_insert_when_no_existing_page(self, monkeypatch):
+        monkeypatch.setenv("NOTION_HEALTH_DS_ID", "ds-h")
+        client = _FakeClient(existing_page_id=None)
+        mirror._upsert_health(_health_row(), client)
+        assert len(client.created) == 1
+        assert client.created[0]["ds"] == "ds-h"
+        assert client.created[0]["markdown"] is None  # property-only pages
+        assert client.updated == []
+
+    def test_update_when_page_exists(self, monkeypatch):
+        monkeypatch.setenv("NOTION_HEALTH_DS_ID", "ds-h")
+        client = _FakeClient(existing_page_id="page-h")
+        mirror._upsert_health(_health_row(), client)
+        assert client.created == []
+        assert client.updated[0]["page_id"] == "page-h"
+        assert client.markdown_patched == []  # body never touched
+
+
+class TestReviewKindProperty:
+    def _r(self, **over):
+        base = {"id": 7, "date": "2026-06-11", "status": None, "session_id": None}
+        base.update(over)
+        return base
+
+    def test_activity_default(self):
+        props = mirror._review_properties(self._r(), "rid:7")
+        assert props["Kind"] == {"select": {"name": "activity"}}
+        assert props["Title"]["title"][0]["text"]["content"] == "2026-06-11 review"
+
+    def test_readiness_kind_and_title(self):
+        props = mirror._review_properties(self._r(kind="readiness"), "rid:7")
+        assert props["Kind"] == {"select": {"name": "readiness"}}
+        assert props["Title"]["title"][0]["text"]["content"] == "2026-06-11 readiness check-in"
+
+
+class TestHealthMirrorUsesMergedRows:
+    def test_upsert_notifies_post_coalesce_rows(self, tmp_path, monkeypatch):
+        """The mirror must receive what SQLite KEEPS, not what the pull
+        carried — otherwise a backfill night clears the recovery snapshot
+        from prior days' Notion pages."""
+        from state_manager import StateManager
+
+        d = tmp_path / "state"
+        d.mkdir()
+        monkeypatch.delenv("DATABASE_PATH", raising=False)
+        state = StateManager(d)
+        captured = []
+        monkeypatch.setattr(state, "_notify_mirror_health", lambda rows: captured.append(rows))
+        state.upsert_daily_health([{"date": "2026-06-10", "recovery_pct": 88, "recovery_level": "Good"}])
+        # Backfill re-pull: no recovery for that date.
+        state.upsert_daily_health([{"date": "2026-06-10", "sleep_score": 81}])
+        merged = captured[-1][0]
+        assert merged["recovery_pct"] == 88  # preserved value reaches the mirror
+        assert merged["sleep_score"] == 81
+
+
+class TestHealthEnabledGate:
+    def test_disabled_without_ds_id(self, monkeypatch):
+        monkeypatch.setenv("NOTION_TOKEN", "ntn_x")
+        monkeypatch.delenv("NOTION_HEALTH_DS_ID", raising=False)
+        assert mirror.health_enabled() is False
+
+    def test_enabled_with_full_config(self, monkeypatch):
+        monkeypatch.setenv("NOTION_TOKEN", "ntn_x")
+        monkeypatch.setenv("NOTION_HEALTH_DS_ID", "ds-h")
+        assert mirror.health_enabled() is True
+
+    def test_mirror_health_rows_noops_when_disabled(self, monkeypatch):
+        monkeypatch.delenv("NOTION_TOKEN", raising=False)
+        called = []
+        monkeypatch.setattr(mirror, "_mirror_health_batch", lambda rows: called.append(rows))
+        mirror.mirror_health_rows([_health_row()])
+        assert called == []
+
+    def test_rows_without_dates_filtered(self, monkeypatch):
+        monkeypatch.setenv("NOTION_TOKEN", "ntn_x")
+        monkeypatch.setenv("NOTION_HEALTH_DS_ID", "ds-h")
+        spawned = []
+        monkeypatch.setattr(mirror, "_spawn", lambda fn, rows: spawned.append(rows))
+        mirror.mirror_health_rows([{"no_date": True}, _health_row()])
+        assert len(spawned) == 1
+        assert len(spawned[0]) == 1
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))

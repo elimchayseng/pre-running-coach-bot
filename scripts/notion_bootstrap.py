@@ -1,8 +1,9 @@
 """One-shot bootstrap for the Notion mirror (Phase 1B.1).
 
-Creates the four mirror databases under the PRE Training parent page:
-PRE Sessions, PRE Journal, PRE Plan Changes, PRE Reviews. Sessions is created
-first so Plan Changes and Reviews can declare a relation into it.
+Creates the five mirror databases under the PRE Training parent page:
+PRE Sessions, PRE Journal, PRE Plan Changes, PRE Reviews, PRE Health.
+Sessions is created first so Plan Changes and Reviews can declare a relation
+into it.
 
 Idempotent: a database whose exact title already exists under the parent page
 is reused, not recreated. Safe to re-run.
@@ -70,12 +71,32 @@ def _create_or_reuse(client: NotionClient, title: str, properties: dict, parent_
     existing = _find_database(client, title, parent_page_id)
     if existing:
         db_id, ds_id = existing
+        _patch_missing_properties(client, ds_id, title, properties)
         print(f"  reuse  {title}: database={db_id}")
         return {"title": title, "database_id": db_id, "data_source_id": ds_id, "created": False}
     db = client.create_database(parent_page_id, title, properties)
     ds_id = (db.get("data_sources") or [{}])[0].get("id", "")
     print(f"  create {title}: database={db['id']}")
     return {"title": title, "database_id": db["id"], "data_source_id": ds_id, "created": True}
+
+
+def _patch_missing_properties(client: NotionClient, ds_id: str, title: str, properties: dict) -> None:
+    """Add schema properties that don't exist yet on a reused data source.
+
+    Without this, a property added to the code schema after a database was
+    first created (e.g. Reviews' "Kind") never reaches existing deployments,
+    and every mirror upsert 400s — swallowed per-row in the daemon threads,
+    so the mirror dies silently. Additive only: existing properties are
+    never modified or removed.
+    """
+    try:
+        current = client._request("GET", f"/data_sources/{ds_id}").get("properties", {})
+        missing = {name: spec for name, spec in properties.items() if name not in current}
+        if missing:
+            client._request("PATCH", f"/data_sources/{ds_id}", {"properties": missing})
+            print(f"  patch  {title}: added properties {sorted(missing)}")
+    except Exception as e:  # noqa: BLE001 — bootstrap stays usable if patching fails
+        print(f"  warn   {title}: could not patch properties: {e}")
 
 
 def bootstrap() -> list[dict]:
@@ -109,6 +130,8 @@ def bootstrap() -> list[dict]:
             parent_page_id,
         )
     )
+    # Health has no relations — order-independent.
+    out.append(_create_or_reuse(client, schema.DB_HEALTH, schema.HEALTH_PROPERTIES, parent_page_id))
     return out
 
 
@@ -117,6 +140,7 @@ _ENV_KEYS = {
     schema.DB_JOURNAL: ("NOTION_JOURNAL_DB_ID", "NOTION_JOURNAL_DS_ID"),
     schema.DB_PLAN_CHANGES: ("NOTION_PLAN_CHANGES_DB_ID", "NOTION_PLAN_CHANGES_DS_ID"),
     schema.DB_REVIEWS: ("NOTION_REVIEWS_DB_ID", "NOTION_REVIEWS_DS_ID"),
+    schema.DB_HEALTH: ("NOTION_HEALTH_DB_ID", "NOTION_HEALTH_DS_ID"),
 }
 
 

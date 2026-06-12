@@ -54,6 +54,10 @@ def reviews_enabled() -> bool:
     return bool(os.getenv("NOTION_TOKEN") and os.getenv("NOTION_REVIEWS_DS_ID"))
 
 
+def health_enabled() -> bool:
+    return bool(os.getenv("NOTION_TOKEN") and os.getenv("NOTION_HEALTH_DS_ID"))
+
+
 # ---------- property-value builders ----------
 #
 # Every builder always emits its property (even for an empty source value) so
@@ -142,13 +146,48 @@ def _review_properties(row: dict, source_key: str, session_page_id: Optional[str
     ``session_page_id`` is the Notion Sessions page id for the related
     session row; looked up by the mirror via ``sid:<session_id>`` source_key.
     Left empty when the session hasn't been mirrored yet (the next review
-    upsert will fill the relation if the page exists by then).
+    upsert will fill the relation if the page exists by then). Readiness
+    check-ins (kind='readiness') have no session and title accordingly.
     """
+    kind = row.get("kind") or "activity"
+    title = f"{row['date']} readiness check-in" if kind == "readiness" else f"{row['date']} review"
     return {
-        "Title": _title(f"{row['date']} review"),
+        "Title": _title(title),
         "Date": _date_prop(row.get("date")),
         "Status": _select(row.get("status")),
+        "Kind": _select(kind),
         "Session": _relation([session_page_id] if session_page_id else None),
+        schema.SOURCE_KEY: _rich(source_key),
+    }
+
+
+def _health_properties(row: dict, source_key: str) -> dict:
+    """Map a daily_health SQLite row to PRE Health Notion properties.
+
+    Sleep hours is the main-sleep duration in decimal hours (one place);
+    naps are surfaced separately so a 6h24m night + 2h nap doesn't read as
+    an 8.4h sleep.
+    """
+    sleep_min = row.get("sleep_duration_min")
+    sleep_hours = round(sleep_min / 60.0, 1) if isinstance(sleep_min, (int, float)) else None
+    return {
+        "Title": _title(row.get("date") or "(day)"),
+        "Date": _date_prop(row.get("date")),
+        "Sleep score": _number(row.get("sleep_score")),
+        "Sleep hours": _number(sleep_hours),
+        "Nap min": _number(row.get("sleep_nap_min")),
+        "HRV": _number(row.get("hrv_avg")),
+        "HRV baseline": _number(row.get("hrv_baseline")),
+        "HRV eval": _select(row.get("hrv_evaluation")),
+        "Resting HR": _number(row.get("resting_hr")),
+        "Stress": _number(row.get("stress_avg")),
+        "Steps": _number(row.get("steps")),
+        "Recovery %": _number(row.get("recovery_pct")),
+        "Recovery level": _select(row.get("recovery_level")),
+        "Load ST": _number(row.get("load_short_term")),
+        "Load LT": _number(row.get("load_long_term")),
+        "Load ratio": _number(row.get("load_ratio")),
+        "Load status": _select(row.get("load_comment")),
         schema.SOURCE_KEY: _rich(source_key),
     }
 
@@ -327,6 +366,24 @@ def _upsert_review(row: dict, client: NotionClient) -> None:
             client.create_page(data_source_id, props, markdown=body or None)
 
 
+def _upsert_health(row: dict, client: NotionClient) -> None:
+    """Insert or update the PRE Health page for one daily_health row.
+
+    Property-only upsert: no page body. The raw tool payloads live in
+    SQLite's daily_health.raw — mirroring kilobytes of escaped text into
+    every page body adds noise to the database views for no query value.
+    """
+    data_source_id = os.environ["NOTION_HEALTH_DS_ID"]
+    source_key = schema.health_key(row["date"])
+    props = _health_properties(row, source_key)
+    with _upsert_lock:
+        page_id = _query_page_id(client, data_source_id, source_key)
+        if page_id:
+            client.update_page(page_id, properties=props)
+        else:
+            client.create_page(data_source_id, props)
+
+
 def _upsert_session(row: dict, client: NotionClient) -> None:
     """Insert or update the PRE Sessions page for one SQLite session row.
 
@@ -400,6 +457,17 @@ def mirror_reviews(rows: list[dict]) -> None:
         _spawn(_mirror_review_batch, rows)
 
 
+def mirror_health_rows(rows: list[dict]) -> None:
+    """Mirror daily_health rows to Notion in ONE daemon thread (best-effort).
+
+    The nightly pull upserts ~4 dates at once; batching keeps that to a
+    single worker instead of one thread per row.
+    """
+    rows = [r for r in (rows or []) if r and r.get("date")]
+    if rows and health_enabled():
+        _spawn(_mirror_health_batch, rows)
+
+
 def _mirror_batch(rows: list[dict]) -> None:
     client = NotionClient()
     for row in rows:
@@ -407,6 +475,15 @@ def _mirror_batch(rows: list[dict]) -> None:
             _upsert_session(row, client)
         except Exception as e:  # noqa: BLE001 — one bad row must not drop the rest
             logger.warning("Notion mirror failed for session id=%s: %s", row.get("id"), e)
+
+
+def _mirror_health_batch(rows: list[dict]) -> None:
+    client = NotionClient()
+    for row in rows:
+        try:
+            _upsert_health(row, client)
+        except Exception as e:  # noqa: BLE001 — one bad row must not drop the rest
+            logger.warning("Notion mirror failed for daily health %s: %s", row.get("date"), e)
 
 
 def _mirror_journal_batch(entries: list[dict]) -> None:

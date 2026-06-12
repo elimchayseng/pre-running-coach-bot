@@ -101,7 +101,11 @@ CREATE TABLE IF NOT EXISTS reviews (
     status          TEXT
                     CHECK (status IS NULL OR status IN ('approved','rejected','expired','no-op')),
     created_at      TEXT    NOT NULL DEFAULT (datetime('now')),
-    resolved_at     TEXT
+    resolved_at     TEXT,
+    -- v8: 'activity' = post-activity review; 'readiness' = nightly COROS
+    -- check-in (no session_id/strava_id). Pre-v8 DBs gain this via the
+    -- PRAGMA-guarded ALTER in state_manager._ensure_schema.
+    kind            TEXT    NOT NULL DEFAULT 'activity'
 );
 CREATE INDEX IF NOT EXISTS idx_reviews_session_id ON reviews(session_id);
 CREATE INDEX IF NOT EXISTS idx_reviews_date ON reviews(date);
@@ -118,3 +122,39 @@ CREATE TABLE IF NOT EXISTS gcal_sync_state (
     off_plan          INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_gcal_sync_completed ON gcal_sync_state(completed);
+
+-- Daily wearable health metrics (schema v7). One row per local date, pulled
+-- nightly from the official COROS MCP server (coros/ingest.py). recovery_*
+-- is a point-in-time snapshot taken at fetch time — COROS exposes no
+-- recovery history. `raw` keeps the original tool text outputs (JSON object
+-- keyed by tool name, set on the date that was "today" at pull time) so a
+-- COROS copy-format change degrades to NULL columns, never data loss.
+-- Upserts COALESCE per column so a backfill re-pull carrying no recovery
+-- snapshot can't null out the one captured on the original night.
+CREATE TABLE IF NOT EXISTS daily_health (
+    date               TEXT PRIMARY KEY,   -- YYYY-MM-DD (USER_TIMEZONE local)
+    sleep_score        INTEGER,
+    sleep_duration_min INTEGER,            -- main sleep, excludes naps
+    sleep_nap_min      INTEGER,
+    sleep_deep_min     INTEGER,
+    sleep_light_min    INTEGER,
+    sleep_rem_min      INTEGER,
+    sleep_awake_min    INTEGER,
+    hrv_avg            INTEGER,
+    hrv_baseline       INTEGER,
+    hrv_range_low      INTEGER,
+    hrv_range_high     INTEGER,
+    hrv_evaluation     TEXT,
+    resting_hr         INTEGER,
+    stress_avg         INTEGER,
+    steps              INTEGER,
+    exercise_min       INTEGER,
+    recovery_pct       INTEGER,
+    recovery_level     TEXT,
+    load_short_term    REAL,
+    load_long_term     REAL,
+    load_ratio         REAL,
+    load_comment       TEXT,
+    raw                TEXT,
+    fetched_at         TEXT NOT NULL DEFAULT (datetime('now'))
+);

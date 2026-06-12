@@ -42,3 +42,5 @@ state/.gcal_sync_state.json
 # OS
 .DS_Store
 Thumbs.db
+.coros_spike_tokens.json
+.coros_tokens.json

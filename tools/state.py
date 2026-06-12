@@ -369,7 +369,7 @@ def _mark_calendar_complete(state, entry: dict) -> None:
 def _update_plan(args: dict, state) -> dict:
     state.update_plan(args["new_plan_markdown"], args["change_reason"])
     result = {"ok": True, "change_reason": args["change_reason"]}
-    _auto_resolve_matching_review(state)
+    _auto_resolve_matching_review(state, full_plan_write=True)
     _consume_pending_proposal()
     _attach_today_warning_if_broken(state, result)
     _mark_plan_dirty()
@@ -425,7 +425,7 @@ def _consume_pending_proposal() -> None:
         pass
 
 
-def _auto_resolve_matching_review(state) -> None:
+def _auto_resolve_matching_review(state, full_plan_write: bool = False) -> None:
     """Heuristic: a plan-edit tool just ran. If Redis has a pending proposal
     whose ``proposed_for_activity`` matches a recent Pending review (by
     ``strava_id``), flip that review to ``approved`` and mirror the flip
@@ -462,17 +462,30 @@ def _auto_resolve_matching_review(state) -> None:
         return
     if not proposal:
         return
+    # Readiness check-in proposals carry a direct review_id backlink (no
+    # strava activity exists to match on). Flip it ONLY on a full-plan write
+    # (update_plan — the tool that actually applies a proposal's new_plan_md).
+    # Targeted edits (update_workout / replace_week_table) also happen when
+    # the user DECLINES and the agent counter-proposes its own tweak; flipping
+    # the declined review to 'approved' there would record the wrong outcome
+    # and silently consume a proposal the user never confirmed.
+    review_id = proposal.get("review_id")
     strava_id = proposal.get("proposed_for_activity")
-    if strava_id is None:
+    if review_id is not None and not full_plan_write:
+        return
+    if review_id is None and strava_id is None:
         return
     try:
-        review = state.find_pending_review_for_activity(strava_id=strava_id)
-        if review is None:
-            return
+        if review_id is not None:
+            review = {"id": review_id}
+        else:
+            review = state.find_pending_review_for_activity(strava_id=strava_id)
+            if review is None:
+                return
         resolved = state.resolve_pending_review(review["id"], "approved")
     except Exception as e:
         logging.getLogger("pre_coach.tools.state").warning(
-            f"auto-resolve: failed to flip review for strava_id={strava_id}: {e}"
+            f"auto-resolve: failed to flip review (review_id={review_id}, strava_id={strava_id}): {e}"
         )
         return
     if resolved is None:

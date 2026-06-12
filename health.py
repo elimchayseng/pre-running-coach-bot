@@ -49,6 +49,54 @@ def run_health_checks() -> dict[str, bool]:
             logger.error(f"Gcal health check failed: {e}")
             results["gcal"] = False
 
+    # COROS is optional — only check when token storage is configured
+    # (COROS_TOKENS_BACKEND set in prod; a local token file in dev). The
+    # gate sits OUTSIDE the try (mirroring the Notion block) so an
+    # unconfigured COROS never reports unhealthy. The check itself is
+    # deliberately passive — token blob present + well-formed, plus data
+    # freshness — and NEVER refreshes: a probe-path refresh would rotate
+    # the single-use refresh token where a gunicorn timeout could kill the
+    # worker between rotation and persist (unrecoverable lockout). Real
+    # refresh validity is exercised by the nightly scheduler's watchdog.
+    coros_configured = False
+    try:
+        from coros.auth import TOKEN_FILE as _coros_token_file
+
+        coros_configured = bool(os.getenv("COROS_TOKENS_BACKEND")) or _coros_token_file.exists()
+    except Exception:  # noqa: BLE001 — import failure = not configured
+        pass
+    if coros_configured:
+        try:
+            from coros.auth import health_check as coros_health
+
+            results["coros"] = coros_health()
+            if results["coros"]:
+                # Freshness: a token can be valid while the nightly pull has
+                # been failing for days (non-auth breakage is otherwise
+                # invisible — exit codes only reach logs). Only PARSED
+                # metrics count as fresh: ingest's raw-insurance row is
+                # written even when zero fields parse, so mere row existence
+                # would mask a COROS format change forever. Rows but no
+                # metric ever = pulls run, nothing parses (unhealthy); a
+                # truly empty table is a fresh install and stays healthy.
+                from datetime import date, timedelta
+
+                from state_manager import StateManager
+                from temporal_context import today_local
+
+                state = StateManager()
+                latest = state.latest_metric_date()
+                if latest is None:
+                    if state.has_daily_health_rows():
+                        logger.warning("COROS auth ok but no daily_health row has ever parsed a metric")
+                        results["coros"] = False
+                elif date.fromisoformat(latest) < today_local() - timedelta(days=2):
+                    logger.warning("COROS auth ok but no parsed daily_health metrics in 3 days")
+                    results["coros"] = False
+        except Exception as e:
+            logger.error(f"COROS health check failed: {e}")
+            results["coros"] = False
+
     # Notion mirror is optional — only check when a token is configured.
     if os.getenv("NOTION_TOKEN"):
         try:

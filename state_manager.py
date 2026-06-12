@@ -25,6 +25,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import re
 import sqlite3
 import threading
 from contextlib import contextmanager
@@ -48,11 +49,15 @@ SCHEMA_PATH = Path(__file__).resolve().parent / "state" / "schema.sql"
 # Current schema version. v4 was the Phase 1A cutover (unified `sessions`
 # table, `plan_meta`); v5 adds the `reviews` table for Phase 1B.4; v6 adds
 # the `sessions.reflection` column for the Notion-Workers bidirectional
-# sync (athlete-owned post-run notes; see docs/notion-workers-architecture.md).
-# scripts/cutover_to_unified_sessions.py handles v3→v4; v4→v5 / v5→v6 are
-# additive and land the next time _ensure_schema runs (v6 uses an
-# ALTER TABLE … ADD COLUMN guarded by a PRAGMA table_info check).
-CURRENT_SCHEMA_VERSION = 6
+# sync (athlete-owned post-run notes; see docs/notion-workers-architecture.md);
+# v7 adds the `daily_health` table for the nightly COROS wearable pull
+# (see docs/coros-mcp.md); v8 adds `reviews.kind` ('activity' | 'readiness')
+# so the nightly readiness check-in reuses the reviews machinery.
+# scripts/cutover_to_unified_sessions.py handles v3→v4; v4 onward are
+# additive and land the next time _ensure_schema runs (v6/v8 use an
+# ALTER TABLE … ADD COLUMN guarded by a PRAGMA table_info check; v5/v7 are
+# plain CREATE TABLE IF NOT EXISTS).
+CURRENT_SCHEMA_VERSION = 8
 
 _JOURNAL_HEADER = "# Journal\n\nAppend-only freeform notes. Newest entries at the bottom.\n"
 
@@ -221,9 +226,35 @@ class StateManager:
                 # column. SQLite's CREATE TABLE IF NOT EXISTS in schema.sql is a
                 # no-op when the table already exists, so a column added after
                 # the table was first created has to come in via ALTER TABLE.
+                def _add_column(sql: str) -> None:
+                    # The PRAGMA guard races across PROCESSES (_schema_lock
+                    # only serializes threads): old/new containers overlap
+                    # during a deploy, both pass the check, the loser gets
+                    # 'duplicate column name'. That loss is harmless — the
+                    # column exists, which is all we wanted.
+                    try:
+                        conn.execute(sql)
+                    except sqlite3.OperationalError as e:
+                        if "duplicate column name" not in str(e).lower():
+                            raise
+
                 cols = {r[1] for r in conn.execute("PRAGMA table_info(sessions)")}
                 if "reflection" not in cols:
-                    conn.execute("ALTER TABLE sessions ADD COLUMN reflection TEXT DEFAULT NULL")
+                    _add_column("ALTER TABLE sessions ADD COLUMN reflection TEXT DEFAULT NULL")
+                # v7 → v8: review kind discriminator ('activity' | 'readiness').
+                rev_cols = {r[1] for r in conn.execute("PRAGMA table_info(reviews)")}
+                if "kind" not in rev_cols:
+                    _add_column("ALTER TABLE reviews ADD COLUMN kind TEXT NOT NULL DEFAULT 'activity'")
+                # One readiness check-in per night, enforced by the DB — the
+                # SELECT-then-INSERT dedup in coros/review.py has a race
+                # window (manual scheduler run vs. in-process tick). Lives
+                # here rather than schema.sql because executescript runs
+                # BEFORE this block, when a pre-v8 DB doesn't yet have the
+                # `kind` column the partial index references.
+                conn.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_reviews_readiness_per_date "
+                    "ON reviews(date) WHERE kind = 'readiness'"
+                )
             conn.execute(
                 "INSERT OR IGNORE INTO schema_version (version) VALUES (?)",
                 (CURRENT_SCHEMA_VERSION if unified else 3,),
@@ -850,19 +881,29 @@ class StateManager:
         review_date: date,
         critique: str,
         proposed_change: Optional[dict] = None,
+        kind: str = "activity",
     ) -> dict:
-        """Persist a post-activity review and fire the Notion mirror.
+        """Persist a review and fire the Notion mirror.
 
-        Returns the inserted row as a dict with ``proposed_change`` parsed
-        back into a dict (it's stored as JSON in SQLite). ``status`` starts
-        NULL (= Pending in the Notion view).
+        ``kind`` discriminates post-activity reviews ('activity', the
+        default) from the nightly COROS readiness check-in ('readiness',
+        which carries no session_id/strava_id). Returns the inserted row as
+        a dict with ``proposed_change`` parsed back into a dict (it's stored
+        as JSON in SQLite). ``status`` starts NULL (= Pending in the Notion
+        view).
         """
+        # App-level guard in lieu of a CHECK constraint: SQLite can't ALTER a
+        # constraint onto the existing migrated column, so enforcing only in
+        # schema.sql would let fresh and migrated DBs diverge.
+        if kind not in ("activity", "readiness"):
+            raise ValueError(f"invalid review kind: {kind!r}")
         proposed_json = json.dumps(proposed_change, ensure_ascii=False) if proposed_change else None
         iso = review_date.isoformat() if isinstance(review_date, date) else str(review_date)[:10]
         with self._conn() as conn:
             cur = conn.execute(
-                "INSERT INTO reviews (session_id, strava_id, date, critique, proposed_change) VALUES (?, ?, ?, ?, ?)",
-                (session_id, strava_id, iso, critique, proposed_json),
+                "INSERT INTO reviews (session_id, strava_id, date, critique, proposed_change, kind) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (session_id, strava_id, iso, critique, proposed_json, kind),
             )
             row = _parse_review_row(
                 dict(conn.execute("SELECT * FROM reviews WHERE id = ?", (cur.lastrowid,)).fetchone())
@@ -978,6 +1019,246 @@ class StateManager:
         self._notify_mirror_reviews(parsed)
         return parsed
 
+    # ---------- Daily health (COROS) ----------
+
+    # Metric columns shared by upsert and reads. `raw` and `fetched_at` are
+    # handled separately in the upsert (raw COALESCEs like metrics;
+    # fetched_at always takes the new value).
+    _HEALTH_COLS = (
+        "sleep_score",
+        "sleep_duration_min",
+        "sleep_nap_min",
+        "sleep_deep_min",
+        "sleep_light_min",
+        "sleep_rem_min",
+        "sleep_awake_min",
+        "hrv_avg",
+        "hrv_baseline",
+        "hrv_range_low",
+        "hrv_range_high",
+        "hrv_evaluation",
+        "resting_hr",
+        "stress_avg",
+        "steps",
+        "exercise_min",
+        "recovery_pct",
+        "recovery_level",
+        "load_short_term",
+        "load_long_term",
+        "load_ratio",
+        "load_comment",
+    )
+
+    def upsert_daily_health(self, rows: list[dict]) -> None:
+        """Insert-or-update one row per date in `daily_health`.
+
+        Per-column COALESCE(excluded, existing) semantics: a re-pull that
+        carries NULL for a field (e.g. backfill rows have no recovery
+        snapshot; today's resting HR is 'No data' until tomorrow) never
+        erases a previously stored value. Fires the best-effort Notion
+        mirror after commit.
+        """
+        if not rows:
+            return
+        cols = list(self._HEALTH_COLS)
+        col_sql = ", ".join(cols)
+        placeholders = ", ".join("?" * (len(cols) + 2))  # + date, raw
+        updates = ", ".join(f"{c} = COALESCE(excluded.{c}, daily_health.{c})" for c in cols)
+        sql = (
+            f"INSERT INTO daily_health (date, {col_sql}, raw, fetched_at) "
+            f"VALUES ({placeholders}, datetime('now')) "
+            f"ON CONFLICT(date) DO UPDATE SET {updates}, "
+            "raw = COALESCE(excluded.raw, daily_health.raw), "
+            "fetched_at = excluded.fetched_at"
+        )
+        dates = [row["date"] for row in rows]
+        with self._conn() as conn:
+            conn.executemany(
+                sql,
+                [
+                    (
+                        row["date"],
+                        *(row.get(c) for c in cols),
+                        row.get("raw"),
+                    )
+                    for row in rows
+                ],
+            )
+            conn.commit()
+            # Mirror the POST-COALESCE rows, not the incoming dicts: a
+            # backfill re-pull carries None for fields SQLite preserves
+            # (e.g. an older date's recovery snapshot), and the Notion
+            # mirror always emits every property — mirroring the input
+            # would clear those values from the Notion page nightly.
+            qmarks = ", ".join("?" * len(dates))
+            merged = [
+                dict(r) for r in conn.execute(f"SELECT * FROM daily_health WHERE date IN ({qmarks})", dates).fetchall()
+            ]
+        self._notify_mirror_health(merged)
+
+    @staticmethod
+    def _today_local() -> date:
+        """Local date in USER_TIMEZONE. daily_health rows are keyed by it
+        (the ingest writes with today_local), so read windows must anchor to
+        the same clock — date.today() on a UTC-hosted deploy drifts a day
+        around local midnight."""
+        from temporal_context import today_local
+
+        return today_local()
+
+    def get_daily_health(self, days: int = 7, today: Optional[date] = None) -> list[dict]:
+        """Return daily_health rows for [today-days+1, today], ascending by date."""
+        ref = today or self._today_local()
+        start = (ref - timedelta(days=days - 1)).isoformat()
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM daily_health WHERE date >= ? AND date <= ? ORDER BY date",
+                (start, ref.isoformat()),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def latest_metric_date(self) -> Optional[str]:
+        """Most recent daily_health date carrying at least one PARSED metric.
+
+        Raw-insurance rows (ingest always writes today's row holding the
+        unparsed bundle, even when zero fields parse) don't count: a
+        freshness check that treats them as data would never notice a COROS
+        output-format change — the exact failure the staleness alert and
+        /health exist to catch."""
+        from coros.translator import METRIC_KEYS  # lazy import — avoids a module cycle
+
+        predicate = " OR ".join(f"{key} IS NOT NULL" for key in METRIC_KEYS)
+        with self._conn() as conn:
+            row = conn.execute(f"SELECT MAX(date) FROM daily_health WHERE {predicate}").fetchone()
+        return row[0]
+
+    def has_daily_health_rows(self) -> bool:
+        """Cheap existence probe — /health runs on every Railway poll, so it
+        must not materialize rows (the raw column alone is kilobytes)."""
+        with self._conn() as conn:
+            return conn.execute("SELECT EXISTS(SELECT 1 FROM daily_health)").fetchone()[0] == 1
+
+    def get_load_trend(self, weeks: int = 4, today: Optional[date] = None) -> list[dict]:
+        """Per-ISO-week training-load aggregates over the trailing window.
+
+        Returns [{week, start, avg_load_ratio, last_long_term, flagged_days}]
+        ascending; weeks with no data are omitted. `flagged_days` counts days
+        whose COROS load comment was anything other than 'Optimized'.
+        """
+        ref = today or self._today_local()
+        rows = self.get_daily_health(days=weeks * 7, today=ref)
+        buckets: dict[tuple[int, int], dict] = {}
+        for row in rows:
+            d = date.fromisoformat(row["date"])
+            key = d.isocalendar()[:2]
+            b = buckets.setdefault(
+                key,
+                {"start": (d - timedelta(days=d.weekday())).isoformat(), "ratios": [], "long_terms": [], "flagged": 0},
+            )
+            if row.get("load_ratio") is not None:
+                b["ratios"].append(row["load_ratio"])
+            if row.get("load_long_term") is not None:
+                b["long_terms"].append((row["date"], row["load_long_term"]))
+            comment = row.get("load_comment")
+            if comment and comment.lower() != "optimized":
+                b["flagged"] += 1
+        out = []
+        for (year, week), b in sorted(buckets.items()):
+            if not b["ratios"] and not b["long_terms"]:
+                continue
+            out.append(
+                {
+                    "week": f"{year}-W{week:02d}",
+                    "start": b["start"],
+                    "avg_load_ratio": round(sum(b["ratios"]) / len(b["ratios"]), 2) if b["ratios"] else None,
+                    "last_long_term": max(b["long_terms"])[1] if b["long_terms"] else None,
+                    "flagged_days": b["flagged"],
+                }
+            )
+        return out
+
+    def render_readiness_block(self, days: int = 7, today: Optional[date] = None) -> str:
+        """Compact markdown readiness table for the system prompt.
+
+        Returns "" when there's no data so the context blob degrades
+        silently on a pre-COROS database.
+        """
+        rows = self.get_daily_health(days=days, today=today)
+        if not rows:
+            return ""
+
+        def _clean(val) -> str:
+            """COROS-derived free text goes into the agent's system prompt —
+            constrain it to a safe charset and length so a hostile/garbled
+            payload can't smuggle instructions or break the markdown table."""
+            return re.sub(r"[^A-Za-z0-9 .%/:-]", "", str(val))[:40]
+
+        def _v(row: dict, key: str, suffix: str = "") -> str:
+            val = row.get(key)
+            if val is None:
+                return "—"
+            if isinstance(val, str):
+                return f"{_clean(val)}{suffix}"
+            return f"{val}{suffix}"
+
+        header_bits = []
+        # Today's row often lags (no HRV entry yet) — take the baseline from
+        # the most recent row that has one.
+        baseline_row = next((r for r in reversed(rows) if r.get("hrv_baseline") is not None), None)
+        if baseline_row:
+            rng = ""
+            if baseline_row.get("hrv_range_low") is not None and baseline_row.get("hrv_range_high") is not None:
+                rng = f" (normal {baseline_row['hrv_range_low']}–{baseline_row['hrv_range_high']}ms)"
+            header_bits.append(f"HRV baseline {baseline_row['hrv_baseline']}ms{rng}")
+        recovery_row = next((r for r in reversed(rows) if r.get("recovery_pct") is not None), None)
+        if recovery_row:
+            level = _clean(recovery_row.get("recovery_level") or "?")
+            header_bits.append(f"Recovery {recovery_row['recovery_pct']}% — {level} (as of {recovery_row['date']})")
+        lines = []
+        if header_bits:
+            lines.append(" | ".join(header_bits))
+        lines.append("| Date | Sleep | HRV | RHR | Stress | Load ratio | Load status |")
+        lines.append("|---|---|---|---|---|---|---|")
+        for row in rows:
+            sleep = "—"
+            if row.get("sleep_duration_min") is not None:
+                h, m = divmod(row["sleep_duration_min"], 60)
+                score = f" (score {row['sleep_score']})" if row.get("sleep_score") is not None else ""
+                nap = f" +{row['sleep_nap_min']}m nap" if row.get("sleep_nap_min") else ""
+                sleep = f"{h}h{m:02d}{score}{nap}"
+            hrv = _v(row, "hrv_avg", "ms")
+            if row.get("hrv_evaluation") and row.get("hrv_avg") is not None:
+                hrv += f" ({_clean(row['hrv_evaluation'])})"
+            lines.append(
+                f"| {row['date']} | {sleep} | {hrv} | {_v(row, 'resting_hr')} | "
+                f"{_v(row, 'stress_avg')} | {_v(row, 'load_ratio')} | {_v(row, 'load_comment')} |"
+            )
+        return "\n".join(lines)
+
+    def _render_load_trend_block(self, weeks: int = 4, today: Optional[date] = None) -> str:
+        """Weekly chronic-load trend lines for the system prompt; "" if no data."""
+        trend = self.get_load_trend(weeks=weeks, today=today)
+        if not trend:
+            return ""
+        lines = []
+        for w in trend:
+            ratio = w["avg_load_ratio"] if w["avg_load_ratio"] is not None else "—"
+            chronic = w["last_long_term"] if w["last_long_term"] is not None else "—"
+            flagged = f", {w['flagged_days']} non-optimized day(s)" if w["flagged_days"] else ""
+            lines.append(f"- {w['week']} (w/o {w['start']}): avg load ratio {ratio}, chronic load {chronic}{flagged}")
+        return "\n".join(lines)
+
+    def _notify_mirror_health(self, rows: list[dict]) -> None:
+        """Best-effort batched mirror of daily health rows to Notion."""
+        if not rows:
+            return
+        try:
+            from notion.mirror import mirror_health_rows
+
+            mirror_health_rows(rows)
+        except Exception:  # noqa: BLE001
+            pass
+
     # ---------- Journal ----------
 
     def load_journal(self, max_entries: Optional[int] = None) -> str:
@@ -1085,6 +1366,21 @@ class StateManager:
             "",
             f"=== RECENT SESSIONS (last {recent_days} days) ===",
             *(json.dumps(e, ensure_ascii=False) for e in recent),
+        ]
+
+        # Wearable readiness + load trend (COROS nightly pull). Both render
+        # "" on a pre-COROS database, keeping the blob unchanged until the
+        # first pull lands. Daily readiness drives today's-session decisions;
+        # the weekly trend gives plan-construction turns the chronic-load
+        # arc without re-deriving it from raw rows.
+        readiness = self.render_readiness_block(days=7)
+        if readiness:
+            parts += ["", "=== READINESS (COROS, last 7 days) ===", readiness]
+        load_trend = self._render_load_trend_block(weeks=4)
+        if load_trend:
+            parts += ["", "=== TRAINING LOAD TREND (last 4 weeks) ===", load_trend]
+
+        parts += [
             "",
             f"=== JOURNAL (last {journal_entries} entries) ===",
             journal.rstrip(),

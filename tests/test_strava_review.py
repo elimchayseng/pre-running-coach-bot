@@ -292,6 +292,30 @@ class TestRunPostActivityReview:
         assert stashed["reason"] == "overreach signals"
         assert stashed["proposed_for_activity"] == 999
 
+    def test_pending_proposal_withheld_not_clobbered(self, state, easy_entry, monkeypatch, fake_redis):
+        """A webhook-driven review can land at any hour; it must not clobber
+        a pending proposal the user was already pinged 'Reply yes' about —
+        their yes would silently apply the wrong change. First proposal wins
+        (mirrors coros/review.py's guard)."""
+        from pending_proposal_store import get_pending_plan_proposal, set_pending_plan_proposal
+
+        set_pending_plan_proposal(
+            {"summary": "readiness change", "new_plan_md": "x", "reason": "y", "source": "readiness"}
+        )
+        _mock_llm_response(
+            monkeypatch,
+            json.dumps(
+                {
+                    "feedback": "Overcooked.",
+                    "plan_change": {"summary": "Demote tempo", "new_plan_md": "# r\n", "reason": "z"},
+                }
+            ),
+        )
+        out = review.run_post_activity_review(easy_entry, state)
+        assert "another proposal is already pending" in out
+        assert "Proposed plan change" not in out
+        assert get_pending_plan_proposal()["summary"] == "readiness change"  # untouched
+
     def test_llm_raises_returns_none(self, state, easy_entry, monkeypatch):
         fake_client = MagicMock()
         fake_client.chat.completions.create.side_effect = RuntimeError("boom")
