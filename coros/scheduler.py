@@ -78,12 +78,13 @@ def classify_auth() -> tuple[str, str]:
     try:
         auth.get_access_token()
     except auth.CorosAuthError as e:
-        msg = str(e)
-        # get_access_token() re-wraps a storage outage as CorosAuthError; keep
-        # treating that as infra, not a re-auth prompt.
-        if "storage unavailable" in msg.lower():
-            return ("infra", msg)
-        return ("needs_auth", msg)
+        # get_access_token() re-wraps a storage outage as CorosAuthError
+        # (raised `from` TokenStorageUnavailable) — that's infra, not a
+        # re-auth prompt. Check the cause structurally; the substring is a
+        # belt-and-suspenders fallback only.
+        if isinstance(e.__cause__, auth.TokenStorageUnavailable) or "storage unavailable" in str(e).lower():
+            return ("infra", str(e))
+        return ("needs_auth", str(e))
     except Exception as e:  # network blip, unexpected shape, etc.
         return ("infra", str(e))
 
@@ -244,14 +245,47 @@ def run(now: float | None = None, dry_run: bool = False, do_pull: bool = True) -
         f"{'[dry-run] ' if dry_run else ''}auth ok · pull dates={len(result['dates'])} fields={result['fields_parsed']}"
     )
     for err in result.get("errors", []):
-        # Partial-tool or format-change problems are diagnostics, not auth.
+        # Partial-tool problems are diagnostics; zero-data is a failure (below).
         logger.warning(f"COROS pull issue: {err}")
+
+    if not result.get("ok", bool(result["dates"])):
+        # Nothing usable parsed (format change / all tools down). Fail the
+        # pass so the success marker doesn't advance — the loop retries
+        # tonight, and the staleness alert fires if it keeps happening.
+        print("infra: pull produced no usable data", file=sys.stderr)
+        _maybe_send_staleness_alert(state, now)
+        return EXIT_INFRA
 
     if not dry_run and result["dates"]:
         _run_readiness_checkin(state)
 
     _clear_alert_state()
     return EXIT_OK
+
+
+def _maybe_send_staleness_alert(state, now: float) -> None:
+    """Alert (cooldown-deduped) when pulls have failed long enough that
+    readiness data is going stale — the non-auth analog of the re-auth
+    alert. Without it, persistent infra failures are invisible: exit codes
+    only reach logs, and the quiet-night ping policy makes silence look
+    healthy."""
+    try:
+        if state.get_daily_health(days=2):
+            return  # data still fresh — one failed night isn't alertable
+        if not _should_alert(now):
+            return
+        from strava.notify import send_telegram_text
+
+        sent = send_telegram_text(
+            "⚠️ PRE's COROS pull has been failing — no fresh readiness data "
+            "for 2+ days (auth is fine; likely a COROS outage or output "
+            "format change). Check logs: railway logs | grep -i coros",
+            mirror=False,
+        )
+        if sent:
+            _record_alert(now)
+    except Exception:
+        logger.exception("COROS staleness alert failed")
 
 
 def _run_readiness_checkin(state) -> None:

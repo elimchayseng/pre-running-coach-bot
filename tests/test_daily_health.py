@@ -262,16 +262,21 @@ class TestRunNightlyPull:
         assert result["dates"]
         assert state.get_daily_health(days=7, today=TODAY) == []
 
-    def test_format_change_flags_error(self, state, monkeypatch):
+    def test_total_format_change_flags_error_and_keeps_raw(self, state, monkeypatch):
+        """The worst case — NOTHING parses — must surface an error (so the
+        scheduler fails the pass and retries) and still persist the raw
+        bundle on today's row for recovery."""
         from coros import ingest
 
         garbled = {t: '"Totally New Format"' for t in ingest.client.BUNDLE_TOOLS}
         monkeypatch.setattr(ingest.client, "fetch_daily_bundle", lambda days: garbled)
         monkeypatch.setattr(ingest, "today_local", lambda: TODAY)
         result = ingest.run_nightly_pull(state)
-        # No dates parse at all -> rows empty -> nothing written, missing-tool
-        # error absent, but the empty outcome must not crash.
-        assert result["dates"] == []
+        assert result["ok"] is False
+        assert any("0 fields parsed" in e for e in result["errors"])
+        assert result["dates"] == [TODAY.isoformat()]  # raw-only row
+        row = state.get_daily_health(days=1, today=TODAY)[0]
+        assert json.loads(row["raw"]) == garbled
 
     def test_partial_tool_failure_reported(self, state, monkeypatch, fixtures_bundle):
         from coros import ingest

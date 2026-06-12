@@ -27,12 +27,15 @@ from typing import Optional
 from config import llm_client
 from pending_proposal_store import get_pending_plan_proposal, set_pending_plan_proposal
 from state_manager import StateManager
-from strava.review import _call_review_llm, _parse_review_output
+from strava.review import _TELEGRAM_MAX_CHARS, _call_review_llm, _parse_review_output
 from temporal_context import today_local
 
 logger = logging.getLogger("pre_coach.coros.review")
 
-_TELEGRAM_MAX_CHARS = 3900
+# The readiness prompt demands the FULL revised plan.md in new_plan_md, which
+# can exceed the post-activity review's 4000-token default and truncate
+# mid-JSON (silently dropping the whole check-in).
+_MAX_TOKENS = 8000
 
 
 def _always_ping() -> bool:
@@ -84,11 +87,20 @@ def _build_messages(state: StateManager) -> list[dict]:
         "describing the change if you propose one."
     )
 
+    # Strip raw (the unparsed COROS tool-text bundle — kilobytes of
+    # third-party-controlled free text) and fetched_at from the prompt rows:
+    # the parsed columns carry the signal; raw would be a prompt-injection
+    # surface feeding an LLM that drafts plan changes and Telegram text.
+    readiness_rows = [
+        {k: v for k, v in row.items() if k not in ("raw", "fetched_at")}
+        for row in state.get_daily_health(days=7, today=today)
+    ]
+
     user = json.dumps(
         {
             "today": today.isoformat(),
             "tomorrow": tomorrow.isoformat(),
-            "readiness_last_7_days": state.get_daily_health(days=7, today=today),
+            "readiness_last_7_days": readiness_rows,
             "load_trend_4_weeks": state.get_load_trend(weeks=4, today=today),
             "todays_sessions": state.sessions_on_date(today),
             "yesterdays_sessions": state.sessions_on_date(today - timedelta(days=1)),
@@ -137,9 +149,16 @@ def run_readiness_review(state: StateManager) -> Optional[str]:
     if not state.get_daily_health(days=2, today=today):
         logger.info("No recent daily_health rows; skipping readiness review")
         return None
+    # Once per night, DB-enforced: a manual `python -m coros.scheduler` run,
+    # a marker-store outage (the Redis due-check fails open by design), or a
+    # crashed-and-restarted worker must not produce duplicate LLM reviews,
+    # rows, and Telegram pings for the same date.
+    if any(r.get("kind") == "readiness" for r in state.get_reviews_in_range(today, today)):
+        logger.info("Readiness review for %s already exists; skipping", today.isoformat())
+        return None
     try:
         messages = _build_messages(state)
-        raw = _call_review_llm(messages)
+        raw = _call_review_llm(messages, max_tokens=_MAX_TOKENS)
         parsed = _parse_review_output(raw)
         if parsed is None:
             return None
@@ -185,9 +204,22 @@ def run_readiness_review(state: StateManager) -> Optional[str]:
                     }
                 )
             except Exception as e:
-                # Deliver the analysis anyway; the proposal just isn't applyable.
+                # Deliver the analysis anyway; the proposal just isn't
+                # applyable. Force concern so the delivery gate below still
+                # fires — otherwise a concern=false night with a stash
+                # failure would silently swallow the proposed change.
                 logger.error(f"Failed to stash readiness proposal: {e}")
                 parsed["plan_change"] = None
+                parsed["concern"] = True
+
+        if not parsed.get("plan_change") and not parsed.get("concern") and review_row:
+            # Quiet night: resolve immediately to 'no-op' so Pending in the
+            # Reviews view keeps meaning "needs user attention" instead of
+            # accumulating ~365 all-clear rows a year.
+            try:
+                state.resolve_pending_review(review_row["id"], "no-op")
+            except Exception as e:
+                logger.warning(f"Could not no-op quiet-night review: {e}")
 
         if parsed.get("plan_change") or parsed.get("concern") or _always_ping():
             return _format_user_message(parsed)

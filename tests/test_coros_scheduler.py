@@ -132,7 +132,7 @@ class TestRun:
         assert scheduler.run() == scheduler.EXIT_OK
         assert cleared == [1]
 
-    def test_check_only_skips_pull(self, monkeypatch):
+    def test_check_only_skips_pull(self, monkeypatch, fake_redis):
         monkeypatch.setattr(scheduler, "classify_auth", lambda: ("ok", ""))
 
         from coros import ingest
@@ -157,36 +157,42 @@ class TestRun:
         assert scheduler.run() == scheduler.EXIT_NEEDS_AUTH
         assert sent == [1]
 
-    def test_successful_pull_triggers_readiness_checkin(self, monkeypatch):
+    def test_successful_pull_triggers_readiness_checkin(self, monkeypatch, fake_redis):
         monkeypatch.setattr(scheduler, "classify_auth", lambda: ("ok", ""))
         from coros import ingest
 
         monkeypatch.setattr(
-            ingest, "run_nightly_pull", lambda state, dry_run=False: {"dates": ["d"], "fields_parsed": 5, "errors": []}
+            ingest,
+            "run_nightly_pull",
+            lambda state, dry_run=False: {"dates": ["d"], "fields_parsed": 5, "errors": [], "ok": True},
         )
         called = []
         monkeypatch.setattr(scheduler, "_run_readiness_checkin", lambda state: called.append(1))
         assert scheduler.run() == scheduler.EXIT_OK
         assert called == [1]
 
-    def test_dry_run_skips_readiness_checkin(self, monkeypatch):
+    def test_dry_run_skips_readiness_checkin(self, monkeypatch, fake_redis):
         monkeypatch.setattr(scheduler, "classify_auth", lambda: ("ok", ""))
         from coros import ingest
 
         monkeypatch.setattr(
-            ingest, "run_nightly_pull", lambda state, dry_run=False: {"dates": ["d"], "fields_parsed": 5, "errors": []}
+            ingest,
+            "run_nightly_pull",
+            lambda state, dry_run=False: {"dates": ["d"], "fields_parsed": 5, "errors": [], "ok": True},
         )
         called = []
         monkeypatch.setattr(scheduler, "_run_readiness_checkin", lambda state: called.append(1))
         assert scheduler.run(dry_run=True) == scheduler.EXIT_OK
         assert called == []
 
-    def test_readiness_checkin_failure_does_not_fail_pass(self, monkeypatch):
+    def test_readiness_checkin_failure_does_not_fail_pass(self, monkeypatch, fake_redis):
         monkeypatch.setattr(scheduler, "classify_auth", lambda: ("ok", ""))
         from coros import ingest
 
         monkeypatch.setattr(
-            ingest, "run_nightly_pull", lambda state, dry_run=False: {"dates": ["d"], "fields_parsed": 5, "errors": []}
+            ingest,
+            "run_nightly_pull",
+            lambda state, dry_run=False: {"dates": ["d"], "fields_parsed": 5, "errors": [], "ok": True},
         )
 
         def _explode(state):
@@ -196,6 +202,47 @@ class TestRun:
 
         monkeypatch.setattr(coros_review, "run_readiness_review", _explode)
         assert scheduler.run() == scheduler.EXIT_OK
+
+    def test_zero_data_pull_is_infra_and_skips_checkin(self, monkeypatch, fake_redis):
+        """A pull that parses nothing usable must FAIL the pass (no success
+        marker -> retries tonight) instead of silently returning OK."""
+        monkeypatch.setattr(scheduler, "classify_auth", lambda: ("ok", ""))
+        from coros import ingest
+
+        monkeypatch.setattr(
+            ingest,
+            "run_nightly_pull",
+            lambda state, dry_run=False: {
+                "dates": ["2026-06-11"],  # raw-only row exists
+                "fields_parsed": 0,
+                "errors": ["0 fields parsed from a non-empty bundle"],
+                "ok": False,
+            },
+        )
+        called = []
+        monkeypatch.setattr(scheduler, "_run_readiness_checkin", lambda state: called.append(1))
+        monkeypatch.setattr(scheduler, "_maybe_send_staleness_alert", lambda state, now: None)
+        assert scheduler.run() == scheduler.EXIT_INFRA
+        assert called == []
+
+    def test_staleness_alert_only_when_data_stale(self, monkeypatch, fake_redis):
+        sent = []
+        import strava.notify as notify
+
+        monkeypatch.setattr(notify, "send_telegram_text", lambda text, mirror=True: sent.append(text) or True)
+
+        class _FreshState:
+            def get_daily_health(self, days):
+                return [{"date": "2026-06-11"}]
+
+        class _StaleState:
+            def get_daily_health(self, days):
+                return []
+
+        scheduler._maybe_send_staleness_alert(_FreshState(), now=1000.0)
+        assert sent == []  # fresh data -> no alert
+        scheduler._maybe_send_staleness_alert(_StaleState(), now=1000.0)
+        assert len(sent) == 1 and "COROS pull has been failing" in sent[0]
 
     def test_pull_crash_is_infra_not_auth(self, monkeypatch):
         monkeypatch.setattr(scheduler, "classify_auth", lambda: ("ok", ""))

@@ -49,7 +49,10 @@ def run_nightly_pull(state, days: Optional[int] = None, dry_run: bool = False) -
 
     rows = translator.merge_daily_rows(bundle, today=today)
     fields_parsed = sum(1 for row in rows for key in translator.METRIC_KEYS if row.get(key) is not None)
-    if rows and fields_parsed == 0:
+    if fields_parsed == 0:
+        # merge_daily_rows always emits today's row carrying the raw bundle,
+        # so a total format change still lands here (rows non-empty, zero
+        # metric fields) — and the raw payloads are persisted for recovery.
         errors.append(
             "0 fields parsed from a non-empty bundle — COROS output format "
             "may have changed (raw payloads are stored; see docs/coros-mcp.md)"
@@ -62,6 +65,10 @@ def run_nightly_pull(state, days: Optional[int] = None, dry_run: bool = False) -
         "dates": [row["date"] for row in rows],
         "fields_parsed": fields_parsed,
         "errors": errors,
+        # Zero usable metrics = the pull effectively failed, whatever the
+        # transport said. The scheduler treats this as a failed pass (no
+        # success marker -> retries tonight, staleness alert eventually).
+        "ok": fields_parsed > 0,
     }
     logger.info(
         "COROS pull: %d dates, %d fields parsed%s%s",

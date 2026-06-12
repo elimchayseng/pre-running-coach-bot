@@ -596,6 +596,44 @@ class TestHealthUpsert:
         assert client.markdown_patched == []  # body never touched
 
 
+class TestReviewKindProperty:
+    def _r(self, **over):
+        base = {"id": 7, "date": "2026-06-11", "status": None, "session_id": None}
+        base.update(over)
+        return base
+
+    def test_activity_default(self):
+        props = mirror._review_properties(self._r(), "rid:7")
+        assert props["Kind"] == {"select": {"name": "activity"}}
+        assert props["Title"]["title"][0]["text"]["content"] == "2026-06-11 review"
+
+    def test_readiness_kind_and_title(self):
+        props = mirror._review_properties(self._r(kind="readiness"), "rid:7")
+        assert props["Kind"] == {"select": {"name": "readiness"}}
+        assert props["Title"]["title"][0]["text"]["content"] == "2026-06-11 readiness check-in"
+
+
+class TestHealthMirrorUsesMergedRows:
+    def test_upsert_notifies_post_coalesce_rows(self, tmp_path, monkeypatch):
+        """The mirror must receive what SQLite KEEPS, not what the pull
+        carried — otherwise a backfill night clears the recovery snapshot
+        from prior days' Notion pages."""
+        from state_manager import StateManager
+
+        d = tmp_path / "state"
+        d.mkdir()
+        monkeypatch.delenv("DATABASE_PATH", raising=False)
+        state = StateManager(d)
+        captured = []
+        monkeypatch.setattr(state, "_notify_mirror_health", lambda rows: captured.append(rows))
+        state.upsert_daily_health([{"date": "2026-06-10", "recovery_pct": 88, "recovery_level": "Good"}])
+        # Backfill re-pull: no recovery for that date.
+        state.upsert_daily_health([{"date": "2026-06-10", "sleep_score": 81}])
+        merged = captured[-1][0]
+        assert merged["recovery_pct"] == 88  # preserved value reaches the mirror
+        assert merged["sleep_score"] == 81
+
+
 class TestHealthEnabledGate:
     def test_disabled_without_ds_id(self, monkeypatch):
         monkeypatch.setenv("NOTION_TOKEN", "ntn_x")

@@ -178,6 +178,13 @@ def register_client(redirect_uri: str) -> dict:
     return resp.json()
 
 
+# Assumed access-token lifetime when the token endpoint omits expires_in.
+# Conservative 1h: without this floor, a missing expires_in would make
+# expires_at == now, and EVERY subsequent call would refresh-and-rotate —
+# multiplying the rotation-loss window by orders of magnitude.
+FALLBACK_EXPIRES_IN = 3600
+
+
 def _tokens_from_response(body: dict, fallback_refresh: Optional[str] = None) -> dict:
     """Normalize a token-endpoint response to the persisted shape
     (expires_in -> absolute expires_at, like the Strava/Gcal blobs)."""
@@ -187,10 +194,14 @@ def _tokens_from_response(body: dict, fallback_refresh: Optional[str] = None) ->
             "COROS did not return a refresh_token. Ensure the requested scope "
             f"includes offline_access (got scope={body.get('scope')!r})."
         )
+    expires_in = int(body.get("expires_in") or 0)
+    if expires_in <= 0:
+        logger.warning("COROS token response missing expires_in; assuming %ss", FALLBACK_EXPIRES_IN)
+        expires_in = FALLBACK_EXPIRES_IN
     return {
         "access_token": body["access_token"],
         "refresh_token": refresh,
-        "expires_at": int(time.time()) + int(body.get("expires_in", 0)),
+        "expires_at": int(time.time()) + expires_in,
         "scope": body.get("scope"),
     }
 
@@ -220,12 +231,16 @@ def exchange_code_for_tokens(code: str, redirect_uri: str, code_verifier: str, c
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=1, max=8),
-    retry=retry_if_exception_type((requests.ConnectionError, requests.Timeout)),
+    # ConnectionError ONLY — never Timeout. A read timeout can mean COROS
+    # already processed the refresh and rotated the (single-use) token; a
+    # retry would re-present the consumed token and kill the grant. A
+    # ConnectionError guarantees the request never reached the server.
+    retry=retry_if_exception_type(requests.ConnectionError),
 )
 def _refresh_request(refresh_token: str, client_id: str) -> dict:
-    """POST the refresh grant. Retries transient network errors only — a 4xx
-    means the refresh token is dead (rotated away or revoked) and propagates
-    immediately as CorosAuthError."""
+    """POST the refresh grant. Retries pre-send connection failures only —
+    a 4xx means the refresh token is dead (rotated away or revoked) and
+    propagates immediately as CorosAuthError."""
     resp = requests.post(
         TOKEN_URL,
         data={
@@ -240,6 +255,19 @@ def _refresh_request(refresh_token: str, client_id: str) -> dict:
     return resp.json()
 
 
+# Last refresh outcome kept in memory when persistence failed. With rotating
+# refresh tokens, a blob that exists only in a lost stack frame means
+# permanent lockout — this keeps the process able to operate and to flush
+# the blob to storage on a later call. Guarded by _refresh_lock.
+_unsaved_blob: Optional[dict] = None
+
+
+def _fresh_token(tokens: dict, now: int) -> Optional[str]:
+    if tokens.get("access_token") and int(tokens.get("expires_at") or 0) - now > REFRESH_LEEWAY_SECONDS:
+        return tokens["access_token"]
+    return None
+
+
 def get_access_token() -> str:
     """Return a valid access token, refreshing (and persisting the rotated
     refresh token) if expired or near-expiry.
@@ -247,8 +275,20 @@ def get_access_token() -> str:
     Raises CorosAuthError if no tokens are stored (run setup first) or if
     refresh fails.
     """
+    global _unsaved_blob
+    # Flush a blob whose persist failed earlier — even when the in-memory
+    # token is still fresh, storage must catch up as soon as it recovers
+    # (another process reading storage would otherwise see the dead token).
+    if _unsaved_blob is not None:
+        with _refresh_lock:
+            if _unsaved_blob is not None:
+                try:
+                    _write_blob(_unsaved_blob)
+                    _unsaved_blob = None
+                except TokenStorageUnavailable:
+                    pass
     try:
-        blob = _read_blob()
+        blob = _unsaved_blob or _read_blob()
     except TokenStorageUnavailable as e:
         raise CorosAuthError(
             f"COROS token storage unavailable ({_backend()} backend): {e}. "
@@ -263,32 +303,81 @@ def get_access_token() -> str:
         raise CorosAuthError(f"No COROS tokens at {location}. Run `python scripts/coros_setup.py auth` first.")
 
     now = int(time.time())
-    if tokens.get("access_token") and int(tokens.get("expires_at") or 0) - now > REFRESH_LEEWAY_SECONDS:
-        return tokens["access_token"]
+    fresh = _fresh_token(tokens, now)
+    if fresh:
+        return fresh
 
     with _refresh_lock:
-        # Re-read inside the lock: another thread may have just refreshed and
-        # rotated the token while we were waiting.
-        blob = _read_blob() or blob
+        # Re-read inside the lock: another thread may have refreshed and
+        # rotated while we waited. An unflushed in-memory blob (persist
+        # failed; flush attempted above) is newer than storage.
+        if _unsaved_blob is not None:
+            blob = _unsaved_blob
+        else:
+            try:
+                blob = _read_blob() or blob
+            except TokenStorageUnavailable:
+                pass  # fall back to the blob read before the lock
         tokens = blob["tokens"]
         now = int(time.time())
-        if tokens.get("access_token") and int(tokens.get("expires_at") or 0) - now > REFRESH_LEEWAY_SECONDS:
-            return tokens["access_token"]
+        fresh = _fresh_token(tokens, now)
+        if fresh:
+            return fresh
 
         logger.info("COROS access token expired or stale; refreshing")
-        body = _refresh_request(tokens["refresh_token"], blob["client_info"]["client_id"])
+        try:
+            body = _refresh_request(tokens["refresh_token"], blob["client_info"]["client_id"])
+        except CorosAuthError:
+            # The refresh token may have been consumed by ANOTHER PROCESS
+            # (e.g. `make coros-status-prod` on the laptop racing the prod
+            # worker — _refresh_lock only covers threads in this process).
+            # If storage now holds a different (newer) refresh token, adopt
+            # it instead of declaring the grant dead.
+            try:
+                latest = _read_blob()
+            except TokenStorageUnavailable:
+                latest = None
+            latest_tokens = (latest or {}).get("tokens") or {}
+            if not latest_tokens.get("refresh_token") or latest_tokens["refresh_token"] == tokens["refresh_token"]:
+                raise
+            logger.info("COROS refresh token was rotated by another process; adopting it")
+            blob = latest
+            tokens = latest_tokens
+            fresh = _fresh_token(tokens, int(time.time()))
+            if fresh:
+                return fresh
+            body = _refresh_request(tokens["refresh_token"], blob["client_info"]["client_id"])
+
         blob["tokens"] = _tokens_from_response(body, fallback_refresh=tokens["refresh_token"])
-        # Persist FIRST: COROS rotates the refresh token, so returning before
-        # the write sticks would risk losing the only valid credential.
-        _write_blob(blob)
+        # Persist BEFORE returning — but if the write fails, the rotated
+        # token must survive in memory rather than die with this frame.
+        try:
+            _write_blob(blob)
+            _unsaved_blob = None
+        except TokenStorageUnavailable as e:
+            _unsaved_blob = blob
+            logger.error(
+                f"COROS token persist failed after rotation ({e}); holding "
+                "rotated token in memory and retrying the write on next use"
+            )
         return blob["tokens"]["access_token"]
 
 
 def health_check() -> bool:
-    """Return True if we can produce a working access token, False otherwise."""
+    """PASSIVE token-state check for probe paths: blob present and shaped
+    right, with a refresh token to renew from.
+
+    Deliberately does NOT call get_access_token(): a probe-path refresh
+    would rotate the single-use refresh token on the Flask request path,
+    where a gunicorn worker timeout (SIGKILL) between rotation and persist
+    is unrecoverable. Actual refresh validity is exercised by the nightly
+    scheduler, whose watchdog alerts on failure.
+    """
     try:
-        get_access_token()
-        return True
+        blob = _read_blob()
     except Exception as e:
         logger.warning(f"COROS auth health check failed: {e}")
         return False
+    tokens = (blob or {}).get("tokens") or {}
+    client_info = (blob or {}).get("client_info") or {}
+    return bool(tokens.get("refresh_token") and client_info.get("client_id"))

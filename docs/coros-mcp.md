@@ -49,8 +49,11 @@ Spike checklist (all verified 2026-06-11):
       lockout; (2) serialize refreshes with a lock — two concurrent refreshes
       with the same (now-consumed) refresh token would fail the second.
 - [x] Fixtures captured to `tests/fixtures/coros/` (9 tools)
-- [ ] Refresh still valid ≥25h after issue (re-run `replay` tomorrow — low risk
-      given 30-day access tokens; does not block PR 1)
+- [ ] Refresh still valid ≥25h after issue (run
+      `python scripts/coros_setup.py status` tomorrow — low risk given
+      30-day access tokens; does not block anything). The throwaway spike
+      script was deleted after capture; `coros/` + `scripts/coros_setup.py`
+      are the production replacements.
 
 ## Tool output parsing notes (for the translator)
 

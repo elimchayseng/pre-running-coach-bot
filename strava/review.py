@@ -188,16 +188,24 @@ def _safe_parse_date(value) -> Optional[date]:
     wait=wait_exponential(multiplier=1, min=2, max=10),
     retry=retry_if_exception_type((ConnectionError, TimeoutError, RateLimitError, APIStatusError)),
 )
-def _call_review_llm(messages: list[dict]) -> str:
-    """Single LLM call, no tools, JSON-mode response. Returns raw text content."""
+def _call_review_llm(messages: list[dict], max_tokens: int = 4000) -> str:
+    """Single LLM call, no tools, JSON-mode response. Returns raw text content.
+
+    Callers whose prompts demand a FULL new_plan_md (e.g. the COROS readiness
+    check-in) pass a higher max_tokens — a truncated completion parses as
+    malformed JSON and silently drops the review.
+    """
     response = llm_client.chat.completions.create(
         model=HEROKU_MODEL,
         messages=messages,
-        max_tokens=4000,
+        max_tokens=max_tokens,
     )
     if not response.choices:
         raise ValueError("LLM returned no response choices")
-    return response.choices[0].message.content or ""
+    choice = response.choices[0]
+    if getattr(choice, "finish_reason", None) == "length":
+        logger.warning("Review LLM output truncated at max_tokens=%s", max_tokens)
+    return choice.message.content or ""
 
 
 def _parse_review_output(raw: str) -> Optional[dict]:

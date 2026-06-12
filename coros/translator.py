@@ -330,7 +330,10 @@ def merge_daily_rows(bundle: dict[str, str], today: date) -> list[dict]:
         row["recovery_pct"] = recovery["recovery_pct"]
         row["recovery_level"] = recovery.get("recovery_level")
 
-    if bundle and today_iso in rows:
-        rows[today_iso]["raw"] = json.dumps(bundle, ensure_ascii=False)
+    # Attach the raw bundle to today's row UNCONDITIONALLY (creating the row
+    # if nothing parsed for today). The raw column is the format-change
+    # insurance — dropping it exactly when parsing fails would defeat it.
+    if bundle:
+        _row(today_iso)["raw"] = json.dumps(bundle, ensure_ascii=False)
 
     return [rows[d] for d in sorted(rows)]

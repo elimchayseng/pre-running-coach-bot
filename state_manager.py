@@ -25,6 +25,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import re
 import sqlite3
 import threading
 from contextlib import contextmanager
@@ -869,6 +870,11 @@ class StateManager:
         as JSON in SQLite). ``status`` starts NULL (= Pending in the Notion
         view).
         """
+        # App-level guard in lieu of a CHECK constraint: SQLite can't ALTER a
+        # constraint onto the existing migrated column, so enforcing only in
+        # schema.sql would let fresh and migrated DBs diverge.
+        if kind not in ("activity", "readiness"):
+            raise ValueError(f"invalid review kind: {kind!r}")
         proposed_json = json.dumps(proposed_change, ensure_ascii=False) if proposed_change else None
         iso = review_date.isoformat() if isinstance(review_date, date) else str(review_date)[:10]
         with self._conn() as conn:
@@ -1043,6 +1049,7 @@ class StateManager:
             "raw = COALESCE(excluded.raw, daily_health.raw), "
             "fetched_at = excluded.fetched_at"
         )
+        dates = [row["date"] for row in rows]
         with self._conn() as conn:
             conn.executemany(
                 sql,
@@ -1056,11 +1063,30 @@ class StateManager:
                 ],
             )
             conn.commit()
-        self._notify_mirror_health(rows)
+            # Mirror the POST-COALESCE rows, not the incoming dicts: a
+            # backfill re-pull carries None for fields SQLite preserves
+            # (e.g. an older date's recovery snapshot), and the Notion
+            # mirror always emits every property — mirroring the input
+            # would clear those values from the Notion page nightly.
+            qmarks = ", ".join("?" * len(dates))
+            merged = [
+                dict(r) for r in conn.execute(f"SELECT * FROM daily_health WHERE date IN ({qmarks})", dates).fetchall()
+            ]
+        self._notify_mirror_health(merged)
+
+    @staticmethod
+    def _today_local() -> date:
+        """Local date in USER_TIMEZONE. daily_health rows are keyed by it
+        (the ingest writes with today_local), so read windows must anchor to
+        the same clock — date.today() on a UTC-hosted deploy drifts a day
+        around local midnight."""
+        from temporal_context import today_local
+
+        return today_local()
 
     def get_daily_health(self, days: int = 7, today: Optional[date] = None) -> list[dict]:
         """Return daily_health rows for [today-days+1, today], ascending by date."""
-        ref = today or date.today()
+        ref = today or self._today_local()
         start = (ref - timedelta(days=days - 1)).isoformat()
         with self._conn() as conn:
             rows = conn.execute(
@@ -1076,7 +1102,7 @@ class StateManager:
         ascending; weeks with no data are omitted. `flagged_days` counts days
         whose COROS load comment was anything other than 'Optimized'.
         """
-        ref = today or date.today()
+        ref = today or self._today_local()
         rows = self.get_daily_health(days=weeks * 7, today=ref)
         buckets: dict[tuple[int, int], dict] = {}
         for row in rows:
@@ -1118,9 +1144,19 @@ class StateManager:
         if not rows:
             return ""
 
+        def _clean(val) -> str:
+            """COROS-derived free text goes into the agent's system prompt —
+            constrain it to a safe charset and length so a hostile/garbled
+            payload can't smuggle instructions or break the markdown table."""
+            return re.sub(r"[^A-Za-z0-9 .%/:-]", "", str(val))[:40]
+
         def _v(row: dict, key: str, suffix: str = "") -> str:
             val = row.get(key)
-            return f"{val}{suffix}" if val is not None else "—"
+            if val is None:
+                return "—"
+            if isinstance(val, str):
+                return f"{_clean(val)}{suffix}"
+            return f"{val}{suffix}"
 
         header_bits = []
         # Today's row often lags (no HRV entry yet) — take the baseline from
@@ -1133,10 +1169,8 @@ class StateManager:
             header_bits.append(f"HRV baseline {baseline_row['hrv_baseline']}ms{rng}")
         recovery_row = next((r for r in reversed(rows) if r.get("recovery_pct") is not None), None)
         if recovery_row:
-            header_bits.append(
-                f"Recovery {recovery_row['recovery_pct']}% — {recovery_row.get('recovery_level') or '?'}"
-                f" (as of {recovery_row['date']})"
-            )
+            level = _clean(recovery_row.get("recovery_level") or "?")
+            header_bits.append(f"Recovery {recovery_row['recovery_pct']}% — {level} (as of {recovery_row['date']})")
         lines = []
         if header_bits:
             lines.append(" | ".join(header_bits))
@@ -1151,7 +1185,7 @@ class StateManager:
                 sleep = f"{h}h{m:02d}{score}{nap}"
             hrv = _v(row, "hrv_avg", "ms")
             if row.get("hrv_evaluation") and row.get("hrv_avg") is not None:
-                hrv += f" ({row['hrv_evaluation']})"
+                hrv += f" ({_clean(row['hrv_evaluation'])})"
             lines.append(
                 f"| {row['date']} | {sleep} | {hrv} | {_v(row, 'resting_hr')} | "
                 f"{_v(row, 'stress_avg')} | {_v(row, 'load_ratio')} | {_v(row, 'load_comment')} |"

@@ -17,6 +17,7 @@ import logging
 import os
 from typing import Optional
 
+import httpx
 from tenacity import (
     retry,
     retry_if_exception_type,
@@ -81,7 +82,10 @@ class CorosToolError(RuntimeError):
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=2, max=10),
-    retry=retry_if_exception_type((ConnectionError, TimeoutError, OSError)),
+    # The MCP transport surfaces network failures as httpx exceptions (not
+    # builtins): httpx.TransportError covers ConnectError/ReadTimeout/etc.
+    # Builtins are kept for anyio/asyncio-level failures.
+    retry=retry_if_exception_type((httpx.TransportError, ConnectionError, TimeoutError, OSError)),
     reraise=True,
 )
 def call_tool_text(name: str, arguments: Optional[dict] = None) -> str:

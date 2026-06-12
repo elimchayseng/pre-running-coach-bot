@@ -51,18 +51,40 @@ def run_health_checks() -> dict[str, bool]:
 
     # COROS is optional — only check when token storage is configured
     # (COROS_TOKENS_BACKEND set in prod; a local token file in dev). The
-    # check is a token-validity probe (refresh only when stale), so it
-    # catches the silent failure mode where the rotated refresh token was
-    # lost and the nightly health pull has quietly stopped.
+    # gate sits OUTSIDE the try (mirroring the Notion block) so an
+    # unconfigured COROS never reports unhealthy. The check itself is
+    # deliberately passive — token blob present + well-formed, plus data
+    # freshness — and NEVER refreshes: a probe-path refresh would rotate
+    # the single-use refresh token where a gunicorn timeout could kill the
+    # worker between rotation and persist (unrecoverable lockout). Real
+    # refresh validity is exercised by the nightly scheduler's watchdog.
+    coros_configured = False
     try:
         from coros.auth import TOKEN_FILE as _coros_token_file
-        from coros.auth import health_check as coros_health
 
-        if os.getenv("COROS_TOKENS_BACKEND") or _coros_token_file.exists():
+        coros_configured = bool(os.getenv("COROS_TOKENS_BACKEND")) or _coros_token_file.exists()
+    except Exception:  # noqa: BLE001 — import failure = not configured
+        pass
+    if coros_configured:
+        try:
+            from coros.auth import health_check as coros_health
+
             results["coros"] = coros_health()
-    except Exception as e:
-        logger.error(f"COROS health check failed: {e}")
-        results["coros"] = False
+            if results["coros"]:
+                # Freshness: a token can be valid while the nightly pull has
+                # been failing for days (non-auth breakage is otherwise
+                # invisible — exit codes only reach logs). A table with rows
+                # but none recent means the pull STOPPED; a fully empty
+                # table is a fresh install and stays healthy.
+                from state_manager import StateManager
+
+                state = StateManager()
+                if not state.get_daily_health(days=3) and state.get_daily_health(days=3650):
+                    logger.warning("COROS auth ok but no daily_health rows in 3 days")
+                    results["coros"] = False
+        except Exception as e:
+            logger.error(f"COROS health check failed: {e}")
+            results["coros"] = False
 
     # Notion mirror is optional — only check when a token is configured.
     if os.getenv("NOTION_TOKEN"):

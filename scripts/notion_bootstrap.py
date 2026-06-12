@@ -71,12 +71,32 @@ def _create_or_reuse(client: NotionClient, title: str, properties: dict, parent_
     existing = _find_database(client, title, parent_page_id)
     if existing:
         db_id, ds_id = existing
+        _patch_missing_properties(client, ds_id, title, properties)
         print(f"  reuse  {title}: database={db_id}")
         return {"title": title, "database_id": db_id, "data_source_id": ds_id, "created": False}
     db = client.create_database(parent_page_id, title, properties)
     ds_id = (db.get("data_sources") or [{}])[0].get("id", "")
     print(f"  create {title}: database={db['id']}")
     return {"title": title, "database_id": db["id"], "data_source_id": ds_id, "created": True}
+
+
+def _patch_missing_properties(client: NotionClient, ds_id: str, title: str, properties: dict) -> None:
+    """Add schema properties that don't exist yet on a reused data source.
+
+    Without this, a property added to the code schema after a database was
+    first created (e.g. Reviews' "Kind") never reaches existing deployments,
+    and every mirror upsert 400s — swallowed per-row in the daemon threads,
+    so the mirror dies silently. Additive only: existing properties are
+    never modified or removed.
+    """
+    try:
+        current = client._request("GET", f"/data_sources/{ds_id}").get("properties", {})
+        missing = {name: spec for name, spec in properties.items() if name not in current}
+        if missing:
+            client._request("PATCH", f"/data_sources/{ds_id}", {"properties": missing})
+            print(f"  patch  {title}: added properties {sorted(missing)}")
+    except Exception as e:  # noqa: BLE001 — bootstrap stays usable if patching fails
+        print(f"  warn   {title}: could not patch properties: {e}")
 
 
 def bootstrap() -> list[dict]:

@@ -179,3 +179,20 @@ class TestMergeDailyRows:
         rows = translator.merge_daily_rows(bundle, today=date(2026, 6, 11))
         assert len(rows) == 7
         assert all("sleep_score" not in r for r in rows)
+
+    def test_raw_survives_total_parse_failure(self):
+        """Format-change insurance: even when NOTHING parses, today's row
+        must carry the raw bundle."""
+        bundle = {t: '"Mystery New Format"' for t in ("queryDailyHealthData", "querySleepData")}
+        rows = translator.merge_daily_rows(bundle, today=date(2026, 6, 11))
+        assert len(rows) == 1
+        assert rows[0]["date"] == "2026-06-11"
+        assert json.loads(rows[0]["raw"]) == bundle
+
+    def test_metric_keys_match_state_manager_columns(self):
+        """Drift detector: translator METRIC_KEYS and StateManager._HEALTH_COLS
+        must stay identical — a key added to one but not the other silently
+        drops data (upsert) or breaks the format-change counter (ingest)."""
+        from state_manager import StateManager
+
+        assert tuple(translator.METRIC_KEYS) == tuple(StateManager._HEALTH_COLS)
