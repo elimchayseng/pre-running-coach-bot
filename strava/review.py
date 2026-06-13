@@ -22,7 +22,8 @@ from typing import Optional
 from openai import APIStatusError, RateLimitError
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
-from config import HEROKU_MODEL, llm_client
+import review_common
+from config import llm_client
 from pending_proposal_store import get_pending_plan_proposal, set_pending_plan_proposal
 from state_manager import StateManager
 from temporal_context import today_local
@@ -31,13 +32,13 @@ logger = logging.getLogger("pre_coach.strava.review")
 
 RUN_TYPES = {"run", "easy", "long_run", "workout", "race", "strides", "return_test"}
 
-# Telegram caps a single message at 4096 chars. Cap a little under that so
-# the appended proposal/header lines don't push us over.
-_TELEGRAM_MAX_CHARS = 3900
-# Defensive size guard on LLM-proposed new_plan_md. A typical plan.md is
-# 1-3 KB; anything past 32 KB is the model going off the rails. Drop the
-# plan_change in that case so we don't bloat Redis or the next system prompt.
-_MAX_NEW_PLAN_MD_CHARS = 32 * 1024
+# Shared review internals now live in review_common.py (issue #56). Keep the
+# historical private aliases so this module's call sites and tests are
+# unchanged.
+_TELEGRAM_MAX_CHARS = review_common.TELEGRAM_MAX_CHARS
+_MAX_NEW_PLAN_MD_CHARS = review_common.MAX_NEW_PLAN_MD_CHARS
+_call_review_llm = review_common.call_review_llm
+_parse_review_output = review_common.parse_review_output
 
 # Activity-entry fields kept in the prompt. The full Strava blob has 30+
 # fields and full lap/split arrays — we trim aggressively to keep the prompt
@@ -188,63 +189,6 @@ def _safe_parse_date(value) -> Optional[date]:
     wait=wait_exponential(multiplier=1, min=2, max=10),
     retry=retry_if_exception_type((ConnectionError, TimeoutError, RateLimitError, APIStatusError)),
 )
-def _call_review_llm(messages: list[dict], max_tokens: int = 4000) -> str:
-    """Single LLM call, no tools, JSON-mode response. Returns raw text content.
-
-    Callers whose prompts demand a FULL new_plan_md (e.g. the COROS readiness
-    check-in) pass a higher max_tokens — a truncated completion parses as
-    malformed JSON and silently drops the review.
-    """
-    response = llm_client.chat.completions.create(
-        model=HEROKU_MODEL,
-        messages=messages,
-        max_tokens=max_tokens,
-    )
-    if not response.choices:
-        raise ValueError("LLM returned no response choices")
-    choice = response.choices[0]
-    if getattr(choice, "finish_reason", None) == "length":
-        logger.warning("Review LLM output truncated at max_tokens=%s", max_tokens)
-    return choice.message.content or ""
-
-
-def _parse_review_output(raw: str) -> Optional[dict]:
-    """Parse the model's JSON output. Returns None on malformed output.
-
-    Tolerates the model wrapping its JSON in ```json fences despite
-    instructions otherwise.
-    """
-    text = raw.strip()
-    if text.startswith("```"):
-        # Strip a leading fence and any trailing fence.
-        text = text.split("\n", 1)[1] if "\n" in text else text
-        if text.endswith("```"):
-            text = text.rsplit("```", 1)[0]
-        text = text.strip()
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError as e:
-        logger.error(f"Review LLM returned malformed JSON: {e}; raw: {raw[:300]}")
-        return None
-    if not isinstance(data, dict) or not isinstance(data.get("feedback"), str) or not data["feedback"].strip():
-        logger.error(f"Review LLM JSON missing/empty feedback: {raw[:300]}")
-        return None
-    plan_change = data.get("plan_change")
-    if plan_change is not None:
-        if not isinstance(plan_change, dict):
-            logger.error("plan_change present but not an object; dropping")
-            data["plan_change"] = None
-        else:
-            required = ("summary", "new_plan_md", "reason")
-            if not all(isinstance(plan_change.get(k), str) and plan_change.get(k) for k in required):
-                logger.error("plan_change missing required string fields; dropping")
-                data["plan_change"] = None
-            elif len(plan_change["new_plan_md"]) > _MAX_NEW_PLAN_MD_CHARS:
-                logger.error(f"plan_change.new_plan_md exceeds {_MAX_NEW_PLAN_MD_CHARS} chars; dropping")
-                data["plan_change"] = None
-    return data
-
-
 def _format_user_message(parsed: dict, entry: dict) -> str:
     """Render the parsed review into a Telegram message.
 

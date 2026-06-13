@@ -28,8 +28,10 @@ from typing import Optional
 
 from config import llm_client
 from pending_proposal_store import get_pending_plan_proposal, set_pending_plan_proposal
+from review_common import TELEGRAM_MAX_CHARS as _TELEGRAM_MAX_CHARS
+from review_common import call_review_llm as _call_review_llm
+from review_common import parse_review_output as _parse_review_output
 from state_manager import StateManager
-from strava.review import _TELEGRAM_MAX_CHARS, _call_review_llm, _parse_review_output
 from temporal_context import today_local
 
 logger = logging.getLogger("pre_coach.coros.review")
