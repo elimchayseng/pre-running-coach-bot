@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import os
+from datetime import date
 from typing import Optional
 
 from coros import client, translator
@@ -27,7 +28,7 @@ def _backfill_days() -> int:
         return DEFAULT_BACKFILL_DAYS
 
 
-def run_nightly_pull(state, days: Optional[int] = None, dry_run: bool = False) -> dict:
+def run_nightly_pull(state, days: Optional[int] = None, dry_run: bool = False, today: Optional[date] = None) -> dict:
     """Pull the daily tool bundle and upsert one daily_health row per date.
 
     Returns {"dates": [...], "fields_parsed": n, "errors": [...]}.
@@ -35,9 +36,13 @@ def run_nightly_pull(state, days: Optional[int] = None, dry_run: bool = False) -
     output format — surfaced as an error so the scheduler can alert.
     Raises CorosAuthError straight through (the scheduler's watchdog
     classifies that as needs_auth and Telegram-alerts).
+
+    ``today`` lets the scheduler pin the pass date once so the row dates
+    can't drift from the review row across a midnight boundary; it defaults
+    to today_local() for direct/CLI callers.
     """
     window = days or _backfill_days()
-    today = today_local()
+    today = today or today_local()
     errors: list[str] = []
 
     bundle = client.fetch_daily_bundle(days=window)

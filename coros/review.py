@@ -23,7 +23,7 @@ import logging
 import os
 import re
 import sqlite3
-from datetime import timedelta
+from datetime import date, timedelta
 from typing import Optional
 
 from config import llm_client
@@ -55,9 +55,9 @@ def _clean_text(val: str) -> str:
     return re.sub(r"[^A-Za-z0-9 .%/:-]", "", val)[:40]
 
 
-def _build_messages(state: StateManager) -> list[dict]:
+def _build_messages(state: StateManager, today: Optional[date] = None) -> list[dict]:
     """Build the [system, user] message list for the readiness check-in."""
-    today = today_local()
+    today = today or today_local()
     tomorrow = today + timedelta(days=1)
 
     system = (
@@ -147,10 +147,15 @@ def _format_user_message(parsed: dict) -> str:
     return text
 
 
-def run_readiness_review(state: StateManager) -> Optional[str]:
+def run_readiness_review(state: StateManager, today: Optional[date] = None) -> Optional[str]:
     """Generate the nightly readiness check-in. Returns the Telegram text to
     send, or None when there's nothing worth saying (quiet night) or on any
     failure — the nightly pull itself already succeeded either way.
+
+    ``today`` is the pass date the scheduler captured before the pull, so the
+    review row, its once-per-night dedup, and the prompt window all agree on
+    the same day even when the pass crosses local midnight. Defaults to
+    today_local() for direct callers.
 
     Side effects mirror run_post_activity_review:
       - review persisted with kind='readiness' (status NULL = Pending);
@@ -160,7 +165,7 @@ def run_readiness_review(state: StateManager) -> Optional[str]:
     if llm_client is None:
         logger.warning("llm_client not initialized; skipping readiness review")
         return None
-    today = today_local()
+    today = today or today_local()
     if not state.get_daily_health(days=2, today=today):
         logger.info("No recent daily_health rows; skipping readiness review")
         return None
@@ -172,7 +177,7 @@ def run_readiness_review(state: StateManager) -> Optional[str]:
         logger.info("Readiness review for %s already exists; skipping", today.isoformat())
         return None
     try:
-        messages = _build_messages(state)
+        messages = _build_messages(state, today=today)
         raw = _call_review_llm(messages, max_tokens=_MAX_TOKENS)
         parsed = _parse_review_output(raw)
         if parsed is None:

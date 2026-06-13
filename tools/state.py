@@ -369,7 +369,7 @@ def _mark_calendar_complete(state, entry: dict) -> None:
 def _update_plan(args: dict, state) -> dict:
     state.update_plan(args["new_plan_markdown"], args["change_reason"])
     result = {"ok": True, "change_reason": args["change_reason"]}
-    _auto_resolve_matching_review(state, full_plan_write=True)
+    _auto_resolve_matching_review(state, full_plan_write=True, applied_plan_md=args["new_plan_markdown"])
     _consume_pending_proposal()
     _attach_today_warning_if_broken(state, result)
     _mark_plan_dirty()
@@ -425,7 +425,15 @@ def _consume_pending_proposal() -> None:
         pass
 
 
-def _auto_resolve_matching_review(state, full_plan_write: bool = False) -> None:
+def _normalize_plan_md(text: str) -> str:
+    """Collapse a plan markdown blob to a whitespace-insensitive form for
+    equality checks: strip each line, drop blank lines. Two renderings of the
+    same plan compare equal even if reflowed; a genuinely different rewrite
+    does not."""
+    return "\n".join(line.strip() for line in (text or "").splitlines() if line.strip())
+
+
+def _auto_resolve_matching_review(state, full_plan_write: bool = False, applied_plan_md: str | None = None) -> None:
     """Heuristic: a plan-edit tool just ran. If Redis has a pending proposal
     whose ``proposed_for_activity`` matches a recent Pending review (by
     ``strava_id``), flip that review to ``approved`` and mirror the flip
@@ -473,6 +481,16 @@ def _auto_resolve_matching_review(state, full_plan_write: bool = False) -> None:
     strava_id = proposal.get("proposed_for_activity")
     if review_id is not None and not full_plan_write:
         return
+    # A full-plan write happens both when the user APPLIES a readiness
+    # proposal and when they DECLINE it and ask for an unrelated rewrite in
+    # the same turn. Only the apply should flip the review to 'approved', so
+    # require the written plan to match the stashed new_plan_md. A genuinely
+    # different rewrite leaves the review Pending (the safe direction — better
+    # a stale Pending row than a silently wrong 'approved').
+    if review_id is not None and applied_plan_md is not None:
+        proposed_md = proposal.get("new_plan_md")
+        if proposed_md is None or _normalize_plan_md(applied_plan_md) != _normalize_plan_md(proposed_md):
+            return
     if review_id is None and strava_id is None:
         return
     try:
