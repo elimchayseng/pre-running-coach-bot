@@ -245,11 +245,16 @@ class TestFormatUserMessage:
 
 
 def _mock_llm_response(monkeypatch, content: str) -> MagicMock:
+    import review_common
+
     fake_client = MagicMock()
     completion = MagicMock()
     completion.choices = [MagicMock(message=MagicMock(content=content))]
     fake_client.chat.completions.create.return_value = completion
+    # The None-guard reads strava.review.llm_client; the actual call now runs
+    # in review_common (issue #56 extraction) — patch both.
     monkeypatch.setattr(review, "llm_client", fake_client)
+    monkeypatch.setattr(review_common, "llm_client", fake_client)
     return fake_client
 
 

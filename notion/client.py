@@ -151,6 +151,17 @@ class NotionClient:
     def retrieve_database(self, database_id: str) -> dict:
         return self._request("GET", f"/databases/{database_id}")
 
+    def retrieve_data_source(self, data_source_id: str) -> dict:
+        """GET /data_sources/{id} — the live schema, including `properties`.
+        Used by the bootstrap to diff against the code schema."""
+        return self._request("GET", f"/data_sources/{data_source_id}")
+
+    def update_data_source(self, data_source_id: str, properties: dict) -> dict:
+        """PATCH /data_sources/{id} — add/modify properties. The bootstrap uses
+        it additively (only missing properties); Notion leaves untouched
+        properties as-is."""
+        return self._request("PATCH", f"/data_sources/{data_source_id}", {"properties": properties})
+
     def create_page(self, data_source_id: str, properties: dict, markdown: Optional[str] = None) -> dict:
         """POST /pages — create a page under a data source, optionally with a
         Markdown body."""

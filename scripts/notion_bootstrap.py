@@ -90,10 +90,10 @@ def _patch_missing_properties(client: NotionClient, ds_id: str, title: str, prop
     never modified or removed.
     """
     try:
-        current = client._request("GET", f"/data_sources/{ds_id}").get("properties", {})
+        current = client.retrieve_data_source(ds_id).get("properties", {})
         missing = {name: spec for name, spec in properties.items() if name not in current}
         if missing:
-            client._request("PATCH", f"/data_sources/{ds_id}", {"properties": missing})
+            client.update_data_source(ds_id, missing)
             print(f"  patch  {title}: added properties {sorted(missing)}")
     except Exception as e:  # noqa: BLE001 — bootstrap stays usable if patching fails
         print(f"  warn   {title}: could not patch properties: {e}")
