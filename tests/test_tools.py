@@ -369,6 +369,81 @@ class TestStateTools:
 
         assert get_pending_plan_proposal() is not None
 
+    def test_readiness_review_only_resolves_on_matching_plan(self, state, monkeypatch, fake_redis):
+        """Issue #53: a readiness proposal (review_id backlink, no strava id)
+        must flip to 'approved' ONLY when update_plan writes the proposed
+        plan. An unrelated full rewrite in the same turn (user declined and
+        asked for something else) must leave the review Pending."""
+        from datetime import date as _date
+
+        import temporal_context
+        from pending_proposal_store import set_pending_plan_proposal
+
+        monkeypatch.setattr(temporal_context, "today_local", lambda: _date(2026, 4, 28))
+        monkeypatch.setattr(state, "_notify_mirror_review", lambda entry: None)
+
+        proposed = (
+            "# Plan\n\n## This Week\n\n"
+            "| Day | Date | Workout | Pace target | Notes |\n"
+            "|-----|------|---------|-------------|-------|\n"
+            "| Tue | 2026-04-28 | Easy 4mi | 8:45-9:15 | recovery |\n"
+        )
+        review = state.save_review(
+            None,
+            None,
+            _date(2026, 4, 28),
+            "Poor sleep — back off tomorrow.",
+            proposed_change={"summary": "easy", "new_plan_md": proposed, "reason": "sleep"},
+            kind="readiness",
+        )
+        set_pending_plan_proposal(
+            {"summary": "easy", "new_plan_md": proposed, "reason": "sleep", "review_id": review["id"]}
+        )
+
+        # User declined and asked for a DIFFERENT rewrite.
+        unrelated = (
+            "# Plan\n\n## This Week\n\n"
+            "| Day | Date | Workout | Pace target | Notes |\n"
+            "|-----|------|---------|-------------|-------|\n"
+            "| Tue | 2026-04-28 | 6x800 @ 5k | 6:00 | quality |\n"
+        )
+        execute_tool("update_plan", {"new_plan_markdown": unrelated, "change_reason": "different idea"}, state)
+        assert state.get_all_reviews()[0]["status"] is None  # still Pending — not the apply
+
+    def test_readiness_review_resolves_when_applied_verbatim(self, state, monkeypatch, fake_redis):
+        """The match path: writing the proposed plan (whitespace-reflowed) DOES
+        flip the readiness review to approved."""
+        from datetime import date as _date
+
+        import temporal_context
+        from pending_proposal_store import set_pending_plan_proposal
+
+        monkeypatch.setattr(temporal_context, "today_local", lambda: _date(2026, 4, 28))
+        monkeypatch.setattr(state, "_notify_mirror_review", lambda entry: None)
+
+        proposed = (
+            "# Plan\n\n## This Week\n\n"
+            "| Day | Date | Workout | Pace target | Notes |\n"
+            "|-----|------|---------|-------------|-------|\n"
+            "| Tue | 2026-04-28 | Easy 4mi | 8:45-9:15 | recovery |\n"
+        )
+        review = state.save_review(
+            None,
+            None,
+            _date(2026, 4, 28),
+            "Poor sleep.",
+            proposed_change={"summary": "easy", "new_plan_md": proposed, "reason": "sleep"},
+            kind="readiness",
+        )
+        set_pending_plan_proposal(
+            {"summary": "easy", "new_plan_md": proposed, "reason": "sleep", "review_id": review["id"]}
+        )
+
+        # Apply: same content, reflowed with extra blank lines (normalize-equal).
+        applied = proposed.replace("\n\n", "\n\n\n") + "\n"
+        execute_tool("update_plan", {"new_plan_markdown": applied, "change_reason": "apply"}, state)
+        assert state.get_all_reviews()[0]["status"] == "approved"
+
     def test_update_plan_breaks_table_returns_warning(self, state, monkeypatch):
         """Plan without a parseable today row → tool returns a warning so
         the agent can self-correct."""

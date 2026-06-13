@@ -129,14 +129,14 @@ class TestRun:
         # MUST be stubbed: without it, run() hands the REAL repo StateManager
         # to the readiness check-in — a real LLM call, a real Telegram ping,
         # and a review row in the developer's live coach.db.
-        monkeypatch.setattr(scheduler, "_run_readiness_checkin", lambda state: None)
+        monkeypatch.setattr(scheduler, "_run_readiness_checkin", lambda state, today=None: None)
 
         from coros import ingest
 
         monkeypatch.setattr(
             ingest,
             "run_nightly_pull",
-            lambda state, dry_run=False: {"dates": ["d"], "fields_parsed": 5, "errors": [], "ok": True},
+            lambda state, dry_run=False, today=None: {"dates": ["d"], "fields_parsed": 5, "errors": [], "ok": True},
         )
         assert scheduler.run() == scheduler.EXIT_OK
         assert cleared == [1]
@@ -159,7 +159,7 @@ class TestRun:
 
         from coros import ingest
 
-        def _die(state, dry_run=False):
+        def _die(state, dry_run=False, today=None):
             raise auth.CorosAuthError("revoked")
 
         monkeypatch.setattr(ingest, "run_nightly_pull", _die)
@@ -173,12 +173,37 @@ class TestRun:
         monkeypatch.setattr(
             ingest,
             "run_nightly_pull",
-            lambda state, dry_run=False: {"dates": ["d"], "fields_parsed": 5, "errors": [], "ok": True},
+            lambda state, dry_run=False, today=None: {"dates": ["d"], "fields_parsed": 5, "errors": [], "ok": True},
         )
         called = []
-        monkeypatch.setattr(scheduler, "_run_readiness_checkin", lambda state: called.append(1))
+        monkeypatch.setattr(scheduler, "_run_readiness_checkin", lambda state, today=None: called.append(1))
         assert scheduler.run() == scheduler.EXIT_OK
         assert called == [1]
+
+    def test_pass_date_threaded_to_pull_and_checkin(self, monkeypatch, fake_redis):
+        """Issue #54: run() captures the pass date ONCE and threads the same
+        value into the pull and the readiness check-in, so a midnight-straddling
+        pass can't date ingest on D and the review row on D+1."""
+        from datetime import date as _date
+
+        monkeypatch.setattr(scheduler, "classify_auth", lambda: ("ok", ""))
+        from coros import ingest
+
+        seen = {}
+
+        def _pull(state, dry_run=False, today=None):
+            seen["pull"] = today
+            return {"dates": ["d"], "fields_parsed": 5, "errors": [], "ok": True}
+
+        monkeypatch.setattr(ingest, "run_nightly_pull", _pull)
+        monkeypatch.setattr(
+            scheduler, "_run_readiness_checkin", lambda state, today=None: seen.__setitem__("checkin", today)
+        )
+
+        pinned = _date(2026, 6, 11)
+        assert scheduler.run(today=pinned) == scheduler.EXIT_OK
+        assert seen["pull"] == pinned
+        assert seen["checkin"] == pinned  # same day for both halves of the pass
 
     def test_dry_run_skips_readiness_checkin(self, monkeypatch, fake_redis):
         monkeypatch.setattr(scheduler, "classify_auth", lambda: ("ok", ""))
@@ -187,10 +212,10 @@ class TestRun:
         monkeypatch.setattr(
             ingest,
             "run_nightly_pull",
-            lambda state, dry_run=False: {"dates": ["d"], "fields_parsed": 5, "errors": [], "ok": True},
+            lambda state, dry_run=False, today=None: {"dates": ["d"], "fields_parsed": 5, "errors": [], "ok": True},
         )
         called = []
-        monkeypatch.setattr(scheduler, "_run_readiness_checkin", lambda state: called.append(1))
+        monkeypatch.setattr(scheduler, "_run_readiness_checkin", lambda state, today=None: called.append(1))
         assert scheduler.run(dry_run=True) == scheduler.EXIT_OK
         assert called == []
 
@@ -201,10 +226,10 @@ class TestRun:
         monkeypatch.setattr(
             ingest,
             "run_nightly_pull",
-            lambda state, dry_run=False: {"dates": ["d"], "fields_parsed": 5, "errors": [], "ok": True},
+            lambda state, dry_run=False, today=None: {"dates": ["d"], "fields_parsed": 5, "errors": [], "ok": True},
         )
 
-        def _explode(state):
+        def _explode(state, today=None):
             raise RuntimeError("llm down")
 
         from coros import review as coros_review
@@ -221,7 +246,7 @@ class TestRun:
         monkeypatch.setattr(
             ingest,
             "run_nightly_pull",
-            lambda state, dry_run=False: {
+            lambda state, dry_run=False, today=None: {
                 "dates": ["2026-06-11"],  # raw-only row exists
                 "fields_parsed": 0,
                 "errors": ["0 fields parsed from a non-empty bundle"],
@@ -229,7 +254,7 @@ class TestRun:
             },
         )
         called = []
-        monkeypatch.setattr(scheduler, "_run_readiness_checkin", lambda state: called.append(1))
+        monkeypatch.setattr(scheduler, "_run_readiness_checkin", lambda state, today=None: called.append(1))
         monkeypatch.setattr(scheduler, "_maybe_send_staleness_alert", lambda state, now: None)
         assert scheduler.run() == scheduler.EXIT_INFRA
         assert called == []
@@ -274,7 +299,7 @@ class TestRun:
 
         from coros import ingest
 
-        def _die(state, dry_run=False):
+        def _die(state, dry_run=False, today=None):
             raise RuntimeError("mcp exploded")
 
         monkeypatch.setattr(ingest, "run_nightly_pull", _die)
@@ -345,18 +370,23 @@ class TestTickOnceSafely:
 
         monkeypatch.setattr(temporal_context, "now_local", lambda: datetime(2026, 6, 11, 22, 30))
         monkeypatch.setattr(scheduler, "_read_last_run_date", lambda: "2026-06-10")
-        monkeypatch.setattr(scheduler, "run", lambda do_pull: scheduler.EXIT_OK)
+        passed = {}
+        monkeypatch.setattr(
+            scheduler, "run", lambda do_pull, today=None: passed.__setitem__("today", today) or scheduler.EXIT_OK
+        )
         recorded = []
         monkeypatch.setattr(scheduler, "_record_last_run_date", lambda d: recorded.append(d))
         assert scheduler._tick_once_safely() == scheduler.EXIT_OK
         assert recorded == ["2026-06-11"]
+        # Issue #54: the pass date handed to run() is the tick's own clock read.
+        assert passed["today"] == datetime(2026, 6, 11, 22, 30).date()
 
     def test_failed_run_does_not_record_marker(self, monkeypatch):
         import temporal_context
 
         monkeypatch.setattr(temporal_context, "now_local", lambda: datetime(2026, 6, 11, 22, 30))
         monkeypatch.setattr(scheduler, "_read_last_run_date", lambda: None)
-        monkeypatch.setattr(scheduler, "run", lambda do_pull: scheduler.EXIT_INFRA)
+        monkeypatch.setattr(scheduler, "run", lambda do_pull, today=None: scheduler.EXIT_INFRA)
         recorded = []
         monkeypatch.setattr(scheduler, "_record_last_run_date", lambda d: recorded.append(d))
         assert scheduler._tick_once_safely() == scheduler.EXIT_INFRA

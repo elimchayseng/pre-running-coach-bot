@@ -78,6 +78,8 @@ def build_system_prompt(state: StateManager) -> str:
 
     proposal = _safe_get_pending_proposal()
     if proposal:
+        plan_md = (proposal.get("new_plan_md") or "").rstrip()
+        fence = _safe_fence(plan_md)
         sections.extend(
             [
                 "=== PENDING PLAN PROPOSAL (awaiting user confirmation) ===",
@@ -85,9 +87,9 @@ def build_system_prompt(state: StateManager) -> str:
                 f"Summary: {proposal.get('summary', '')}",
                 f"Reason: {proposal.get('reason', '')}",
                 "Proposed new plan.md content:",
-                "```markdown",
-                (proposal.get("new_plan_md") or "").rstrip(),
-                "```",
+                f"{fence}markdown",
+                plan_md,
+                fence,
                 "",
             ]
         )
@@ -144,6 +146,24 @@ def build_system_prompt(state: StateManager) -> str:
     )
 
     return "\n".join(sections)
+
+
+def _safe_fence(content: str) -> str:
+    """A backtick fence guaranteed longer than any run of backticks inside
+    ``content``. The pending proposal's new_plan_md is LLM output (derived,
+    in the readiness case, from third-party COROS text) rendered into the
+    system prompt inside a code fence — a bare ``` in the content would
+    otherwise close the fence early and let the rest inject as prompt text.
+    CommonMark: a fenced block ends only on a fence at least as long as its
+    opener, so a strictly-longer fence can't be broken from inside."""
+    longest = run = 0
+    for ch in content:
+        if ch == "`":
+            run += 1
+            longest = max(longest, run)
+        else:
+            run = 0
+    return "`" * max(3, longest + 1)
 
 
 def _safe_get_pending_proposal():

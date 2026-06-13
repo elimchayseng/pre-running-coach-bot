@@ -204,13 +204,30 @@ def _is_due(now_local: datetime, last_run_date: Optional[str], pull_hour: int) -
 # ---------- one watchdog/pull pass ----------
 
 
-def run(now: float | None = None, dry_run: bool = False, do_pull: bool = True) -> int:
+def run(
+    now: float | None = None,
+    dry_run: bool = False,
+    do_pull: bool = True,
+    today: date | None = None,
+    state=None,
+) -> int:
     """Execute one pass: classify auth, then pull if healthy.
 
     Returns a process exit code. The caller (scheduler loop or CLI) owns the
     due-check; this function always pulls when asked.
+
+    ``today`` is captured ONCE here and threaded through the pull and the
+    readiness check-in so a pass that straddles local midnight (plausible on
+    a retry-all-night outage) can't date its ingest rows on day D while the
+    review row lands on D+1 — which would make the next night's dedup skip a
+    real check-in. ``state`` is an injection seam for tests; prod builds the
+    repo-volume StateManager.
     """
     now = time.time() if now is None else now
+    if today is None:
+        from temporal_context import today_local
+
+        today = today_local()
 
     status, detail = classify_auth()
 
@@ -235,8 +252,9 @@ def run(now: float | None = None, dry_run: bool = False, do_pull: bool = True) -
         from coros import ingest
         from state_manager import StateManager
 
-        state = StateManager(ROOT / "state")
-        result = ingest.run_nightly_pull(state, dry_run=dry_run)
+        if state is None:
+            state = StateManager(ROOT / "state")
+        result = ingest.run_nightly_pull(state, dry_run=dry_run, today=today)
     except auth.CorosAuthError as e:
         # Token died between the classify check and the pull.
         logger.warning(f"COROS auth failed mid-pull: {e}")
@@ -265,7 +283,7 @@ def run(now: float | None = None, dry_run: bool = False, do_pull: bool = True) -
         return EXIT_INFRA
 
     if not dry_run and result["dates"]:
-        _run_readiness_checkin(state)
+        _run_readiness_checkin(state, today=today)
 
     _clear_alert_state()
     return EXIT_OK
@@ -316,14 +334,16 @@ def _maybe_send_staleness_alert(state, now: float) -> None:
         logger.exception("COROS staleness alert failed")
 
 
-def _run_readiness_checkin(state) -> None:
+def _run_readiness_checkin(state, today: date | None = None) -> None:
     """Phase 2: nightly LLM check of tomorrow's plan against tonight's
     vitals. Best-effort — a failure here never fails the pull pass (the
-    data is already stored; the check-in re-runs tomorrow night)."""
+    data is already stored; the check-in re-runs tomorrow night). ``today``
+    is the pass date captured by run(), so the review row and its dedup use
+    the same day the pull did."""
     try:
         from coros.review import run_readiness_review
 
-        text = run_readiness_review(state)
+        text = run_readiness_review(state, today=today)
         if text:
             from strava.notify import send_telegram_text
 
@@ -375,7 +395,9 @@ def _tick_once_safely() -> int | None:
         local_now = now_local()
         if not _is_due(local_now, _read_last_run_date(), _pull_hour()):
             return None
-        code = run(do_pull=True)
+        # Pin the pass date to the tick's clock read so ingest, the review
+        # row, and the dedup all agree even if the pull crosses midnight.
+        code = run(do_pull=True, today=local_now.date())
         if code == EXIT_OK:
             _record_last_run_date(local_now.date().isoformat())
         logger.info("COROS nightly pass complete (exit=%s)", code)
