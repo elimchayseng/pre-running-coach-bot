@@ -31,7 +31,6 @@ import os
 import secrets
 import sys
 import time
-import urllib.parse
 import webbrowser
 from pathlib import Path
 from urllib.parse import urlencode
@@ -45,63 +44,14 @@ from dotenv import load_dotenv  # noqa: E402
 load_dotenv()
 
 from coros import auth, client  # noqa: E402
+from scripts._setup_common import _fail, _ok, _section, _warn, make_oauth_callback_handler  # noqa: E402
 
 LOOPBACK_HOST = "127.0.0.1"
 LOOPBACK_PORT = 8766
 REDIRECT_URI = f"http://localhost:{LOOPBACK_PORT}/callback"
 
 
-# ---------- printing helpers ----------
-
-
-def _ok(msg: str) -> None:
-    print(f"  ✓ {msg}")
-
-
-def _warn(msg: str) -> None:
-    print(f"  ! {msg}")
-
-
-def _fail(msg: str) -> None:
-    print(f"  ✗ {msg}")
-
-
-def _section(title: str) -> None:
-    print(f"\n{title}")
-
-
 # ---------- auth ----------
-
-
-class _OAuthHandler(http.server.BaseHTTPRequestHandler):
-    """One-shot handler for the OAuth callback. Stashes (code, state) on the
-    server instance, then 200s with a friendly close-this-tab message."""
-
-    def do_GET(self):  # noqa: N802 — stdlib name
-        parsed = urllib.parse.urlparse(self.path)
-        params = dict(urllib.parse.parse_qsl(parsed.query))
-        # Browsers (Chrome especially) sometimes preload /favicon.ico before
-        # following the OAuth redirect. Only treat requests carrying the OAuth
-        # response params as the callback we're waiting for.
-        if "code" not in params and "error" not in params:
-            self.send_response(404)
-            self.end_headers()
-            return
-        self.server.received = params  # type: ignore[attr-defined]
-        body = (
-            b"<html><body style='font-family: sans-serif; padding: 2em;'>"
-            b"<h2>COROS authorization received.</h2>"
-            b"<p>You can close this tab and return to the terminal.</p>"
-            b"</body></html>"
-        )
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def log_message(self, format, *args):  # noqa: A002 — stdlib signature
-        pass
 
 
 def _pkce_pair() -> tuple[str, str]:
@@ -148,7 +98,7 @@ def cmd_auth(_: argparse.Namespace) -> int:
     url = _build_auth_url(client_info["client_id"], state_token, challenge)
 
     try:
-        server = http.server.HTTPServer((LOOPBACK_HOST, LOOPBACK_PORT), _OAuthHandler)
+        server = http.server.HTTPServer((LOOPBACK_HOST, LOOPBACK_PORT), make_oauth_callback_handler("COROS"))
     except OSError as e:
         print(
             f"Could not bind {LOOPBACK_HOST}:{LOOPBACK_PORT}: {e}\n"
