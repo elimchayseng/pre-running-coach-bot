@@ -72,6 +72,13 @@ def build_system_prompt(state: StateManager) -> str:
         f"{today.isoformat()} ({today.strftime('%A')})",
         "This date is from the system clock and is ALWAYS correct. Never override it.",
         "",
+        "=== DATA YOU HAVE ===",
+        "You have the athlete's daily COROS wearable metrics — sleep, HRV (vs"
+        " baseline), resting HR, stress, recovery, and training load. The"
+        " READINESS table below is a 7-day snapshot; summarize and discuss it"
+        " freely when asked about health, sleep, recovery, or readiness, and"
+        " call get_health_summary for any other window.",
+        "",
         blob,
         "",
     ]
@@ -105,6 +112,11 @@ def build_system_prompt(state: StateManager) -> str:
             "  NOT treat them as completing the prescription.",
             "- Call log_session IMMEDIATELY when the user reports a run/workout/race — don't ask first.",
             "- Call get_fitness_summary BEFORE adjusting zones or making non-trivial plan changes.",
+            "- Call get_health_summary when the user asks about sleep, HRV, resting HR, stress,",
+            "  recovery, training load, or 'how's my readiness/health'. The READINESS table in",
+            "  your context is a 7-day snapshot; use the tool for any other window ('this month',",
+            "  'last 2 weeks'). If it returns no data, say when the last COROS sync was — never",
+            "  claim you lack a Coros integration.",
             "- Plan edits — pick the smallest tool that does the job:",
             "  - update_workout(date, ...): default for single-day edits. Patch only the cells",
             "    you want to change (workout, pace_target, notes), and pass detail_body for the",
