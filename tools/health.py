@@ -64,10 +64,7 @@ def _get_health_summary(args: dict, state) -> dict:
             "window_days": window,
             "has_data": False,
             "latest_sync_date": latest,
-            "note": (
-                f"No COROS health data in the last {window} days; "
-                f"last successful sync was {latest or 'never'}."
-            ),
+            "note": (f"No COROS health data in the last {window} days; last successful sync was {latest or 'never'}."),
         }
 
     weeks = max(1, -(-window // 7))  # ceil(window / 7)
@@ -105,10 +102,7 @@ def _signals(rows: list[dict]) -> list[str]:
         else:
             signals.append(f"Latest HRV {hrv}ms below baseline {base}ms — watch recovery")
 
-    flagged = [
-        r for r in rows
-        if r.get("load_comment") and str(r["load_comment"]).lower() != "optimized"
-    ]
+    flagged = [r for r in rows if r.get("load_comment") and str(r["load_comment"]).lower() != "optimized"]
     if flagged:
         signals.append(f"{len(flagged)} day(s) with non-optimized training load in window")
 

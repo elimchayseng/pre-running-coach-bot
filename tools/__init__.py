@@ -22,9 +22,7 @@ from . import calendar, fitness, health, plan, state
 
 logger = logging.getLogger("pre_coach.tools")
 
-ALL_TOOLS: list[dict] = (
-    state.SCHEMAS + plan.SCHEMAS + fitness.SCHEMAS + calendar.SCHEMAS + health.SCHEMAS
-)
+ALL_TOOLS: list[dict] = state.SCHEMAS + plan.SCHEMAS + fitness.SCHEMAS + calendar.SCHEMAS + health.SCHEMAS
 
 _HANDLERS: dict[str, Any] = {
     **state.HANDLERS,

@@ -1207,12 +1207,12 @@ class TestHealthSummary:
     @pytest.mark.parametrize(
         "arg,expected",
         [
-            ({"window_days": 200}, 90),   # clamp to MAX_WINDOW
-            ({"window_days": -5}, 1),     # clamp to MIN_WINDOW
-            ({"window_days": 0}, 7),      # falsy -> default
-            ({"window_days": None}, 7),   # explicit None -> default
+            ({"window_days": 200}, 90),  # clamp to MAX_WINDOW
+            ({"window_days": -5}, 1),  # clamp to MIN_WINDOW
+            ({"window_days": 0}, 7),  # falsy -> default
+            ({"window_days": None}, 7),  # explicit None -> default
             ({"window_days": "abc"}, 7),  # non-coercible -> default, not an error
-            ({}, 7),                      # omitted -> default
+            ({}, 7),  # omitted -> default
         ],
     )
     def test_window_days_coercion_and_clamping(self, state, pin_health_today, arg, expected):
