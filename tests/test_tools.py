@@ -1135,3 +1135,116 @@ class TestAutoSyncDebounce:
         for t in threading.enumerate():
             if t.name == "pre-plan-sync":
                 t.join(timeout=2.0)
+
+
+# ------------- health summary -------------
+
+
+HEALTH_TODAY = date(2026, 6, 11)
+
+
+def _health_row(d: str, **overrides) -> dict:
+    base = {
+        "date": d,
+        "sleep_score": 80,
+        "sleep_duration_min": 450,
+        "hrv_avg": 85,
+        "hrv_baseline": 82,
+        "resting_hr": 50,
+        "stress_avg": 30,
+        "load_short_term": 130.0,
+        "load_long_term": 105.0,
+        "load_ratio": 1.24,
+        "load_comment": "Optimized",
+    }
+    base.update(overrides)
+    return base
+
+
+@pytest.fixture
+def pin_health_today(monkeypatch):
+    """Pin the window reference date so reads are deterministic."""
+    import tools.health
+
+    monkeypatch.setattr(tools.health, "today_local", lambda: HEALTH_TODAY)
+    return HEALTH_TODAY
+
+
+class TestHealthSummary:
+    def test_registered_and_dispatchable(self, state, pin_health_today):
+        # Catches a registration regression (e.g. a missing health.HANDLERS merge)
+        # that would otherwise sail through CI silently.
+        names = [t["function"]["name"] for t in ALL_TOOLS]
+        assert "get_health_summary" in names
+        out = execute_tool("get_health_summary", {"window_days": 7}, state)
+        assert "error" not in out
+
+    def test_happy_path_payload(self, state, pin_health_today):
+        state.upsert_daily_health([_health_row("2026-06-10"), _health_row("2026-06-11")])
+        out = execute_tool("get_health_summary", {"window_days": 7}, state)
+        assert out["has_data"] is True
+        assert out["latest_sync_date"] == "2026-06-11"  # most recent in window
+        assert "2026-06-11" in out["readiness_table"]
+        assert isinstance(out["load_trend"], list)
+        assert isinstance(out["signals"], list)
+
+    def test_empty_state_never_denies_integration(self, state, pin_health_today):
+        # The reason the tool exists: report the gap honestly, don't claim
+        # there is no COROS integration.
+        out = execute_tool("get_health_summary", {"window_days": 7}, state)
+        assert out["has_data"] is False
+        assert out["latest_sync_date"] is None
+        assert "never" in out["note"]
+
+    def test_empty_state_reports_last_sync_when_stale(self, state, pin_health_today):
+        # Data exists, but all of it predates the requested window.
+        state.upsert_daily_health([_health_row("2026-05-01")])
+        out = execute_tool("get_health_summary", {"window_days": 7}, state)
+        assert out["has_data"] is False
+        assert out["latest_sync_date"] == "2026-05-01"
+        assert "2026-05-01" in out["note"]
+
+    @pytest.mark.parametrize(
+        "arg,expected",
+        [
+            ({"window_days": 200}, 90),   # clamp to MAX_WINDOW
+            ({"window_days": -5}, 1),     # clamp to MIN_WINDOW
+            ({"window_days": 0}, 7),      # falsy -> default
+            ({"window_days": None}, 7),   # explicit None -> default
+            ({"window_days": "abc"}, 7),  # non-coercible -> default, not an error
+            ({}, 7),                      # omitted -> default
+        ],
+    )
+    def test_window_days_coercion_and_clamping(self, state, pin_health_today, arg, expected):
+        out = execute_tool("get_health_summary", arg, state)
+        assert "error" not in out
+        assert out["window_days"] == expected
+
+    def test_signals_sleep_average(self):
+        from tools.health import _signals
+
+        rows = [_health_row("2026-06-10", sleep_duration_min=450), _health_row("2026-06-11", sleep_duration_min=420)]
+        sig = _signals(rows)
+        assert any("Average sleep 7h15 over 2 night(s)" in s for s in sig)
+
+    def test_signals_hrv_below_baseline(self):
+        from tools.health import _signals
+
+        sig = _signals([_health_row("2026-06-11", hrv_avg=70, hrv_baseline=82)])
+        assert any("below baseline" in s and "watch recovery" in s for s in sig)
+
+    def test_signals_hrv_at_or_above_baseline(self):
+        from tools.health import _signals
+
+        sig = _signals([_health_row("2026-06-11", hrv_avg=90, hrv_baseline=82)])
+        assert any("at or above baseline" in s for s in sig)
+
+    def test_signals_flags_non_optimized_load_only(self):
+        from tools.health import _signals
+
+        rows = [
+            _health_row("2026-06-10", load_comment="Optimized"),
+            _health_row("2026-06-11", load_comment="Excessive"),
+        ]
+        sig = _signals(rows)
+        assert any("1 day(s) with non-optimized training load" in s for s in sig)

@@ -49,22 +49,24 @@ SCHEMAS = [
 
 
 def _get_health_summary(args: dict, state) -> dict:
-    window = int(args.get("window_days", 7) or 7)
+    try:
+        window = int(args.get("window_days", 7) or 7)
+    except (TypeError, ValueError):
+        window = 7  # malformed input from the model — fall back, don't error
     window = max(MIN_WINDOW, min(MAX_WINDOW, window))
     today = today_local()
 
     rows = state.get_daily_health(days=window, today=today)
-    latest = state.latest_metric_date()
 
     if not rows:
-        last = latest or "never"
+        latest = state.latest_metric_date()
         return {
             "window_days": window,
             "has_data": False,
             "latest_sync_date": latest,
             "note": (
                 f"No COROS health data in the last {window} days; "
-                f"last successful sync was {last}."
+                f"last successful sync was {latest or 'never'}."
             ),
         }
 
@@ -72,7 +74,7 @@ def _get_health_summary(args: dict, state) -> dict:
     return {
         "window_days": window,
         "has_data": True,
-        "latest_sync_date": latest,
+        "latest_sync_date": rows[-1]["date"],  # rows are ascending by date
         "readiness_table": state.render_readiness_block(days=window, today=today),
         "load_trend": state.get_load_trend(weeks=weeks, today=today),
         "signals": _signals(rows),
