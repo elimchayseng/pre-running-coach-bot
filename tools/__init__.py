@@ -18,17 +18,18 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from . import calendar, fitness, plan, state
+from . import calendar, fitness, health, plan, state
 
 logger = logging.getLogger("pre_coach.tools")
 
-ALL_TOOLS: list[dict] = state.SCHEMAS + plan.SCHEMAS + fitness.SCHEMAS + calendar.SCHEMAS
+ALL_TOOLS: list[dict] = state.SCHEMAS + plan.SCHEMAS + fitness.SCHEMAS + calendar.SCHEMAS + health.SCHEMAS
 
 _HANDLERS: dict[str, Any] = {
     **state.HANDLERS,
     **plan.HANDLERS,
     **fitness.HANDLERS,
     **calendar.HANDLERS,
+    **health.HANDLERS,
 }
 
 
