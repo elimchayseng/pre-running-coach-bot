@@ -661,6 +661,23 @@ class TestHealthEnabledGate:
         assert len(spawned) == 1
         assert len(spawned[0]) == 1
 
+    def test_batch_isolates_per_row_failures(self, monkeypatch):
+        """Issue #58: one row that fails _upsert_health must not drop the rest
+        of the batch — the daemon-thread mirror has no retry, so a single bad
+        row silently losing the whole night's batch would be invisible."""
+        monkeypatch.setattr(mirror, "NotionClient", lambda: object())
+        upserted = []
+
+        def _upsert(row, client):
+            if row["date"] == "2026-06-10":
+                raise RuntimeError("Notion 400 on this row")
+            upserted.append(row["date"])
+
+        monkeypatch.setattr(mirror, "_upsert_health", _upsert)
+        mirror._mirror_health_batch([{"date": "2026-06-10"}, {"date": "2026-06-11"}, {"date": "2026-06-12"}])
+        # The failing row is skipped; the two good rows still mirror.
+        assert upserted == ["2026-06-11", "2026-06-12"]
+
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))

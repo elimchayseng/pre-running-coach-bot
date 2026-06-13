@@ -412,3 +412,70 @@ class TestSchedulerLoop:
 
     def test_start_disabled_returns_none(self, monkeypatch):
         assert scheduler.start_scheduler_if_enabled({"TESTING": "1"}) is None
+
+
+class TestRunStateInjection:
+    """Issue #58: run() accepts an injected StateManager so a test of the
+    success path never has to touch the repo-volume DB."""
+
+    def test_injected_state_is_used_not_repo_db(self, monkeypatch, fake_redis):
+        monkeypatch.setattr(scheduler, "classify_auth", lambda: ("ok", ""))
+        monkeypatch.setattr(scheduler, "_run_readiness_checkin", lambda state, today=None: None)
+        sentinel = object()
+        seen = {}
+        from coros import ingest
+
+        def _pull(state, dry_run=False, today=None):
+            seen["state"] = state
+            return {"dates": ["d"], "fields_parsed": 5, "errors": [], "ok": True}
+
+        monkeypatch.setattr(ingest, "run_nightly_pull", _pull)
+        assert scheduler.run(state=sentinel) == scheduler.EXIT_OK
+        assert seen["state"] is sentinel  # the injected state, not StateManager(ROOT/"state")
+
+
+class TestIntervalSeconds:
+    def test_default_is_30_minutes(self):
+        assert scheduler._interval_seconds({}) == 1800.0
+
+    def test_env_override(self):
+        assert scheduler._interval_seconds({"COROS_SCHEDULER_INTERVAL_MINUTES": "10"}) == 600.0
+
+    def test_floored_at_five_minutes(self):
+        # A 0/negative value would otherwise busy-spin the loop thread.
+        assert scheduler._interval_seconds({"COROS_SCHEDULER_INTERVAL_MINUTES": "0"}) == 300.0
+        assert scheduler._interval_seconds({"COROS_SCHEDULER_INTERVAL_MINUTES": "-3"}) == 300.0
+
+    def test_junk_falls_back_to_default(self):
+        assert scheduler._interval_seconds({"COROS_SCHEDULER_INTERVAL_MINUTES": "junk"}) == 1800.0
+
+
+class TestStartSchedulerEnabled:
+    def test_starts_thread_and_is_idempotent(self, monkeypatch):
+        """The enabled path starts exactly one daemon thread; a second call
+        returns the SAME live thread instead of double-scheduling nightly
+        pulls (issue #58)."""
+        import threading
+
+        # Reset the module global so the test is order-independent.
+        monkeypatch.setattr(scheduler, "_scheduler_thread", None)
+        release = threading.Event()
+        started = []
+
+        def _blocking_loop(interval, **kwargs):
+            started.append(interval)
+            release.wait(timeout=5)  # keep the thread alive across both calls
+
+        monkeypatch.setattr(scheduler, "_scheduler_loop", _blocking_loop)
+
+        env = _env()  # RAILWAY + TELEGRAM_BOT_TOKEN, no TESTING
+        try:
+            t1 = scheduler.start_scheduler_if_enabled(env)
+            assert t1 is not None and t1.is_alive()
+            t2 = scheduler.start_scheduler_if_enabled(env)
+            assert t2 is t1  # same thread — not a second scheduler
+            assert len(started) == 1  # loop entered exactly once
+        finally:
+            release.set()
+            if t1 is not None:
+                t1.join(timeout=5)

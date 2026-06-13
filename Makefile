@@ -13,24 +13,25 @@ test:
 
 check: lint test
 
+# The four *-prod targets all need the Railway Redis public URL. The railway
+# preamble (CLI present, logged in) + REDIS_PUBLIC_URL extraction lives once in
+# scripts/railway_redis_url.sh; each target sources it via $(REDIS_URL_CMD).
+REDIS_URL_CMD = scripts/railway_redis_url.sh
+
 # Re-authorize Google Calendar against PROD Redis in one command. Runs the
 # loopback OAuth flow locally (browser on your Mac) but points REDIS_URL at the
 # Railway Redis public proxy so the fresh token lands in prod's token store.
 # load_dotenv(override=False) means these inline vars win over .env.
 gcal-reauth-prod:
-	@command -v railway >/dev/null 2>&1 || { echo "ERROR: railway CLI not found. Install: https://docs.railway.app/guides/cli"; exit 1; }
-	@railway whoami >/dev/null 2>&1 || { echo "ERROR: railway not logged in / linked. Run: railway login && railway link"; exit 1; }
 	@echo "Target → $$(railway status 2>/dev/null | grep -iE 'project|environment' | tr '\n' ' ')"
 	@echo "This writes a fresh token to the above environment's Redis. Ctrl-C now if that's wrong."
-	@PUB="$$(railway variables --service Redis --json | ./venv/bin/python -c 'import sys,json; u=json.load(sys.stdin).get("REDIS_PUBLIC_URL"); sys.exit("ERROR: REDIS_PUBLIC_URL not found on the Redis service") if not u else print(u)')" || exit 1; \
+	@PUB="$$($(REDIS_URL_CMD))" || exit 1; \
 	echo "Re-authing Google Calendar against prod Redis..."; \
 	REDIS_URL="$$PUB" GCAL_TOKENS_BACKEND=redis ./venv/bin/python scripts/google_calendar_setup.py auth
 
 # Print prod's Google Calendar auth/token/calendar status (reads prod Redis).
 gcal-status-prod:
-	@command -v railway >/dev/null 2>&1 || { echo "ERROR: railway CLI not found. Install: https://docs.railway.app/guides/cli"; exit 1; }
-	@railway whoami >/dev/null 2>&1 || { echo "ERROR: railway not logged in / linked. Run: railway login && railway link"; exit 1; }
-	@PUB="$$(railway variables --service Redis --json | ./venv/bin/python -c 'import sys,json; u=json.load(sys.stdin).get("REDIS_PUBLIC_URL"); sys.exit("ERROR: REDIS_PUBLIC_URL not found on the Redis service") if not u else print(u)')" || exit 1; \
+	@PUB="$$($(REDIS_URL_CMD))" || exit 1; \
 	REDIS_URL="$$PUB" GCAL_TOKENS_BACKEND=redis ./venv/bin/python scripts/google_calendar_setup.py status
 
 # Re-authorize COROS against PROD Redis in one command. Same trick as
@@ -38,17 +39,13 @@ gcal-status-prod:
 # but REDIS_URL points at the Railway Redis public proxy so the fresh token
 # lands in prod's token store.
 coros-reauth-prod:
-	@command -v railway >/dev/null 2>&1 || { echo "ERROR: railway CLI not found. Install: https://docs.railway.app/guides/cli"; exit 1; }
-	@railway whoami >/dev/null 2>&1 || { echo "ERROR: railway not logged in / linked. Run: railway login && railway link"; exit 1; }
 	@echo "Target → $$(railway status 2>/dev/null | grep -iE 'project|environment' | tr '\n' ' ')"
 	@echo "This writes a fresh COROS token to the above environment's Redis. Ctrl-C now if that's wrong."
-	@PUB="$$(railway variables --service Redis --json | ./venv/bin/python -c 'import sys,json; u=json.load(sys.stdin).get("REDIS_PUBLIC_URL"); sys.exit("ERROR: REDIS_PUBLIC_URL not found on the Redis service") if not u else print(u)')" || exit 1; \
+	@PUB="$$($(REDIS_URL_CMD))" || exit 1; \
 	echo "Re-authing COROS against prod Redis..."; \
 	REDIS_URL="$$PUB" COROS_TOKENS_BACKEND=redis ./venv/bin/python scripts/coros_setup.py auth
 
 # Print prod's COROS auth/token status + live MCP round-trip (reads prod Redis).
 coros-status-prod:
-	@command -v railway >/dev/null 2>&1 || { echo "ERROR: railway CLI not found. Install: https://docs.railway.app/guides/cli"; exit 1; }
-	@railway whoami >/dev/null 2>&1 || { echo "ERROR: railway not logged in / linked. Run: railway login && railway link"; exit 1; }
-	@PUB="$$(railway variables --service Redis --json | ./venv/bin/python -c 'import sys,json; u=json.load(sys.stdin).get("REDIS_PUBLIC_URL"); sys.exit("ERROR: REDIS_PUBLIC_URL not found on the Redis service") if not u else print(u)')" || exit 1; \
+	@PUB="$$($(REDIS_URL_CMD))" || exit 1; \
 	REDIS_URL="$$PUB" COROS_TOKENS_BACKEND=redis ./venv/bin/python scripts/coros_setup.py status
